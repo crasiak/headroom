@@ -652,6 +652,7 @@ def _start_proxy(
     anthropic_api_url: str | None = None,
     vertex_api_url: str | None = None,
     clear_vertex_api_url: bool = False,
+    bedrock_api_url: str | None = None,
     copilot_api_token: str | None = None,
     copilot_refresh_oauth_token: str | None = None,
     copilot_api_token_expires_at: float | None = None,
@@ -707,6 +708,9 @@ def _start_proxy(
     if vertex_api_url:
         cmd.extend(["--vertex-api-url", vertex_api_url])
 
+    if bedrock_api_url:
+        cmd.extend(["--bedrock-base-url", bedrock_api_url])
+
     timeout_seconds = _resolve_wrap_proxy_timeout_seconds()
     log_path = _get_log_path(port)
     stdio_log_path = _get_proxy_stdio_log_path(port)
@@ -744,6 +748,8 @@ def _start_proxy(
         proxy_env.pop("VERTEX_TARGET_API_URL", None)
     if vertex_api_url:
         proxy_env["VERTEX_TARGET_API_URL"] = vertex_api_url
+    if bedrock_api_url:
+        proxy_env["BEDROCK_TARGET_API_URL"] = bedrock_api_url
     # Pin the wrapper-validated Copilot token for this proxy instance only.
     # Injected into the subprocess env here (not the parent's os.environ) so it
     # never leaks into shared state. The proxy's CopilotTokenProvider honours
@@ -3600,6 +3606,25 @@ def _normalize_proxy_api_url(url: object) -> str | None:
     return normalized or None
 
 
+_TRUTHY = {"1", "true", "yes", "on"}
+
+
+def _detect_bedrock_aperture(env: dict[str, str], flag_override: str | None) -> str | None:
+    """Resolve the company-Bedrock aperture URL for ``wrap claude``.
+
+    A ``--bedrock-base-url`` flag forces/overrides. Otherwise auto-detect the
+    corelight profile: ``CLAUDE_CODE_USE_BEDROCK`` truthy AND
+    ``ANTHROPIC_BEDROCK_BASE_URL`` set. Returns the upstream aperture URL, or
+    None when Bedrock mode should not engage.
+    """
+    if flag_override:
+        return flag_override
+    if env.get("CLAUDE_CODE_USE_BEDROCK", "").strip().lower() not in _TRUTHY:
+        return None
+    base = env.get("ANTHROPIC_BEDROCK_BASE_URL")
+    return base or None
+
+
 def _proxy_version(payload: dict[str, Any] | None) -> str | None:
     """Return the running proxy version when it exposes one."""
     if payload is None:
@@ -4066,6 +4091,7 @@ def _ensure_proxy_unlocked(
     anthropic_api_url: str | None = None,
     vertex_api_url: str | None = None,
     clear_vertex_api_url: bool = False,
+    bedrock_api_url: str | None = None,
     copilot_api_token: str | None = None,
     copilot_refresh_oauth_token: str | None = None,
     copilot_api_token_expires_at: float | None = None,
@@ -4409,6 +4435,7 @@ def _ensure_proxy_unlocked(
                     anthropic_api_url=anthropic_api_url,
                     vertex_api_url=vertex_api_url,
                     clear_vertex_api_url=clear_vertex_api_url,
+                    bedrock_api_url=bedrock_api_url,
                     copilot_api_token=copilot_api_token,
                     copilot_refresh_oauth_token=copilot_refresh_oauth_token,
                     copilot_api_token_expires_at=copilot_api_token_expires_at,
@@ -5127,6 +5154,12 @@ def wrap_selfheal(marker: str | None) -> None:
         "window activates through the proxy (issue #1158)."
     ),
 )
+@click.option(
+    "--bedrock-base-url",
+    default=None,
+    help="Force company-Bedrock aperture mode and route Claude Code's Bedrock "
+         "traffic through the proxy to this upstream URL (overrides auto-detect).",
+)
 @click.option("--verbose", "-v", is_flag=True, help="Verbose output")
 @click.option("--prepare-only", is_flag=True, hidden=True)
 @click.argument("claude_args", nargs=-1, type=click.UNPROCESSED)
@@ -5144,6 +5177,7 @@ def claude(
     backend: str | None,
     region: str | None,
     context_1m: bool,
+    bedrock_base_url: str | None,
     verbose: bool,
     prepare_only: bool,
     claude_args: tuple,
@@ -5275,6 +5309,12 @@ def claude(
         proxy_url = _claude_proxy_base_url(port)
         vertex_upstream = _vertex_target_api_url_from_claude_env(proxy_url) if use_vertex else None
 
+        # Detect company-Bedrock (Tailscale aperture) mode: the corelight
+        # profile sets CLAUDE_CODE_USE_BEDROCK=1 + ANTHROPIC_BEDROCK_BASE_URL.
+        # --bedrock-base-url forces/overrides. In this mode the proxy fronts the
+        # aperture and the child Claude Code points at the local proxy.
+        bedrock_upstream = _detect_bedrock_aperture(dict(os.environ), bedrock_base_url)
+
         _register_proxy_client(port)
         proxy_holder[0], actual_port = _ensure_proxy(
             port,
@@ -5288,6 +5328,7 @@ def claude(
             anthropic_api_url=foundry_upstream,
             vertex_api_url=vertex_upstream,
             clear_vertex_api_url=use_vertex and vertex_upstream is None,
+            bedrock_api_url=bedrock_upstream,
         )
         if actual_port != port:
             _unregister_proxy_client(port)
@@ -5414,6 +5455,17 @@ def claude(
         # Per-project savings attribution: tag every request with the launch
         # directory's name via X-Headroom-Project (user override wins).
         _apply_project_header_env(env)
+
+        if bedrock_upstream:
+            # Point Claude Code's Bedrock client at the local proxy. Claude
+            # appends /model/{id}/invoke...; the proxy forwards to the real
+            # aperture. Bare host:port — no path suffix. Preserve the skip-auth
+            # flag so the child does not attempt client-side SigV4.
+            local_bedrock = f"http://127.0.0.1:{port}"
+            env["ANTHROPIC_BEDROCK_BASE_URL"] = local_bedrock
+            env.setdefault("CLAUDE_CODE_USE_BEDROCK", "1")
+            env.setdefault("CLAUDE_CODE_SKIP_BEDROCK_AUTH", "1")
+            click.echo(f"  Bedrock aperture: {bedrock_upstream} (via {local_bedrock})")
 
         # Issue #746: keep Claude Code's on-demand tool loading on through the
         # proxy so tool schemas are not eagerly materialized into local context.
