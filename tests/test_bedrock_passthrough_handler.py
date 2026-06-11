@@ -140,3 +140,45 @@ async def test_invoke_with_response_stream_relays_eventstream_verbatim():
         assert payload == EVENTSTREAM_BODY
     finally:
         await proxy.http_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_missing_config_returns_501():
+    proxy = HeadroomProxy(
+        ProxyConfig(cache_enabled=False, rate_limit_enabled=False)  # no bedrock_base_url
+    )
+    body = {"anthropic_version": "bedrock-2023-05-31", "max_tokens": 8,
+            "messages": [{"role": "user", "content": "hi"}]}
+    req = _make_request(f"/model/{MODEL}/invoke", body)
+    resp = await proxy.handle_bedrock_invoke(req, MODEL, stream=False)
+    assert resp.status_code == 501
+    assert b"not configured" in resp.body.lower()
+
+
+@pytest.mark.asyncio
+async def test_bypass_header_skips_compression():
+    captured = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, headers={"content-type": "application/json"},
+                              json={"ok": True})
+
+    proxy = _proxy()
+    proxy.http_client = _mock_client(handler)
+    try:
+        big = "BANANA " * 4000
+        body = {
+            "anthropic_version": "bedrock-2023-05-31",
+            "max_tokens": 16,
+            "messages": [
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t1", "content": big}]}
+            ],
+        }
+        req = _make_request(f"/model/{MODEL}/invoke", body,
+                            headers={"x-headroom-bypass": "true"})
+        await proxy.handle_bedrock_invoke(req, MODEL, stream=False)
+        assert captured["body"] == body
+    finally:
+        await proxy.http_client.aclose()
