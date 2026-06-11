@@ -5679,6 +5679,8 @@ def _proxy_config_from_env() -> ProxyConfig:
             DEFAULT_BUFFERED_CCR_GRACE_SECONDS,
         ),
         vertex_api_url=os.environ.get("VERTEX_TARGET_API_URL"),
+        bedrock_base_url=os.environ.get("BEDROCK_TARGET_API_URL"),
+        bedrock_compression=_get_env_str("HEADROOM_BEDROCK_COMPRESSION", "aggressive"),
         backend=_get_env_str("HEADROOM_BACKEND", "anthropic"),
         bedrock_region=_get_env_str("HEADROOM_BEDROCK_REGION", "us-west-2"),
         bedrock_profile=os.environ.get("AWS_PROFILE"),
@@ -6118,6 +6120,16 @@ if __name__ == "__main__":
         "--vertex-api-url",
         help=f"Custom Vertex AI regional API URL (default: {DEFAULT_VERTEX_API_URL})",
     )
+    parser.add_argument(
+        "--bedrock-base-url",
+        help="Company-Bedrock (Tailscale aperture) upstream URL (env: BEDROCK_TARGET_API_URL)",
+    )
+    parser.add_argument(
+        "--bedrock-compression",
+        choices=["aggressive", "lossless", "off"],
+        default="aggressive",
+        help="Request-side compression policy for Bedrock passthrough (default: aggressive)",
+    )
 
     # Backend (anthropic direct, bedrock, openrouter, anyllm, or litellm-<provider>)
     parser.add_argument(
@@ -6432,6 +6444,8 @@ if __name__ == "__main__":
             min_value=1,
         ),
         vertex_api_url=_get_env_str("VERTEX_TARGET_API_URL", args.vertex_api_url),
+        bedrock_base_url=args.bedrock_base_url or os.environ.get("BEDROCK_TARGET_API_URL"),
+        bedrock_compression=args.bedrock_compression,
         # Backend settings
         backend=_get_env_str("HEADROOM_BACKEND", args.backend),  # type: ignore[arg-type]
         bedrock_region=_get_env_str("HEADROOM_BEDROCK_REGION", args.bedrock_region),

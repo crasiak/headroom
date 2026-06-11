@@ -947,6 +947,21 @@ def dashboard(port: int, no_open: bool) -> None:
     help=("Custom Vertex AI regional API URL for publisher endpoints (env: VERTEX_TARGET_API_URL)"),
 )
 @click.option(
+    "--bedrock-base-url",
+    default=None,
+    help=(
+        "Company-Bedrock (Tailscale aperture) upstream URL. Enables the "
+        "/model/{id}/invoke[-with-response-stream] passthrough "
+        "(env: BEDROCK_TARGET_API_URL)."
+    ),
+)
+@click.option(
+    "--bedrock-compression",
+    type=click.Choice(["aggressive", "lossless", "off"]),
+    default="aggressive",
+    help="Request-side compression policy for Bedrock passthrough (default: aggressive).",
+)
+@click.option(
     "--region",
     default="us-west-2",
     envvar="HEADROOM_REGION",
@@ -1102,6 +1117,8 @@ def proxy(
     gemini_api_url: str | None,
     cloudcode_api_url: str | None,
     vertex_api_url: str | None,
+    bedrock_base_url: str | None,
+    bedrock_compression: str,
     region: str,
     bedrock_region: str | None,
     bedrock_profile: str | None,
@@ -1318,6 +1335,8 @@ def proxy(
         gemini_api_url=provider_api_overrides.gemini,
         cloudcode_api_url=provider_api_overrides.cloudcode,
         vertex_api_url=provider_api_overrides.vertex,
+        bedrock_base_url=bedrock_base_url or os.environ.get("BEDROCK_TARGET_API_URL"),
+        bedrock_compression=bedrock_compression,
         mode=effective_mode,
         optimize=not no_optimize,
         cache_enabled=not no_cache,
