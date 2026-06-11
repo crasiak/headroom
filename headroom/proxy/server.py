@@ -822,6 +822,7 @@ def _external_compressor_selection(compressors: set[str] | None) -> list[str] | 
 class HeadroomProxy(
     StreamingMixin,
     AnthropicHandlerMixin,
+    BedrockHandlerMixin,
     OpenAIHandlerMixin,
     GeminiHandlerMixin,
     BatchHandlerMixin,
