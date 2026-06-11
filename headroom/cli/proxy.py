@@ -1335,8 +1335,10 @@ def proxy(
         gemini_api_url=provider_api_overrides.gemini,
         cloudcode_api_url=provider_api_overrides.cloudcode,
         vertex_api_url=provider_api_overrides.vertex,
+        # bedrock_base_url is a gateway URL, not a provider-routing override, so it
+        # takes its env fallback inline rather than via resolve_api_overrides().
         bedrock_base_url=bedrock_base_url or os.environ.get("BEDROCK_TARGET_API_URL"),
-        bedrock_compression=bedrock_compression,
+        bedrock_compression=os.environ.get("HEADROOM_BEDROCK_COMPRESSION") or bedrock_compression,
         mode=effective_mode,
         optimize=not no_optimize,
         cache_enabled=not no_cache,

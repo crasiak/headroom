@@ -6445,7 +6445,7 @@ if __name__ == "__main__":
         ),
         vertex_api_url=_get_env_str("VERTEX_TARGET_API_URL", args.vertex_api_url),
         bedrock_base_url=args.bedrock_base_url or os.environ.get("BEDROCK_TARGET_API_URL"),
-        bedrock_compression=args.bedrock_compression,
+        bedrock_compression=_get_env_str("HEADROOM_BEDROCK_COMPRESSION", args.bedrock_compression),
         # Backend settings
         backend=_get_env_str("HEADROOM_BACKEND", args.backend),  # type: ignore[arg-type]
         bedrock_region=_get_env_str("HEADROOM_BEDROCK_REGION", args.bedrock_region),

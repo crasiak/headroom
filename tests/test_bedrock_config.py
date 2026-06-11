@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from click.testing import CliRunner
+
 from headroom.proxy.models import ProxyConfig
 
 
@@ -18,9 +20,6 @@ def test_bedrock_config_set():
     assert cfg.bedrock_compression == "lossless"
 
 
-from click.testing import CliRunner
-
-
 def test_env_wires_bedrock_base_url(monkeypatch):
     from headroom.proxy.server import _proxy_config_from_env
 
@@ -29,6 +28,15 @@ def test_env_wires_bedrock_base_url(monkeypatch):
     monkeypatch.setenv("BEDROCK_TARGET_API_URL", "https://aperture.test/bedrock")
     cfg = _proxy_config_from_env()
     assert cfg.bedrock_base_url == "https://aperture.test/bedrock"
+
+
+def test_env_wires_bedrock_compression(monkeypatch):
+    from headroom.proxy.server import _proxy_config_from_env
+
+    monkeypatch.delenv("HEADROOM_PROXY_CONFIG_JSON", raising=False)
+    monkeypatch.setenv("HEADROOM_BEDROCK_COMPRESSION", "lossless")
+    cfg = _proxy_config_from_env()
+    assert cfg.bedrock_compression == "lossless"
 
 
 def test_click_proxy_accepts_bedrock_flags():
