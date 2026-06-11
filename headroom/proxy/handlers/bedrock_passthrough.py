@@ -83,6 +83,8 @@ class BedrockHandlerMixin:
         tokens_saved = 0
         outbound = raw
 
+        # TODO(v2): "lossless" is accepted but not yet distinct from "aggressive" —
+        # both run the full pipeline. Only "off" currently short-circuits compression.
         should_compress = (
             body is not None
             and isinstance(body.get("messages"), list)
@@ -184,6 +186,8 @@ class BedrockHandlerMixin:
         """Best-effort request-outcome recording for the /stats dashboard."""
         from headroom.proxy.outcome import RequestOutcome
 
+        # attempted_input_tokens mirrors original_tokens; it is 0 when compression
+        # was skipped (bypass / policy="off" / no messages list) or not attempted.
         try:
             await self._record_request_outcome(
                 RequestOutcome(

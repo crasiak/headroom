@@ -52,6 +52,9 @@ def _make_request(path: str, body: dict, headers: dict | None = None):
 
 @pytest.mark.asyncio
 async def test_invoke_forwards_to_aperture_and_compresses_request():
+    # NOTE: asserts forwarding + verbatim return. Compression MAGNITUDE is not
+    # asserted here (the Rust _core extension may be absent); that lives in the
+    # live smoke test (tests/test_bedrock_smoke.py, Task 8).
     captured = {}
 
     def handler(request: httpx.Request) -> httpx.Response:

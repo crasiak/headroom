@@ -164,7 +164,7 @@ class ProxyConfig:
     # Request-side compression policy for the Bedrock passthrough:
     # "aggressive" (default — full lossy compression, it's the user's paid
     # company endpoint), "lossless", or "off" (forward unchanged).
-    bedrock_compression: str = "aggressive"
+    bedrock_compression: Literal["aggressive", "lossless", "off"] = "aggressive"
 
     # Backend: "anthropic" (direct API), "litellm-*" (via LiteLLM), or "anyllm" (via any-llm)
     backend: str = "anthropic"
