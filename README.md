@@ -622,6 +622,7 @@ is for teams that would rather have it deployed, supported and scaled for them.
 | [Failure learning](https://docs.headroomlabs.ai/docs/failure-learning) | [Benchmarks](https://docs.headroomlabs.ai/docs/benchmarks) |
 | [Configuration](https://docs.headroomlabs.ai/docs/configuration) | [Limitations](https://docs.headroomlabs.ai/docs/limitations) |
 | [Persistent installs](https://docs.headroomlabs.ai/docs/persistent-installs) | [Savings analytics](https://docs.headroomlabs.ai/docs/savings) |
+| [Subscriptions & company Bedrock](docs/getting-started-subscriptions-and-bedrock.md) | Claude Max · OpenAI Pro · Tailscale aperture |
 
 ## Compared to
 
