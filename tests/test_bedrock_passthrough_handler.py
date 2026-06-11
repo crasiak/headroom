@@ -101,3 +101,42 @@ async def test_invoke_forwards_to_aperture_and_compresses_request():
         assert isinstance(captured["body"]["messages"], list)
     finally:
         await proxy.http_client.aclose()
+
+
+# AWS binary event-stream prelude bytes (the real frame header shape we probed).
+EVENTSTREAM_BODY = bytes.fromhex(
+    "000002aa0000004bf373"  # truncated frame header sample (even-length hex)
+) + b"\x00\x05event" + b'{"bytes":"eyJ0eXBlIjoibWVzc2FnZV9zdGFydCJ9"}'
+
+
+@pytest.mark.asyncio
+async def test_invoke_with_response_stream_relays_eventstream_verbatim():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={
+                "content-type": "application/vnd.amazon.eventstream",
+                "x-amzn-bedrock-content-type": "application/json",
+            },
+            content=EVENTSTREAM_BODY,
+        )
+
+    proxy = _proxy()
+    proxy.http_client = _mock_client(handler)
+    try:
+        body = {
+            "anthropic_version": "bedrock-2023-05-31",
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": "hi"}],
+        }
+        req = _make_request(f"/model/{MODEL}/invoke-with-response-stream", body)
+        resp = await proxy.handle_bedrock_invoke(req, MODEL, stream=True)
+
+        assert resp.media_type == "application/vnd.amazon.eventstream"
+        assert resp.headers["x-amzn-bedrock-content-type"] == "application/json"
+
+        chunks = [c async for c in resp.body_iterator]
+        payload = b"".join(c if isinstance(c, bytes) else c.encode() for c in chunks)
+        assert payload == EVENTSTREAM_BODY
+    finally:
+        await proxy.http_client.aclose()
