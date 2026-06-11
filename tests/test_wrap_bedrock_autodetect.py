@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from headroom.cli.wrap import _detect_bedrock_aperture
+from headroom.cli.wrap import _apply_bedrock_child_env, _detect_bedrock_aperture
 
 
 def test_autodetect_returns_url_when_corelight_env_present():
@@ -42,6 +42,28 @@ def test_falsy_use_bedrock_not_detected():
     env = {"CLAUDE_CODE_USE_BEDROCK": "0",
            "ANTHROPIC_BEDROCK_BASE_URL": "https://ai.taileb6e.ts.net/bedrock"}
     assert _detect_bedrock_aperture(env, flag_override=None) is None
+
+
+def test_apply_bedrock_child_env_rewrites_when_engaged():
+    env = {}
+    local = _apply_bedrock_child_env(env, "https://ai.taileb6e.ts.net/bedrock", 8788)
+    assert local == "http://127.0.0.1:8788"
+    assert env["ANTHROPIC_BEDROCK_BASE_URL"] == "http://127.0.0.1:8788"
+    assert env["CLAUDE_CODE_USE_BEDROCK"] == "1"
+    assert env["CLAUDE_CODE_SKIP_BEDROCK_AUTH"] == "1"
+
+
+def test_apply_bedrock_child_env_noop_when_disengaged():
+    env = {"FOO": "bar"}
+    assert _apply_bedrock_child_env(env, None, 8788) is None
+    assert "ANTHROPIC_BEDROCK_BASE_URL" not in env
+
+
+def test_apply_bedrock_child_env_preserves_existing_flags():
+    env = {"CLAUDE_CODE_SKIP_BEDROCK_AUTH": "0"}
+    _apply_bedrock_child_env(env, "https://x/bedrock", 9000)
+    assert env["CLAUDE_CODE_SKIP_BEDROCK_AUTH"] == "0"  # setdefault preserves operator value
+    assert env["ANTHROPIC_BEDROCK_BASE_URL"] == "http://127.0.0.1:9000"  # force-set
 
 
 def test_start_proxy_forwards_bedrock_flag(monkeypatch):

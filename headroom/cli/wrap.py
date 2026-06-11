@@ -3606,7 +3606,7 @@ def _normalize_proxy_api_url(url: object) -> str | None:
     return normalized or None
 
 
-_TRUTHY = {"1", "true", "yes", "on"}
+_TRUTHY = frozenset({"1", "true", "yes", "y", "on"})
 
 
 def _detect_bedrock_aperture(env: dict[str, str], flag_override: str | None) -> str | None:
@@ -3623,6 +3623,25 @@ def _detect_bedrock_aperture(env: dict[str, str], flag_override: str | None) -> 
         return None
     base = env.get("ANTHROPIC_BEDROCK_BASE_URL")
     return base or None
+
+
+def _apply_bedrock_child_env(
+    env: dict[str, str], bedrock_upstream: str | None, port: int
+) -> str | None:
+    """Rewrite the child Claude Code env for Bedrock-aperture mode.
+
+    When bedrock_upstream is set, point the child's Bedrock client at the
+    local proxy (bare host:port — the handler forwards request.url.path
+    verbatim) and ensure the skip-auth flags are present. Returns the local
+    URL written (for logging), or None when Bedrock mode is not engaged.
+    """
+    if not bedrock_upstream:
+        return None
+    local_bedrock = f"http://127.0.0.1:{port}"
+    env["ANTHROPIC_BEDROCK_BASE_URL"] = local_bedrock
+    env.setdefault("CLAUDE_CODE_USE_BEDROCK", "1")
+    env.setdefault("CLAUDE_CODE_SKIP_BEDROCK_AUTH", "1")
+    return local_bedrock
 
 
 def _proxy_version(payload: dict[str, Any] | None) -> str | None:
@@ -5315,6 +5334,12 @@ def claude(
         # aperture and the child Claude Code points at the local proxy.
         bedrock_upstream = _detect_bedrock_aperture(dict(os.environ), bedrock_base_url)
 
+        if foundry_upstream and bedrock_upstream:
+            click.echo(
+                "  Warning: both Foundry and Bedrock modes detected; Claude Code uses "
+                "Foundry first, so Bedrock-aperture compression will be inert."
+            )
+
         _register_proxy_client(port)
         proxy_holder[0], actual_port = _ensure_proxy(
             port,
@@ -5456,15 +5481,8 @@ def claude(
         # directory's name via X-Headroom-Project (user override wins).
         _apply_project_header_env(env)
 
-        if bedrock_upstream:
-            # Point Claude Code's Bedrock client at the local proxy. Claude
-            # appends /model/{id}/invoke...; the proxy forwards to the real
-            # aperture. Bare host:port — no path suffix. Preserve the skip-auth
-            # flag so the child does not attempt client-side SigV4.
-            local_bedrock = f"http://127.0.0.1:{port}"
-            env["ANTHROPIC_BEDROCK_BASE_URL"] = local_bedrock
-            env.setdefault("CLAUDE_CODE_USE_BEDROCK", "1")
-            env.setdefault("CLAUDE_CODE_SKIP_BEDROCK_AUTH", "1")
+        local_bedrock = _apply_bedrock_child_env(env, bedrock_upstream, port)
+        if local_bedrock:
             click.echo(f"  Bedrock aperture: {bedrock_upstream} (via {local_bedrock})")
 
         # Issue #746: keep Claude Code's on-demand tool loading on through the
