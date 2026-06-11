@@ -47,10 +47,10 @@ class BedrockHandlerMixin:
 
     async def handle_bedrock_invoke(
         self,
-        request: "Request",
+        request: Request,
         model_id: str,
         stream: bool = False,
-    ) -> "Response | StreamingResponse | JSONResponse":
+    ) -> Response | StreamingResponse | JSONResponse:
         """Compress the request body, forward to the aperture, stream bytes back verbatim."""
         from fastapi.responses import JSONResponse, StreamingResponse
 
