@@ -488,6 +488,14 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
             VERTEX_STREAM_RAW_PREDICT.name,
         )
 
+    @app.post("/model/{model_id}/invoke")
+    async def bedrock_invoke(request: Request, model_id: str):
+        return await proxy.handle_bedrock_invoke(request, model_id, stream=False)
+
+    @app.post("/model/{model_id}/invoke-with-response-stream")
+    async def bedrock_invoke_stream(request: Request, model_id: str):
+        return await proxy.handle_bedrock_invoke(request, model_id, stream=True)
+
     @app.get("/v1/models")
     async def list_models(request: Request):
         provider_name = proxy.provider_runtime.model_metadata_provider(dict(request.headers))
