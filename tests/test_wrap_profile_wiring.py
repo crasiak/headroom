@@ -336,6 +336,27 @@ def test_claude_unknown_profile_is_friendly_click_error(tmp_path, monkeypatch):
     assert "Traceback" not in result.output
 
 
+def test_codex_malformed_profiles_toml_is_friendly_click_error(tmp_path, monkeypatch):
+    """A syntactically invalid profiles.toml must fail with a ClickException
+    naming the file (tomllib.TOMLDecodeError is a ValueError) — no traceback."""
+    from click.testing import CliRunner
+
+    from headroom.cli.wrap import codex
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    (workspace / "profiles.toml").write_text("[profiles\ndefault =")  # malformed
+    monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(workspace))
+    monkeypatch.delenv("HEADROOM_PROFILE", raising=False)
+
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        result = runner.invoke(codex, ["--profile", "company", "--prepare-only"])
+    assert result.exit_code != 0
+    assert "profiles.toml" in result.output
+    assert "Traceback" not in result.output
+
+
 def test_codex_legacy_prepare_only_uses_default_port(tmp_path, monkeypatch):
     """Legacy path (no profiles file) must write port 8787, never 'None'."""
     from click.testing import CliRunner

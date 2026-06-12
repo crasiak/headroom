@@ -3709,7 +3709,9 @@ def _resolve_claude_profile(*, flag: str | None, bedrock_base_url: str | None) -
         default_profile = (doc.get("profiles") or {}).get("default")
         name = select_profile_name(flag=flag, env=dict(os.environ), config_default=default_profile)
         rp = resolve_profile(name, profiles_path=path)
-    except (FileNotFoundError, KeyError) as e:
+    except (FileNotFoundError, KeyError, ValueError) as e:
+        # ValueError covers tomllib.TOMLDecodeError (malformed profiles.toml)
+        # and non-integer `port` values.
         raise _profile_resolution_error(e) from e
     if bedrock_base_url:  # explicit flag overrides the profile's bedrock url
         import dataclasses
@@ -3745,7 +3747,9 @@ def _resolve_codex_profile(*, flag: str | None, port_override: int | None = None
         default_profile = (doc.get("profiles") or {}).get("default")
         name = select_profile_name(flag=flag, env=dict(os.environ), config_default=default_profile)
         rp = resolve_profile(name, profiles_path=path)
-    except (FileNotFoundError, KeyError) as e:
+    except (FileNotFoundError, KeyError, ValueError) as e:
+        # ValueError covers tomllib.TOMLDecodeError (malformed profiles.toml)
+        # and non-integer `port` values.
         raise _profile_resolution_error(e) from e
     if port_override is not None:
         import dataclasses
