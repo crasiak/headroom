@@ -216,6 +216,13 @@ share a single proxy per profile.
 setup is skipped — core compression through the proxy still works. Claude
 profile mode keeps the full setup.
 
+**Skills are shared:** every profile home gets a `skills/` symlink to the
+shared store at `~/.codex/skills`, so all profiles (and the Codex GUI) see the
+same skills, and a skill installed from inside any profile lands in that one
+store. If a profile home already has its own non-empty `skills/` directory,
+headroom leaves it alone and that profile stays independent (a note is echoed
+at wrap time).
+
 ### Per-profile ports
 
 Each profile gets its own proxy port so profiles can run side by side:

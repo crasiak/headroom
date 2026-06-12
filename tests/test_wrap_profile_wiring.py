@@ -383,3 +383,32 @@ def test_codex_legacy_prepare_only_uses_default_port(tmp_path, monkeypatch):
     cfg = (fake_home / ".codex" / "config.toml").read_text()
     assert "8787" in cfg
     assert "None" not in cfg
+
+def test_codex_profile_mode_links_shared_skills(tmp_path, monkeypatch):
+    """Profile mode symlinks the owned home's skills/ at ~/.codex/skills so all
+    profiles share one skill store — without writing into ~/.codex itself."""
+    from click.testing import CliRunner
+
+    from headroom.cli.wrap import codex
+
+    fake_home = tmp_path / "home"
+    shared_skills = fake_home / ".codex" / "skills"
+    (shared_skills / "glab").mkdir(parents=True)
+    (shared_skills / "glab" / "SKILL.md").write_text("# glab")
+
+    workspace = _company_codex_workspace(tmp_path)
+    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(workspace))
+    monkeypatch.delenv("HEADROOM_PROFILE", raising=False)
+
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        result = runner.invoke(codex, ["--profile", "company", "--prepare-only"])
+    assert result.exit_code == 0, result.output
+
+    link = workspace / "codex" / "company" / "skills"
+    assert link.is_symlink()
+    assert link.resolve() == shared_skills.resolve()
+    assert (link / "glab" / "SKILL.md").read_text() == "# glab"
+    # shared store itself untouched (only the one skill, no new entries)
+    assert [p.name for p in shared_skills.iterdir()] == ["glab"]

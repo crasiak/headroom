@@ -3727,7 +3727,10 @@ def _resolve_codex_profile(*, flag: str | None, port_override: int | None = None
     config is written, so the config's base_url always matches the proxy."""
     from pathlib import Path
 
-    from headroom.cli.codex_owned_config import write_codex_owned_config
+    from headroom.cli.codex_owned_config import (
+        link_shared_skills,
+        write_codex_owned_config,
+    )
     from headroom.cli.profiles import (
         default_profiles_path,
         load_profiles,
@@ -3757,6 +3760,14 @@ def _resolve_codex_profile(*, flag: str | None, port_override: int | None = None
     owned_home = workspace_dir() / "codex" / name
     if rp.codex_seed_dir:
         write_codex_owned_config(Path(rp.codex_seed_dir), owned_home, rp.port)
+        # All profile homes share one skill store (~/.codex/skills) via a
+        # symlink, so installs from any profile land in the same place.
+        local_skills = owned_home / "skills"
+        if link_shared_skills(owned_home) is None and local_skills.is_dir():
+            click.echo(
+                f"  Note: {local_skills} has local skills; "
+                "not linking shared ~/.codex/skills"
+            )
     return rp, owned_home
 
 

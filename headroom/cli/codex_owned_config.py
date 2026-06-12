@@ -126,3 +126,33 @@ def write_codex_owned_config(seed_dir: Path, owned_dir: Path, port: int) -> Path
             owned_auth.unlink()
         shutil.copy2(seed_auth, owned_auth)
     return owned_cfg
+
+
+def link_shared_skills(owned_dir: Path, shared_skills: Path | None = None) -> Path | None:
+    """Symlink ``owned_dir/skills`` at the user's shared codex skill store.
+
+    All profile codex homes share one skill store (default ``~/.codex/skills``)
+    so a skill installed from inside any profile lands in the same place.
+    Never writes into the shared store itself. Returns the symlink path, or
+    None when no link was made (no shared store, or local skills already
+    present in the owned home — those are left untouched).
+    """
+    if shared_skills is None:
+        shared_skills = Path.home() / ".codex" / "skills"
+    if not shared_skills.is_dir():
+        return None  # no shared store -> no dangling link
+
+    link = owned_dir / "skills"
+    # is_symlink() before is_dir(): a symlink to a dir is both.
+    if link.is_symlink():
+        if link.resolve() != shared_skills.resolve():
+            link.unlink()
+            link.symlink_to(shared_skills)
+        return link
+    if link.is_dir():
+        if any(link.iterdir()):
+            return None  # local skills present -> profile stays independent
+        link.rmdir()  # empty dir codex auto-created; replace with the link
+    owned_dir.mkdir(parents=True, exist_ok=True)
+    link.symlink_to(shared_skills)
+    return link

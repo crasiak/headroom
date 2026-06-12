@@ -5,7 +5,11 @@ from pathlib import Path
 import pytest
 import tomllib
 
-from headroom.cli.codex_owned_config import build_owned_codex_config, write_codex_owned_config
+from headroom.cli.codex_owned_config import (
+    build_owned_codex_config,
+    link_shared_skills,
+    write_codex_owned_config,
+)
 
 
 def _parse(text: str) -> dict:
@@ -116,3 +120,84 @@ def test_inline_table_provider_fails_loudly():
     )
     with pytest.raises((RuntimeError, ValueError)):
         build_owned_codex_config(seed, port=8830)
+
+
+def _shared_store(tmp_path: Path) -> Path:
+    shared = tmp_path / "dotcodex" / "skills"
+    (shared / "glab").mkdir(parents=True)
+    (shared / "glab" / "SKILL.md").write_text("# glab")
+    return shared
+
+
+def test_link_shared_skills_creates_symlink(tmp_path: Path):
+    shared = _shared_store(tmp_path)
+    owned = tmp_path / "owned"
+    owned.mkdir()
+
+    link = link_shared_skills(owned, shared_skills=shared)
+
+    assert link == owned / "skills"
+    assert link.is_symlink() and link.resolve() == shared.resolve()
+    # skills visible through the link
+    assert (link / "glab" / "SKILL.md").read_text() == "# glab"
+
+
+def test_link_shared_skills_idempotent(tmp_path: Path):
+    shared = _shared_store(tmp_path)
+    owned = tmp_path / "owned"
+    owned.mkdir()
+    link_shared_skills(owned, shared_skills=shared)
+
+    link = link_shared_skills(owned, shared_skills=shared)
+
+    assert link is not None and link.is_symlink()
+    assert link.resolve() == shared.resolve()
+
+
+def test_link_shared_skills_replaces_empty_local_dir(tmp_path: Path):
+    shared = _shared_store(tmp_path)
+    owned = tmp_path / "owned"
+    (owned / "skills").mkdir(parents=True)  # codex auto-creates this empty
+
+    link = link_shared_skills(owned, shared_skills=shared)
+
+    assert link is not None and link.is_symlink()
+    assert link.resolve() == shared.resolve()
+
+
+def test_link_shared_skills_preserves_local_installs(tmp_path: Path):
+    shared = _shared_store(tmp_path)
+    owned = tmp_path / "owned"
+    local = owned / "skills" / "my-local-skill"
+    local.mkdir(parents=True)
+
+    link = link_shared_skills(owned, shared_skills=shared)
+
+    assert link is None
+    assert not (owned / "skills").is_symlink()
+    assert local.is_dir()  # untouched
+
+
+def test_link_shared_skills_no_store_no_dangling_link(tmp_path: Path):
+    owned = tmp_path / "owned"
+    owned.mkdir()
+
+    link = link_shared_skills(owned, shared_skills=tmp_path / "absent")
+
+    assert link is None
+    assert not (owned / "skills").exists()
+    assert not (owned / "skills").is_symlink()
+
+
+def test_link_shared_skills_repoints_stale_symlink(tmp_path: Path):
+    shared = _shared_store(tmp_path)
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    owned = tmp_path / "owned"
+    owned.mkdir()
+    (owned / "skills").symlink_to(elsewhere)
+
+    link = link_shared_skills(owned, shared_skills=shared)
+
+    assert link is not None and link.is_symlink()
+    assert link.resolve() == shared.resolve()
