@@ -4823,6 +4823,7 @@ def _launch_tool(
     region: str | None = None,
     openai_api_url: str | None = None,
     anthropic_api_url: str | None = None,
+    bedrock_api_url: str | None = None,
     copilot_api_token: str | None = None,
     copilot_refresh_oauth_token: str | None = None,
     copilot_api_token_expires_at: float | None = None,
@@ -6596,46 +6597,60 @@ def codex(
     """
     # Resolve the named profile FIRST. In profile mode codex runs from a
     # headroom-owned CODEX_HOME and the user's ~/.codex is NEVER mutated
-    # (it is reserved for the GUI/desktop apps), so the in-place ~/.codex
-    # wrap flow below must be skipped entirely.
+    # (it is reserved for the GUI/desktop apps), so all of the in-place
+    # ~/.codex setup must be skipped.
     resolved, owned_home = _resolve_codex_profile(flag=profile)
-    if resolved is not None and owned_home is not None:
-        codex_bin = shutil.which("codex")
-        if not codex_bin:
-            click.echo("Error: 'codex' not found in PATH.")
-            click.echo("Install Codex CLI: npm install -g @openai/codex")
-            raise SystemExit(1)
+    profile_mode = resolved is not None and owned_home is not None
+    effective_port = port if port is not None else (resolved.port if profile_mode else 8787)
 
-        effective_port = port if port is not None else resolved.port
-        env, env_vars_display = _build_codex_launch_env(effective_port, os.environ)
-        env["CODEX_HOME"] = str(owned_home)  # headroom-owned config; user's ~/.codex* untouched
-        _launch_tool(
-            binary=codex_bin, args=codex_args, env=env, port=effective_port,
-            no_proxy=no_proxy, tool_label=f"CODEX [{resolved.name}]",
-            env_vars_display=env_vars_display, learn=learn, memory=memory,
-            agent_type="codex", code_graph=code_graph, backend=backend,
-            anyllm_provider=anyllm_provider, region=region,
-            openai_api_url=resolved.openai_upstream,
-            bedrock_api_url=resolved.bedrock_base_url,
+    if not profile_mode:
+        # Legacy in-place wrap (no profiles file): original behavior.
+        return _run_codex_wrap(
+            port=effective_port,
+            no_mcp=no_mcp,
+            no_tokensave=no_tokensave,
+            serena=serena,
+            no_serena=no_serena,
+            code_graph=code_graph,
+            no_proxy=no_proxy,
+            learn=learn,
+            memory=memory,
+            backend=backend,
+            anyllm_provider=anyllm_provider,
+            region=region,
+            verbose=verbose,
+            prepare_only=prepare_only,
+            codex_args=codex_args,
         )
+
+    # v1 limitation: rtk/markers/Serena/memory MCP are not set up for
+    # profile codex; core compression still works via the proxy.
+    click.echo(
+        f"  Profile mode [{resolved.name}]: skipping rtk/MCP/Serena/memory "
+        "setup (v1); ~/.codex untouched"
+    )
+
+    if prepare_only:
+        # The owned config was already written by _resolve_codex_profile.
+        click.echo(f"  Owned Codex config: {owned_home / 'config.toml'}")
         return
 
-    return _run_codex_wrap(
-        port=port if port is not None else 8787,
-        no_mcp=no_mcp,
-        no_tokensave=no_tokensave,
-        serena=serena,
-        no_serena=no_serena,
-        code_graph=code_graph,
-        no_proxy=no_proxy,
-        learn=learn,
-        memory=memory,
-        backend=backend,
-        anyllm_provider=anyllm_provider,
-        region=region,
-        verbose=verbose,
-        prepare_only=prepare_only,
-        codex_args=codex_args,
+    codex_bin = shutil.which("codex")
+    if not codex_bin:
+        click.echo("Error: 'codex' not found in PATH.")
+        click.echo("Install Codex CLI: npm install -g @openai/codex")
+        raise SystemExit(1)
+
+    env, env_vars_display = _build_codex_launch_env(effective_port, os.environ)
+    env["CODEX_HOME"] = str(owned_home)  # headroom-owned config; user's ~/.codex* untouched
+    _launch_tool(
+        binary=codex_bin, args=codex_args, env=env, port=effective_port,
+        no_proxy=no_proxy, tool_label=f"CODEX [{resolved.name}]",
+        env_vars_display=env_vars_display, learn=learn, memory=memory,
+        agent_type="codex", code_graph=code_graph, backend=backend,
+        anyllm_provider=anyllm_provider, region=region,
+        openai_api_url=resolved.openai_upstream,
+        bedrock_api_url=resolved.bedrock_base_url,
     )
 
 

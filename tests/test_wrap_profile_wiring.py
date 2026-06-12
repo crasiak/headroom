@@ -58,3 +58,113 @@ def test_health_payload_exposes_bedrock_api_url():
     payload = srv._build_health_config(proxy.config)   # module-level health helper
     assert payload["bedrock_api_url"] == "https://ap/bedrock"
     assert payload["openai_api_url"] == proxy.config.openai_api_url
+
+
+def test_launch_tool_accepts_bedrock_api_url():
+    """_launch_tool must accept bedrock_api_url (it forwards it to _ensure_proxy).
+
+    Before the fix this raised NameError because the parameter was missing
+    from the signature while the body referenced it.
+    """
+    import os
+    import signal
+
+    import pytest
+
+    from headroom.cli.wrap import _launch_tool
+
+    saved_int = signal.getsignal(signal.SIGINT)
+    saved_term = signal.getsignal(signal.SIGTERM)
+    try:
+        with pytest.raises(SystemExit) as excinfo:
+            _launch_tool(
+                binary="/usr/bin/true",
+                args=(),
+                env=os.environ.copy(),
+                port=8999,
+                no_proxy=True,  # _ensure_proxy only probes the port; starts nothing
+                tool_label="X",
+                env_vars_display=[],
+                bedrock_api_url="https://ap/bedrock",
+            )
+        assert excinfo.value.code == 0
+    finally:
+        signal.signal(signal.SIGINT, saved_int)
+        signal.signal(signal.SIGTERM, saved_term)
+
+
+def _company_codex_workspace(tmp_path):
+    """Build a workspace dir with a profiles.toml + codex seed (company profile)."""
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    seed_dir = tmp_path / "cx"
+    seed_dir.mkdir()
+    (seed_dir / "config.toml").write_text(
+        'model="gpt-5.5"\nmodel_provider="corelight"\n'
+        '[model_providers.corelight]\nbase_url="https://ap/v1"\nwire_api="responses"\n')
+    (workspace / "profiles.toml").write_text(
+        f'[profiles]\ndefault="personal"\n[profiles.company]\ncodex_seed="{seed_dir}"\n')
+    return workspace
+
+
+def test_codex_profile_mode_leaves_user_codex_untouched(tmp_path, monkeypatch):
+    """In profile mode the user's ~/.codex must stay byte-identical."""
+    import zlib
+
+    from click.testing import CliRunner
+
+    from headroom.cli.wrap import codex
+
+    fake_home = tmp_path / "home"
+    user_codex = fake_home / ".codex"
+    user_codex.mkdir(parents=True)
+    sentinel = 'model = "user-owned-do-not-touch"\n'
+    (user_codex / "config.toml").write_text(sentinel)
+
+    workspace = _company_codex_workspace(tmp_path)
+    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(workspace))
+    monkeypatch.delenv("HEADROOM_PROFILE", raising=False)
+
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        result = runner.invoke(codex, ["--profile", "company", "--prepare-only"])
+    assert result.exit_code == 0, result.output
+
+    # ~/.codex byte-identical: same single file, same content.
+    assert [p.name for p in user_codex.iterdir()] == ["config.toml"]
+    assert (user_codex / "config.toml").read_text() == sentinel
+
+    # Owned config materialized with the company proxy port.
+    owned_config = workspace / "codex" / "company" / "config.toml"
+    assert owned_config.exists()
+    company_port = 8788 + (zlib.crc32(b"company") % 1000)
+    assert f'base_url = "http://127.0.0.1:{company_port}/v1"' in owned_config.read_text()
+
+
+def test_codex_legacy_prepare_only_uses_default_port(tmp_path, monkeypatch):
+    """Legacy path (no profiles file) must write port 8787, never 'None'."""
+    from click.testing import CliRunner
+
+    from headroom.cli.wrap import codex
+
+    fake_home = tmp_path / "home"
+    # Pre-create ~/.codex so CodexRegistrar.detect() lets headroom MCP setup
+    # run — that's where the literal 'http://127.0.0.1:None' corruption bit.
+    (fake_home / ".codex").mkdir(parents=True)
+    workspace = tmp_path / "ws"
+    workspace.mkdir()  # empty: no profiles.toml -> legacy path
+    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(workspace))
+    monkeypatch.delenv("HEADROOM_PROFILE", raising=False)
+
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        result = runner.invoke(
+            codex, ["--prepare-only", "--no-rtk", "--no-serena"]
+        )
+    assert result.exit_code == 0, result.output
+
+    cfg = (fake_home / ".codex" / "config.toml").read_text()
+    assert "8787" in cfg
+    assert "None" not in cfg
