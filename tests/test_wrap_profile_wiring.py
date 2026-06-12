@@ -142,6 +142,106 @@ def test_codex_profile_mode_leaves_user_codex_untouched(tmp_path, monkeypatch):
     assert f'base_url = "http://127.0.0.1:{company_port}/v1"' in owned_config.read_text()
 
 
+def test_resolve_codex_profile_port_override(tmp_path, monkeypatch):
+    """--port must win: the owned config must point at the override, not crc32."""
+    import zlib
+
+    from headroom.cli.wrap import _resolve_codex_profile
+
+    seed_dir = tmp_path / "cx"
+    seed_dir.mkdir()
+    (seed_dir / "config.toml").write_text(
+        'model="gpt-5.5"\nmodel_provider="corelight"\n'
+        '[model_providers.corelight]\nbase_url="https://ap/v1"\nwire_api="responses"\n')
+    (tmp_path / "profiles.toml").write_text(
+        f'[profiles]\ndefault="personal"\n[profiles.company]\ncodex_seed="{seed_dir}"\n')
+    monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(tmp_path))
+
+    rp, owned_home = _resolve_codex_profile(flag="company", port_override=9999)
+    assert rp.port == 9999
+    written = (owned_home / "config.toml").read_text()
+    assert 'base_url = "http://127.0.0.1:9999/v1"' in written
+    crc32_port = 8788 + (zlib.crc32(b"company") % 1000)
+    assert f"127.0.0.1:{crc32_port}" not in written
+
+
+def test_codex_profile_mode_port_flag_wins(tmp_path, monkeypatch):
+    """CLI: codex --profile company --port 9999 writes 9999 into the owned config."""
+    import zlib
+
+    from click.testing import CliRunner
+
+    from headroom.cli.wrap import codex
+
+    fake_home = tmp_path / "home"
+    user_codex = fake_home / ".codex"
+    user_codex.mkdir(parents=True)
+    sentinel = 'model = "user-owned-do-not-touch"\n'
+    (user_codex / "config.toml").write_text(sentinel)
+
+    workspace = _company_codex_workspace(tmp_path)
+    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(workspace))
+    monkeypatch.delenv("HEADROOM_PROFILE", raising=False)
+
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        result = runner.invoke(
+            codex, ["--profile", "company", "--prepare-only", "--port", "9999"]
+        )
+    assert result.exit_code == 0, result.output
+
+    owned_config = workspace / "codex" / "company" / "config.toml"
+    assert owned_config.exists()
+    written = owned_config.read_text()
+    assert 'base_url = "http://127.0.0.1:9999/v1"' in written
+    crc32_port = 8788 + (zlib.crc32(b"company") % 1000)
+    assert f"127.0.0.1:{crc32_port}" not in written
+
+    # ~/.codex untouched.
+    assert (user_codex / "config.toml").read_text() == sentinel
+
+
+def test_codex_profile_mode_memory_disabled(tmp_path, monkeypatch):
+    """Profile mode is compression-only (v1): _launch_tool must get memory=False
+    even when --memory was passed, the skip must be echoed, and ~/.codex must
+    stay untouched (no memory MCP registration)."""
+    from click.testing import CliRunner
+
+    from headroom.cli import wrap as wrap_mod
+    from headroom.cli.wrap import codex
+
+    fake_home = tmp_path / "home"
+    user_codex = fake_home / ".codex"
+    user_codex.mkdir(parents=True)
+    sentinel = 'model = "user-owned-do-not-touch"\n'
+    (user_codex / "config.toml").write_text(sentinel)
+
+    workspace = _company_codex_workspace(tmp_path)
+    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(workspace))
+    monkeypatch.delenv("HEADROOM_PROFILE", raising=False)
+
+    calls = {}
+
+    def fake_launch_tool(**kwargs):
+        calls.update(kwargs)
+        raise SystemExit(0)
+
+    monkeypatch.setattr(wrap_mod, "_launch_tool", fake_launch_tool)
+    monkeypatch.setattr(wrap_mod.shutil, "which", lambda name: "/usr/bin/true")
+
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        result = runner.invoke(codex, ["--profile", "company", "--memory"])
+    assert result.exit_code == 0, result.output
+    assert "memory" in result.output  # skip is visible in the profile-mode echo
+    assert calls, "_launch_tool was not called"
+    assert calls["memory"] is False
+    # No memory MCP write to the user's ~/.codex.
+    assert (user_codex / "config.toml").read_text() == sentinel
+
+
 def test_codex_legacy_prepare_only_uses_default_port(tmp_path, monkeypatch):
     """Legacy path (no profiles file) must write port 8787, never 'None'."""
     from click.testing import CliRunner

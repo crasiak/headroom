@@ -3670,10 +3670,12 @@ def _resolve_claude_profile(*, flag: str | None, bedrock_base_url: str | None) -
     return rp
 
 
-def _resolve_codex_profile(*, flag: str | None):
+def _resolve_codex_profile(*, flag: str | None, port_override: int | None = None):
     """Resolve the profile for `wrap codex` and materialize the owned CODEX_HOME.
     Returns (ResolvedProfile, owned_codex_home: Path), or (None, None) when no
-    profiles file exists (caller falls back to the legacy in-place wrap)."""
+    profiles file exists (caller falls back to the legacy in-place wrap).
+    A --port override replaces the profile's derived port BEFORE the owned
+    config is written, so the config's base_url always matches the proxy."""
     from pathlib import Path
 
     from headroom.cli.codex_owned_config import write_codex_owned_config
@@ -3692,6 +3694,9 @@ def _resolve_codex_profile(*, flag: str | None):
     default_profile = (doc.get("profiles") or {}).get("default")
     name = select_profile_name(flag=flag, env=dict(os.environ), config_default=default_profile)
     rp = resolve_profile(name, profiles_path=path)
+    if port_override is not None:
+        import dataclasses
+        rp = dataclasses.replace(rp, port=port_override)
     owned_home = workspace_dir() / "codex" / name
     if rp.codex_seed_dir:
         write_codex_owned_config(Path(rp.codex_seed_dir), owned_home, rp.port)
@@ -6593,9 +6598,9 @@ def codex(
     # headroom-owned CODEX_HOME and the user's ~/.codex is NEVER mutated
     # (it is reserved for the GUI/desktop apps), so all of the in-place
     # ~/.codex setup must be skipped.
-    resolved, owned_home = _resolve_codex_profile(flag=profile)
+    resolved, owned_home = _resolve_codex_profile(flag=profile, port_override=port)
     profile_mode = resolved is not None and owned_home is not None
-    effective_port = port if port is not None else (resolved.port if profile_mode else 8787)
+    effective_port = resolved.port if profile_mode else (port if port is not None else 8787)
 
     if not profile_mode:
         # Legacy in-place wrap (no profiles file): original behavior.
@@ -6640,7 +6645,9 @@ def codex(
     _launch_tool(
         binary=codex_bin, args=codex_args, env=env, port=effective_port,
         no_proxy=no_proxy, tool_label=f"CODEX [{resolved.name}]",
-        env_vars_display=env_vars_display, learn=learn, memory=memory,
+        # Profile mode is compression-only in v1: the owned CODEX_HOME has
+        # no memory MCP registered, so proxy-side memory stays off too.
+        env_vars_display=env_vars_display, learn=learn, memory=False,
         agent_type="codex", code_graph=code_graph, backend=backend,
         anyllm_provider=anyllm_provider, region=region,
         openai_api_url=resolved.openai_upstream,
