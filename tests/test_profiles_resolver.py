@@ -1,0 +1,142 @@
+from __future__ import annotations
+
+import json
+import zlib
+from pathlib import Path
+
+import pytest
+
+from headroom.cli.profiles import (
+    ResolvedProfile,
+    _profile_port,
+    _strip_v1,
+    resolve_profile,
+    select_profile_name,
+)
+
+
+def test_strip_v1():
+    assert _strip_v1("https://h/v1") == "https://h"
+    assert _strip_v1("https://h/v1/") == "https://h"
+    assert _strip_v1("https://h") == "https://h"
+    assert _strip_v1(None) is None
+
+
+def test_profile_port_default_pins_8787():
+    assert _profile_port("personal", default_profile="personal") == 8787
+
+
+def test_profile_port_deterministic_and_stable():
+    p1 = _profile_port("company", default_profile="personal")
+    p2 = _profile_port("company", default_profile="personal")
+    assert p1 == p2 == 8788 + (zlib.crc32(b"company") % 1000)
+    assert p1 != 8787
+
+
+def test_profile_explicit_port_wins(tmp_path):
+    _write_profiles(tmp_path, """
+[profiles]
+default = "personal"
+[profiles.company]
+port = 9123
+codex_seed = "{seed}"
+""".replace("{seed}", str(_codex_seed(tmp_path))))
+    rp = resolve_profile("company", profiles_path=tmp_path / "profiles.toml")
+    assert rp.port == 9123
+
+
+def test_resolve_company_reads_both_seeds(tmp_path):
+    claude_seed = tmp_path / "settings.corelight.json"
+    claude_seed.write_text(json.dumps({"env": {
+        "ANTHROPIC_BEDROCK_BASE_URL": "https://ai.taileb6e.ts.net/bedrock",
+        "CLAUDE_CODE_USE_BEDROCK": "1",
+        "CLAUDE_CODE_SKIP_BEDROCK_AUTH": "1",
+        "ANTHROPIC_DEFAULT_SONNET_MODEL": "x",
+    }}))
+    seed_dir = _codex_seed(tmp_path)
+    _write_profiles(tmp_path, f"""
+[profiles]
+default = "personal"
+[profiles.company]
+claude_seed = "{claude_seed}"
+codex_seed = "{seed_dir}"
+""")
+    rp = resolve_profile("company", profiles_path=tmp_path / "profiles.toml")
+    assert rp.name == "company"
+    assert rp.bedrock_base_url == "https://ai.taileb6e.ts.net/bedrock"
+    assert rp.claude_env["CLAUDE_CODE_USE_BEDROCK"] == "1"
+    assert rp.claude_env["ANTHROPIC_DEFAULT_SONNET_MODEL"] == "x"
+    assert rp.openai_upstream == "https://ai.taileb6e.ts.net"   # /v1 stripped
+    assert rp.codex_seed_dir == str(seed_dir)
+    assert rp.port == 8788 + (zlib.crc32(b"company") % 1000)
+
+
+def test_resolve_personal_no_claude_seed(tmp_path):
+    seed_dir = _codex_seed(tmp_path, provider=None)  # pristine default-openai config
+    _write_profiles(tmp_path, f"""
+[profiles]
+default = "personal"
+[profiles.personal]
+codex_seed = "{seed_dir}"
+""")
+    rp = resolve_profile("personal", profiles_path=tmp_path / "profiles.toml")
+    assert rp.bedrock_base_url is None
+    assert rp.claude_env == {}
+    assert rp.openai_upstream is None         # no custom provider -> default OpenAI
+    assert rp.codex_seed_dir == str(seed_dir)
+    assert rp.port == 8787                     # it is the default profile
+
+
+def test_missing_seed_file_raises(tmp_path):
+    _write_profiles(tmp_path, """
+[profiles]
+default = "company"
+[profiles.company]
+codex_seed = "/no/such/dir"
+""")
+    with pytest.raises(FileNotFoundError) as exc:
+        resolve_profile("company", profiles_path=tmp_path / "profiles.toml")
+    assert "/no/such/dir" in str(exc.value)
+
+
+def test_unknown_profile_lists_available(tmp_path):
+    _write_profiles(tmp_path, """
+[profiles]
+default = "personal"
+[profiles.personal]
+[profiles.company]
+""")
+    with pytest.raises(KeyError) as exc:
+        resolve_profile("nope", profiles_path=tmp_path / "profiles.toml")
+    assert "personal" in str(exc.value) and "company" in str(exc.value)
+
+
+def test_select_profile_precedence(monkeypatch):
+    # flag > env > config default
+    assert select_profile_name(flag="company", env={"HEADROOM_PROFILE": "x"},
+                                config_default="personal") == "company"
+    assert select_profile_name(flag=None, env={"HEADROOM_PROFILE": "envp"},
+                                config_default="personal") == "envp"
+    assert select_profile_name(flag=None, env={}, config_default="personal") == "personal"
+    assert select_profile_name(flag=None, env={}, config_default=None) == "personal"
+
+
+# --- helpers ---
+def _write_profiles(tmp_path: Path, body: str) -> None:
+    (tmp_path / "profiles.toml").write_text(body)
+
+
+def _codex_seed(tmp_path: Path, provider: str | None = "corelight") -> Path:
+    d = tmp_path / "codexseed"
+    d.mkdir(exist_ok=True)
+    if provider:
+        (d / "config.toml").write_text(
+            f'model = "gpt-5.5"\n'
+            f'model_provider = "{provider}"\n'
+            f'[model_providers.{provider}]\n'
+            f'base_url = "https://ai.taileb6e.ts.net/v1"\n'
+            f'wire_api = "responses"\n'
+        )
+    else:
+        (d / "config.toml").write_text('model = "gpt-5.5"\n')
+    return d
