@@ -146,6 +146,106 @@ accounting is available on the non-streaming path only in v1.
 
 ---
 
+## Profiles (personal / company)
+
+Profiles let you switch both agents between named backends — e.g. a `personal`
+profile (Claude Max + ChatGPT Pro) and a `company` profile (Bedrock aperture +
+company Codex endpoint) — with one flag:
+
+```bash
+headroom wrap claude --profile company
+headroom wrap codex --profile company
+```
+
+Profiles live in `~/.headroom/profiles.toml`. The file is created automatically
+(as a starter template) the first time you pass `--profile` explicitly:
+
+```toml
+# Headroom wrap profiles. Select with: headroom wrap <agent> --profile <name>
+# (or set HEADROOM_PROFILE, or change `default` below).
+[profiles]
+default = "personal"
+
+[profiles.personal]
+codex_seed = "~/.codex"                              # ChatGPT / OpenAI Pro
+# no claude_seed -> Claude Max (default Anthropic, no Bedrock)
+
+[profiles.company]
+claude_seed = "~/.claude/settings.corelight.json"    # Bedrock aperture
+codex_seed  = "~/.codex-corelight"                    # aperture /v1 Responses
+```
+
+Edit the seed paths to match your machine, then wrap as usual.
+
+### Selecting a profile
+
+Precedence: `--profile` flag > `HEADROOM_PROFILE` env var > `default` in
+`profiles.toml` (which itself falls back to `personal`).
+
+```bash
+headroom wrap claude                      # uses the configured default (personal)
+headroom wrap claude --profile company    # explicit flag
+HEADROOM_PROFILE=company headroom wrap codex   # env-driven, e.g. per shell
+```
+
+If no `~/.headroom/profiles.toml` exists and you don't pass `--profile`, both
+commands keep their original (legacy) behavior described in Modes 1–3 above.
+
+### Seeds are read-only
+
+A profile references your *existing* config files as seeds; Headroom never
+modifies them:
+
+- **`claude_seed`** — a Claude settings JSON whose `env` block supplies
+  `ANTHROPIC_BEDROCK_BASE_URL` and the Bedrock flags. Omit it for plain
+  Claude Max (Mode 1).
+- **`codex_seed`** — a Codex home directory whose `config.toml` provider
+  `base_url` supplies the upstream. In profile mode Codex runs from a
+  **headroom-owned `CODEX_HOME`** at `~/.headroom/codex/<profile>/`: the seed's
+  `config.toml` is copied with the provider `base_url` rewritten to the local
+  proxy, and `auth.json` is carried over so your login persists. Your
+  `~/.codex*` directories are **never touched** in profile mode.
+
+Each profile starts one profile-complete proxy carrying both the Bedrock
+aperture URL (for Claude) and the OpenAI upstream (for Codex), so both agents
+share a single proxy per profile.
+
+**v1 limitation (codex profile mode):** rtk / MCP-retrieve / Serena / memory
+setup is skipped — core compression through the proxy still works. Claude
+profile mode keeps the full setup.
+
+### Per-profile ports
+
+Each profile gets its own proxy port so profiles can run side by side:
+
+- the configured default profile (e.g. `personal`) pins the canonical **8787**;
+- every other profile gets a deterministic crc32-derived port in 8788–9787
+  (`8788 + crc32(name) % 1000` — `company` lands on **9611**);
+- an explicit `port = <n>` field in the profile, or the `--port` flag,
+  overrides the derived port. The owned Codex config is always written against
+  the effective proxy port, so config and proxy can't drift apart.
+
+### Verify both agents through one profile proxy
+
+Run a company Claude and a company Codex, then watch the shared proxy's
+counters move:
+
+```bash
+# Terminal 1
+headroom wrap claude --profile company
+
+# Terminal 2
+headroom wrap codex --profile company
+
+# Terminal 3 — company's port is 9611 unless overridden
+curl -s http://127.0.0.1:9611/stats | jq .
+```
+
+Issue a prompt in each agent and re-run the `curl`; the request counters and
+token-savings figures should increase for both.
+
+---
+
 ## Troubleshooting
 
 - **HTTP 501 "not configured"** — the proxy received a Bedrock invoke path but no
