@@ -45,6 +45,13 @@ def _strip_v1(url: str | None) -> str | None:
 
 
 def _profile_port(name: str, *, default_profile: str) -> int:
+    """Deterministic per-profile proxy port.
+
+    The configured default profile pins to the canonical 8787; every other
+    profile gets a stable crc32-derived port (8788–9787). NOTE: changing
+    `[profiles] default` reassigns 8787 to the new default — a profile's port
+    is therefore relative to which profile is default, by design.
+    """
     if name == default_profile:
         return 8787
     return 8788 + (zlib.crc32(name.encode()) % 1000)
@@ -57,8 +64,11 @@ def _expand(p: str) -> Path:
 def load_profiles(profiles_path_: Path) -> dict:
     if not profiles_path_.exists():
         raise FileNotFoundError(f"No headroom profiles file at {profiles_path_}")
-    with open(profiles_path_, "rb") as f:
-        return tomllib.load(f)
+    try:
+        with open(profiles_path_, "rb") as f:
+            return tomllib.load(f)
+    except tomllib.TOMLDecodeError as e:
+        raise ValueError(f"{profiles_path_} is malformed TOML: {e}") from e
 
 
 def select_profile_name(*, flag: str | None, env: dict[str, str], config_default: str | None) -> str:
@@ -90,7 +100,7 @@ def _read_codex_seed(dir_path: Path) -> str | None:
     if base_url is None:
         base_url = data.get("openai_base_url")
     upstream = _strip_v1(base_url)
-    if upstream and ("127.0.0.1" in upstream or "localhost" in upstream):
+    if upstream and any(h in upstream for h in ("127.0.0.1", "localhost", "::1")):
         return None  # seed already wrapped to a local proxy -> treat as default
     return upstream
 
@@ -105,7 +115,13 @@ def resolve_profile(name: str, *, profiles_path: Path | None = None) -> Resolved
         available = sorted(k for k in table if k != "default")
         raise KeyError(f"Unknown profile '{name}'. Available: {available}")
 
-    port = int(profile["port"]) if "port" in profile else _profile_port(name, default_profile=default_profile)
+    if "port" in profile:
+        try:
+            port = int(profile["port"])
+        except (TypeError, ValueError) as e:
+            raise ValueError(f"profile '{name}' has a non-integer port: {profile['port']!r}") from e
+    else:
+        port = _profile_port(name, default_profile=default_profile)
 
     bedrock_base_url: str | None = None
     claude_env: dict[str, str] = {}

@@ -33,6 +33,12 @@ def test_profile_port_deterministic_and_stable():
     assert p1 != 8787
 
 
+def test_profile_port_default_pinning_is_relative():
+    # whichever profile is default pins to 8787; others are crc32-derived
+    assert _profile_port("company", default_profile="company") == 8787
+    assert _profile_port("personal", default_profile="company") == 8788 + (zlib.crc32(b"personal") % 1000)
+
+
 def test_profile_explicit_port_wins(tmp_path):
     _write_profiles(tmp_path, """
 [profiles]
@@ -119,6 +125,33 @@ def test_select_profile_precedence(monkeypatch):
                                 config_default="personal") == "envp"
     assert select_profile_name(flag=None, env={}, config_default="personal") == "personal"
     assert select_profile_name(flag=None, env={}, config_default=None) == "personal"
+
+
+def test_already_wrapped_codex_seed_returns_none(tmp_path):
+    d = tmp_path / "cx"; d.mkdir()
+    (d / "config.toml").write_text(
+        'model_provider="headroom"\n[model_providers.headroom]\nbase_url="http://127.0.0.1:8787/v1"\n')
+    _write_profiles(tmp_path, f'[profiles]\ndefault="personal"\n[profiles.personal]\ncodex_seed="{d}"\n')
+    rp = resolve_profile("personal", profiles_path=tmp_path / "profiles.toml")
+    assert rp.openai_upstream is None
+
+
+def test_codex_seed_provider_not_in_table_falls_back(tmp_path):
+    d = tmp_path / "cx"; d.mkdir()
+    (d / "config.toml").write_text('model_provider="ghost"\nopenai_base_url="https://h/v1"\n')
+    _write_profiles(tmp_path, f'[profiles]\ndefault="personal"\n[profiles.personal]\ncodex_seed="{d}"\n')
+    rp = resolve_profile("personal", profiles_path=tmp_path / "profiles.toml")
+    assert rp.openai_upstream == "https://h"
+
+
+def test_profile_with_no_seeds_resolves_all_none(tmp_path):
+    _write_profiles(tmp_path, '[profiles]\ndefault="personal"\n[profiles.personal]\n')
+    rp = resolve_profile("personal", profiles_path=tmp_path / "profiles.toml")
+    assert rp.bedrock_base_url is None and rp.openai_upstream is None and rp.codex_seed_dir is None
+
+
+def test_strip_v1_only_strips_one_suffix():
+    assert _strip_v1("https://h/v1/v1") == "https://h/v1"
 
 
 # --- helpers ---
