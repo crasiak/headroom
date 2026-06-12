@@ -3644,6 +3644,38 @@ def _apply_bedrock_child_env(
     return local_bedrock
 
 
+def _resolve_claude_profile(*, flag: str | None, bedrock_base_url: str | None):
+    """Resolve the profile for `wrap claude`. A --bedrock-base-url flag still
+    forces Bedrock mode without a profile (manual override)."""
+    from headroom.cli.profiles import (
+        ResolvedProfile, default_profiles_path, load_profiles,
+        resolve_profile, select_profile_name,
+    )
+    path = default_profiles_path()
+    if flag is not None and not path.exists():
+        try:
+            from headroom.cli.profiles import ensure_starter_profiles
+            path = ensure_starter_profiles()
+        except ImportError:
+            pass
+    if not path.exists():
+        # No profiles configured and no --profile: preserve legacy behavior via
+        # the flag / ambient detect, on the default port.
+        bedrock = _detect_bedrock_aperture(dict(os.environ), bedrock_base_url)
+        return ResolvedProfile(name="(none)", port=8787, bedrock_base_url=bedrock)
+    doc = load_profiles(path)
+    default_profile = (doc.get("profiles") or {}).get("default")
+    name = select_profile_name(flag=flag, env=dict(os.environ), config_default=default_profile)
+    rp = resolve_profile(name, profiles_path=path)
+    if bedrock_base_url:  # explicit flag overrides the profile's bedrock url
+        rp = ResolvedProfile(
+            name=rp.name, port=rp.port, bedrock_base_url=bedrock_base_url,
+            claude_env=rp.claude_env, openai_upstream=rp.openai_upstream,
+            codex_seed_dir=rp.codex_seed_dir,
+        )
+    return rp
+
+
 def _proxy_version(payload: dict[str, Any] | None) -> str | None:
     """Return the running proxy version when it exposes one."""
     if payload is None:
@@ -5106,9 +5138,9 @@ def wrap_selfheal(marker: str | None) -> None:
 @click.option(
     # no "-p" short alias here: claude's own -p/--print must fall through to CLAUDE_ARGS
     "--port",
-    default=8787,
+    default=None,
     type=click.IntRange(1, 65535),
-    help="Proxy port (default: 8787)",
+    help="Proxy port (default: profile port or 8787)",
 )
 @click.option(
     "--no-mcp",
@@ -5186,11 +5218,16 @@ def wrap_selfheal(marker: str | None) -> None:
     help="Force company-Bedrock aperture mode and route Claude Code's Bedrock "
          "traffic through the proxy to this upstream URL (overrides auto-detect).",
 )
+@click.option(
+    "--profile", "profile", default=None,
+    help="Named backend profile from ~/.headroom/profiles.toml (e.g. personal, company). "
+         "Default resolves from the profiles file; HEADROOM_PROFILE env overrides.",
+)
 @click.option("--verbose", "-v", is_flag=True, help="Verbose output")
 @click.option("--prepare-only", is_flag=True, hidden=True)
 @click.argument("claude_args", nargs=-1, type=click.UNPROCESSED)
 def claude(
-    port: int,
+    port: int | None,
     no_mcp: bool,
     no_tokensave: bool,
     serena: bool,
@@ -5204,6 +5241,7 @@ def claude(
     region: str | None,
     context_1m: bool,
     bedrock_base_url: str | None,
+    profile: str | None,
     verbose: bool,
     prepare_only: bool,
     claude_args: tuple,
@@ -5237,12 +5275,14 @@ def claude(
     if tool_search is not None:
         tool_search = _normalize_tool_search_mode(tool_search)
 
+    resolved = _resolve_claude_profile(flag=profile, bedrock_base_url=bedrock_base_url)
+    effective_port = port if port is not None else resolved.port
     proxy_holder: list[subprocess.Popen | None] = [None]
     _saved_base_url: list[str | None] = [None]  # previous settings.json value for restore
     _tool_search_not_written = object()
     _saved_tool_search: list[object | str | None] = [_tool_search_not_written]
     _settings_foundry: list[bool] = [False]
-    port_holder: list[int] = [port]
+    port_holder: list[int] = [effective_port]
     _settings_vertex: list[bool] = [False]
     # Bind before the try so the finally can always reference it. It is otherwise
     # only assigned inside the try (after _ensure_proxy, which can raise), so an
@@ -5310,6 +5350,8 @@ def claude(
         click.echo("  ╚═══════════════════════════════════════════════╝")
         click.echo()
 
+        bedrock_upstream = resolved.bedrock_base_url
+
         # Detect Foundry mode: Claude Code uses ANTHROPIC_FOUNDRY_BASE_URL instead of
         # ANTHROPIC_BASE_URL when CLAUDE_CODE_USE_FOUNDRY=1 is set.
         # Users typically set ANTHROPIC_FOUNDRY_RESOURCE (the resource name) rather
@@ -5335,21 +5377,15 @@ def claude(
         proxy_url = _claude_proxy_base_url(port)
         vertex_upstream = _vertex_target_api_url_from_claude_env(proxy_url) if use_vertex else None
 
-        # Detect company-Bedrock (Tailscale aperture) mode: the corelight
-        # profile sets CLAUDE_CODE_USE_BEDROCK=1 + ANTHROPIC_BEDROCK_BASE_URL.
-        # --bedrock-base-url forces/overrides. In this mode the proxy fronts the
-        # aperture and the child Claude Code points at the local proxy.
-        bedrock_upstream = _detect_bedrock_aperture(dict(os.environ), bedrock_base_url)
-
         if foundry_upstream and bedrock_upstream:
             click.echo(
                 "  Warning: both Foundry and Bedrock modes detected; Claude Code uses "
                 "Foundry first, so Bedrock-aperture compression will be inert."
             )
 
-        _register_proxy_client(port)
+        _register_proxy_client(effective_port)
         proxy_holder[0], actual_port = _ensure_proxy(
-            port,
+            effective_port,
             no_proxy,
             learn=learn,
             memory=memory,
@@ -5361,6 +5397,7 @@ def claude(
             vertex_api_url=vertex_upstream,
             clear_vertex_api_url=use_vertex and vertex_upstream is None,
             bedrock_api_url=bedrock_upstream,
+            openai_api_url=resolved.openai_upstream,
         )
         if actual_port != port:
             _unregister_proxy_client(port)
@@ -5440,6 +5477,7 @@ def claude(
         click.echo()
 
         env = os.environ.copy()
+        env.update(resolved.claude_env)
         if use_vertex:
             # Claude Code stays in Vertex mode (keeps CLAUDE_CODE_USE_VERTEX,
             # ANTHROPIC_VERTEX_PROJECT_ID, CLOUD_ML_REGION, ADC — all inherited);
@@ -5477,7 +5515,7 @@ def claude(
             foundry_mode=_settings_foundry[0],
             vertex_mode=_settings_vertex[0],
             settings_path=_wrap_settings_path,
-            port=port,
+            port=actual_port,
         )
         # Issue #2221: pair the marker just written with a reader. wrap installs
         # no hook of its own, so a session that only ran `wrap` (never `init`)
@@ -5488,9 +5526,9 @@ def claude(
         # directory's name via X-Headroom-Project (user override wins).
         _apply_project_header_env(env)
 
-        local_bedrock = _apply_bedrock_child_env(env, bedrock_upstream, port)
+        local_bedrock = _apply_bedrock_child_env(env, bedrock_upstream, actual_port)
         if local_bedrock:
-            click.echo(f"  Bedrock aperture: {bedrock_upstream} (via {local_bedrock})")
+            click.echo(f"  Bedrock aperture [{resolved.name}]: {bedrock_upstream} (via {local_bedrock})")
 
         # Issue #746: keep Claude Code's on-demand tool loading on through the
         # proxy so tool schemas are not eagerly materialized into local context.
