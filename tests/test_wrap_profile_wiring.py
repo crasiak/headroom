@@ -245,6 +245,97 @@ def test_codex_profile_mode_memory_disabled(tmp_path, monkeypatch):
     assert (user_codex / "config.toml").read_text() == sentinel
 
 
+def _ambient_bedrock_env():
+    return {
+        "CLAUDE_CODE_USE_BEDROCK": "1",
+        "ANTHROPIC_BEDROCK_BASE_URL": "https://ambient/bedrock",
+        "CLAUDE_CODE_SKIP_BEDROCK_AUTH": "1",
+        "PATH": "/usr/bin",
+    }
+
+
+def test_scrub_ambient_bedrock_env_no_bedrock_profile():
+    """A real profile without Bedrock must drop ambient Bedrock routing vars,
+    otherwise Claude Code would bypass the proxy and route to Bedrock directly."""
+    from headroom.cli.wrap import _scrub_ambient_bedrock_env
+
+    env = _ambient_bedrock_env()
+    _scrub_ambient_bedrock_env(env, profile_name="personal", bedrock_base_url=None)
+    assert "CLAUDE_CODE_USE_BEDROCK" not in env
+    assert "ANTHROPIC_BEDROCK_BASE_URL" not in env
+    assert "CLAUDE_CODE_SKIP_BEDROCK_AUTH" not in env
+    assert env["PATH"] == "/usr/bin"  # unrelated vars untouched
+
+
+def test_scrub_ambient_bedrock_env_bedrock_profile_untouched():
+    from headroom.cli.wrap import _scrub_ambient_bedrock_env
+
+    env = _ambient_bedrock_env()
+    _scrub_ambient_bedrock_env(
+        env, profile_name="company", bedrock_base_url="https://ap/bedrock"
+    )
+    assert env == _ambient_bedrock_env()
+
+
+def test_scrub_ambient_bedrock_env_legacy_none_untouched():
+    """The '(none)' legacy fallback keeps ambient detection — no scrubbing."""
+    from headroom.cli.wrap import _scrub_ambient_bedrock_env
+
+    env = _ambient_bedrock_env()
+    _scrub_ambient_bedrock_env(env, profile_name="(none)", bedrock_base_url=None)
+    assert env == _ambient_bedrock_env()
+
+
+def test_codex_profile_missing_seed_is_friendly_click_error(tmp_path, monkeypatch):
+    """A profile whose codex_seed points at a missing dir must fail with a
+    ClickException mentioning profiles.toml — never a raw traceback."""
+    from click.testing import CliRunner
+
+    from headroom.cli.wrap import codex
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    missing_seed = tmp_path / "does-not-exist"
+    (workspace / "profiles.toml").write_text(
+        f'[profiles]\ndefault="personal"\n[profiles.company]\ncodex_seed="{missing_seed}"\n'
+    )
+    monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(workspace))
+    monkeypatch.delenv("HEADROOM_PROFILE", raising=False)
+
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        result = runner.invoke(codex, ["--profile", "company", "--prepare-only"])
+    assert result.exit_code != 0
+    assert "profiles.toml" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_claude_unknown_profile_is_friendly_click_error(tmp_path, monkeypatch):
+    """An unknown --profile name must surface as a ClickException naming the
+    profiles file, with KeyError's quoting stripped."""
+    from click.testing import CliRunner
+
+    from headroom.cli import wrap as wrap_mod
+    from headroom.cli.wrap import claude
+
+    # The command checks for the claude binary before resolving the profile.
+    monkeypatch.setattr(wrap_mod.shutil, "which", lambda name: "/usr/bin/true")
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    (workspace / "profiles.toml").write_text('[profiles]\ndefault="personal"\n[profiles.personal]\n')
+    monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(workspace))
+    monkeypatch.delenv("HEADROOM_PROFILE", raising=False)
+
+    runner = CliRunner()
+    with runner.isolated_filesystem():
+        result = runner.invoke(claude, ["--profile", "nope"])
+    assert result.exit_code != 0
+    assert "profiles.toml" in result.output
+    assert "Unknown profile 'nope'" in result.output
+    assert "Traceback" not in result.output
+
+
 def test_codex_legacy_prepare_only_uses_default_port(tmp_path, monkeypatch):
     """Legacy path (no profiles file) must write port 8787, never 'None'."""
     from click.testing import CliRunner

@@ -3647,6 +3647,44 @@ def _apply_bedrock_child_env(
     return local_bedrock
 
 
+_AMBIENT_BEDROCK_VARS = (
+    "CLAUDE_CODE_USE_BEDROCK",
+    "ANTHROPIC_BEDROCK_BASE_URL",
+    "CLAUDE_CODE_SKIP_BEDROCK_AUTH",
+)
+
+
+def _scrub_ambient_bedrock_env(
+    env: dict[str, str], *, profile_name: str, bedrock_base_url: str | None
+) -> None:
+    """Drop ambient Bedrock routing vars when a real profile resolved without
+    Bedrock. A profile without Bedrock must not inherit ambient Bedrock
+    routing from the parent shell — Claude Code would route to Bedrock
+    directly and silently bypass the proxy; that ambient seam is exactly what
+    profiles exist to eliminate. Must run BEFORE the profile's own claude_env
+    is applied, so env supplied by the profile's seed is never scrubbed (a
+    seed may set CLAUDE_CODE_USE_BEDROCK without ANTHROPIC_BEDROCK_BASE_URL,
+    leaving bedrock_base_url None). The "(none)" sentinel — the legacy
+    no-profiles fallback — keeps the ambient-detect behavior untouched.
+    """
+    if profile_name == "(none)" or bedrock_base_url is not None:
+        return
+    for key in _AMBIENT_BEDROCK_VARS:
+        env.pop(key, None)
+
+
+def _profile_resolution_error(e: Exception) -> click.ClickException:
+    """Turn resolver failures (missing seed, unknown profile) into a friendly
+    ClickException pointing at the profiles file instead of a raw traceback."""
+    from headroom.cli.profiles import default_profiles_path
+
+    msg = str(e.args[0]) if isinstance(e, KeyError) and e.args else str(e)
+    return click.ClickException(
+        f"Profile resolution failed: {msg}. "
+        f"Edit {default_profiles_path()} (or pass --profile <name>)."
+    )
+
+
 def _resolve_claude_profile(*, flag: str | None, bedrock_base_url: str | None) -> ResolvedProfile:
     """Resolve the profile for `wrap claude`. A --bedrock-base-url flag still
     forces Bedrock mode without a profile (manual override)."""
@@ -3666,10 +3704,13 @@ def _resolve_claude_profile(*, flag: str | None, bedrock_base_url: str | None) -
         # the flag / ambient detect, on the default port.
         bedrock = _detect_bedrock_aperture(dict(os.environ), bedrock_base_url)
         return ResolvedProfile(name="(none)", port=8787, bedrock_base_url=bedrock)
-    doc = load_profiles(path)
-    default_profile = (doc.get("profiles") or {}).get("default")
-    name = select_profile_name(flag=flag, env=dict(os.environ), config_default=default_profile)
-    rp = resolve_profile(name, profiles_path=path)
+    try:
+        doc = load_profiles(path)
+        default_profile = (doc.get("profiles") or {}).get("default")
+        name = select_profile_name(flag=flag, env=dict(os.environ), config_default=default_profile)
+        rp = resolve_profile(name, profiles_path=path)
+    except (FileNotFoundError, KeyError) as e:
+        raise _profile_resolution_error(e) from e
     if bedrock_base_url:  # explicit flag overrides the profile's bedrock url
         import dataclasses
         rp = dataclasses.replace(rp, bedrock_base_url=bedrock_base_url)
@@ -3699,10 +3740,13 @@ def _resolve_codex_profile(*, flag: str | None, port_override: int | None = None
         path = ensure_starter_profiles()
     if not path.exists():
         return None, None
-    doc = load_profiles(path)
-    default_profile = (doc.get("profiles") or {}).get("default")
-    name = select_profile_name(flag=flag, env=dict(os.environ), config_default=default_profile)
-    rp = resolve_profile(name, profiles_path=path)
+    try:
+        doc = load_profiles(path)
+        default_profile = (doc.get("profiles") or {}).get("default")
+        name = select_profile_name(flag=flag, env=dict(os.environ), config_default=default_profile)
+        rp = resolve_profile(name, profiles_path=path)
+    except (FileNotFoundError, KeyError) as e:
+        raise _profile_resolution_error(e) from e
     if port_override is not None:
         import dataclasses
         rp = dataclasses.replace(rp, port=port_override)
@@ -5515,6 +5559,12 @@ def claude(
         click.echo()
 
         env = os.environ.copy()
+        # A profile without Bedrock must not inherit ambient Bedrock routing —
+        # that seam is exactly what profiles exist to eliminate. Scrub before
+        # claude_env so env supplied by the profile's own seed survives.
+        _scrub_ambient_bedrock_env(
+            env, profile_name=resolved.name, bedrock_base_url=resolved.bedrock_base_url
+        )
         env.update(resolved.claude_env)
         if use_vertex:
             # Claude Code stays in Vertex mode (keeps CLAUDE_CODE_USE_VERTEX,
