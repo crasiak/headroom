@@ -159,6 +159,21 @@ def _write_profiles(tmp_path: Path, body: str) -> None:
     (tmp_path / "profiles.toml").write_text(body)
 
 
+def test_ensure_starter_profiles_writes_template(tmp_path, monkeypatch):
+    monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(tmp_path))
+    from headroom.cli.profiles import default_profiles_path, ensure_starter_profiles
+    path = ensure_starter_profiles()
+    assert path == default_profiles_path()
+    assert path.exists()
+    body = path.read_text()
+    assert "[profiles]" in body and 'default = "personal"' in body
+    assert "[profiles.personal]" in body and "[profiles.company]" in body
+    # idempotent: second call does not overwrite
+    path.write_text(body + "\n# edited\n")
+    ensure_starter_profiles()
+    assert "# edited" in path.read_text()
+
+
 def _codex_seed(tmp_path: Path, provider: str | None = "corelight") -> Path:
     d = tmp_path / "codexseed"
     d.mkdir(exist_ok=True)

@@ -105,6 +105,31 @@ def _read_codex_seed(dir_path: Path) -> str | None:
     return upstream
 
 
+_STARTER_PROFILES = '''\
+# Headroom wrap profiles. Select with: headroom wrap <agent> --profile <name>
+# (or set HEADROOM_PROFILE, or change `default` below).
+[profiles]
+default = "personal"
+
+[profiles.personal]
+codex_seed = "~/.codex"                              # ChatGPT / OpenAI Pro
+# no claude_seed -> Claude Max (default Anthropic, no Bedrock)
+
+[profiles.company]
+claude_seed = "~/.claude/settings.corelight.json"    # Bedrock aperture
+codex_seed  = "~/.codex-corelight"                    # aperture /v1 Responses
+'''
+
+
+def ensure_starter_profiles() -> Path:
+    """Create a starter profiles.toml if none exists. Idempotent."""
+    path = default_profiles_path()
+    if not path.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(_STARTER_PROFILES)
+    return path
+
+
 def resolve_profile(name: str, *, profiles_path: Path | None = None) -> ResolvedProfile:
     path = profiles_path if profiles_path is not None else default_profiles_path()
     doc = load_profiles(path)

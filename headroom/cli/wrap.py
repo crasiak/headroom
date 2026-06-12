@@ -3653,11 +3653,8 @@ def _resolve_claude_profile(*, flag: str | None, bedrock_base_url: str | None) -
     )
     path = default_profiles_path()
     if flag is not None and not path.exists():
-        try:
-            from headroom.cli.profiles import ensure_starter_profiles
-            path = ensure_starter_profiles()
-        except ImportError:
-            pass
+        from headroom.cli.profiles import ensure_starter_profiles
+        path = ensure_starter_profiles()
     if not path.exists():
         # No profiles configured and no --profile: preserve legacy behavior via
         # the flag / ambient detect, on the default port.
@@ -3687,11 +3684,8 @@ def _resolve_codex_profile(*, flag: str | None):
 
     path = default_profiles_path()
     if flag is not None and not path.exists():
-        try:
-            from headroom.cli.profiles import ensure_starter_profiles
-            path = ensure_starter_profiles()
-        except ImportError:
-            pass
+        from headroom.cli.profiles import ensure_starter_profiles
+        path = ensure_starter_profiles()
     if not path.exists():
         return None, None
     doc = load_profiles(path)
