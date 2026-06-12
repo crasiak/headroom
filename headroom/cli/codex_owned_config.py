@@ -32,17 +32,22 @@ def build_owned_codex_config(seed_text: str, port: int) -> str:
     provider = doc.get("model_provider")
     providers = doc.get("model_providers") or {}
 
-    if isinstance(provider, str) and provider in providers and "base_url" in providers[provider]:
+    if isinstance(provider, str) and provider in providers:
         # Rewrite the active provider's base_url line in place (text-level so we
         # preserve comments/formatting/other keys). The base_url lives inside the
         # [model_providers.<provider>] table.
-        return _rewrite_provider_base_url(cleaned, provider, proxy_v1)
+        if "base_url" not in providers[provider]:
+            raise ValueError(
+                f"codex seed provider '{provider}' has no base_url to rewrite")
+        result = _rewrite_provider_base_url(cleaned, provider, proxy_v1)
+        _assert_routes_to_proxy(result, provider, proxy_v1)
+        return result
 
-    # Default-OpenAI seed: inject the top-level override at the front (bare keys
-    # must precede any [section]).
-    override = f'openai_base_url = "{proxy_v1}"\n'
-    body = cleaned.strip()
-    return f"{override}{body}\n" if body else override
+    # Default-OpenAI seed: replace/inject the top-level override so subscription
+    # traffic routes through the proxy.
+    result = _set_top_level_openai_base_url(cleaned, proxy_v1)
+    _assert_routes_to_proxy(result, None, proxy_v1)
+    return result
 
 
 def _rewrite_provider_base_url(text: str, provider: str, proxy_v1: str) -> str:
@@ -54,13 +59,52 @@ def _rewrite_provider_base_url(text: str, provider: str, proxy_v1: str) -> str:
     for line in lines:
         stripped = line.strip()
         if stripped.startswith("["):
-            in_table = stripped == header
+            header_part = stripped.split("#", 1)[0].rstrip()
+            in_table = header_part == header
         if in_table and re.match(r"\s*base_url\s*=", line):
             indent = line[: len(line) - len(line.lstrip())]
             out.append(f'{indent}base_url = "{proxy_v1}"\n')
             continue
         out.append(line)
     return "".join(out)
+
+
+def _set_top_level_openai_base_url(text: str, proxy_v1: str) -> str:
+    """Replace a top-level openai_base_url (before any [section]); else prepend."""
+    lines = text.splitlines(keepends=True)
+    out: list[str] = []
+    replaced = False
+    in_table = False
+    for line in lines:
+        s = line.strip()
+        if s.startswith("["):
+            in_table = True
+        if not in_table and re.match(r"\s*openai_base_url\s*=", line):
+            out.append(f'openai_base_url = "{proxy_v1}"\n')
+            replaced = True
+            continue
+        out.append(line)
+    body = "".join(out)
+    if replaced:
+        return body
+    body = body.strip()
+    return f'openai_base_url = "{proxy_v1}"\n{body}\n' if body else f'openai_base_url = "{proxy_v1}"\n'
+
+
+def _assert_routes_to_proxy(text: str, provider: str | None, proxy_v1: str) -> None:
+    """Guarantee the built config actually routes to the proxy; raise loudly
+    if a rewrite silently missed (e.g. inline-table provider syntax)."""
+    doc = tomllib.loads(text)
+    if provider is not None:
+        actual = (doc.get("model_providers") or {}).get(provider, {}).get("base_url")
+    else:
+        actual = doc.get("openai_base_url")
+    if actual != proxy_v1:
+        raise RuntimeError(
+            "codex owned-config did not route to the proxy "
+            f"(expected {proxy_v1!r}, got {actual!r}). The seed config uses an "
+            "unsupported shape (e.g. inline-table providers); edit the seed to "
+            "use a standard [model_providers.<name>] table.")
 
 
 def write_codex_owned_config(seed_dir: Path, owned_dir: Path, port: int) -> Path:

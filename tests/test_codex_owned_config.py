@@ -3,6 +3,8 @@ from __future__ import annotations
 import tomllib
 from pathlib import Path
 
+import pytest
+
 from headroom.cli.codex_owned_config import build_owned_codex_config, write_codex_owned_config
 
 
@@ -80,3 +82,37 @@ def test_write_codex_owned_config_does_not_touch_seed(tmp_path: Path):
     # auth.json carried over (symlink or copy) so login persists
     assert (owned_dir / "auth.json").exists()
     assert (owned_dir / "auth.json").read_text() == '{"token": "x"}'
+
+
+def test_trailing_comment_header_still_rewrites():
+    seed = (
+        'model_provider = "corelight"\n'
+        '[model_providers.corelight] # prod gateway\n'
+        'base_url = "https://ap/v1"\n'
+        'wire_api = "responses"\n'
+    )
+    out = build_owned_codex_config(seed, port=8830)
+    assert tomllib.loads(out)["model_providers"]["corelight"]["base_url"] == "http://127.0.0.1:8830/v1"
+
+
+def test_existing_openai_base_url_is_replaced_not_duplicated():
+    seed = 'openai_base_url = "https://myproxy.example.com/v1"\nmodel = "gpt-5.5"\n'
+    out = build_owned_codex_config(seed, port=8787)
+    assert out.count("openai_base_url") == 1
+    assert tomllib.loads(out)["openai_base_url"] == "http://127.0.0.1:8787/v1"
+
+
+def test_custom_provider_without_base_url_raises():
+    seed = 'model_provider = "corelight"\n[model_providers.corelight]\nwire_api = "responses"\n'
+    with pytest.raises(ValueError):
+        build_owned_codex_config(seed, port=8830)
+
+
+def test_inline_table_provider_fails_loudly():
+    seed = (
+        'model_provider = "corelight"\n'
+        '[model_providers]\n'
+        'corelight = { base_url = "https://ap/v1", wire_api = "responses" }\n'
+    )
+    with pytest.raises((RuntimeError, ValueError)):
+        build_owned_codex_config(seed, port=8830)
