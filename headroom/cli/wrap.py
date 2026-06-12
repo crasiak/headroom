@@ -4365,6 +4365,13 @@ def _ensure_proxy_unlocked(
                     requested_vertex_url = _normalize_proxy_api_url(vertex_api_url)
                     if running_vertex_url != requested_vertex_url:
                         missing.append("vertex-api-url")
+                if bedrock_api_url:
+                    running_bedrock_url = _normalize_proxy_api_url(
+                        running_config.get("bedrock_api_url")
+                    )
+                    requested_bedrock_url = _normalize_proxy_api_url(bedrock_api_url)
+                    if running_bedrock_url != requested_bedrock_url:
+                        missing.append("bedrock-api-url")
 
                 if missing:
                     flags_str = ", ".join(

@@ -3445,6 +3445,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 "code_graph": config.code_graph_watcher,
                 "anthropic_api_url": config.anthropic_api_url,
                 "openai_api_url": config.openai_api_url,
+                "bedrock_api_url": config.bedrock_base_url,
                 "gemini_api_url": config.gemini_api_url,
                 "cloudcode_api_url": config.cloudcode_api_url,
                 "vertex_api_url": config.vertex_api_url,
