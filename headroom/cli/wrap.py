@@ -3644,7 +3644,7 @@ def _apply_bedrock_child_env(
     return local_bedrock
 
 
-def _resolve_claude_profile(*, flag: str | None, bedrock_base_url: str | None):
+def _resolve_claude_profile(*, flag: str | None, bedrock_base_url: str | None) -> "ResolvedProfile":
     """Resolve the profile for `wrap claude`. A --bedrock-base-url flag still
     forces Bedrock mode without a profile (manual override)."""
     from headroom.cli.profiles import (
@@ -3668,11 +3668,8 @@ def _resolve_claude_profile(*, flag: str | None, bedrock_base_url: str | None):
     name = select_profile_name(flag=flag, env=dict(os.environ), config_default=default_profile)
     rp = resolve_profile(name, profiles_path=path)
     if bedrock_base_url:  # explicit flag overrides the profile's bedrock url
-        rp = ResolvedProfile(
-            name=rp.name, port=rp.port, bedrock_base_url=bedrock_base_url,
-            claude_env=rp.claude_env, openai_upstream=rp.openai_upstream,
-            codex_seed_dir=rp.codex_seed_dir,
-        )
+        import dataclasses
+        rp = dataclasses.replace(rp, bedrock_base_url=bedrock_base_url)
     return rp
 
 
@@ -5528,7 +5525,8 @@ def claude(
 
         local_bedrock = _apply_bedrock_child_env(env, bedrock_upstream, actual_port)
         if local_bedrock:
-            click.echo(f"  Bedrock aperture [{resolved.name}]: {bedrock_upstream} (via {local_bedrock})")
+            label = "" if resolved.name == "(none)" else f" [{resolved.name}]"
+            click.echo(f"  Bedrock aperture{label}: {bedrock_upstream} (via {local_bedrock})")
 
         # Issue #746: keep Claude Code's on-demand tool loading on through the
         # proxy so tool schemas are not eagerly materialized into local context.
