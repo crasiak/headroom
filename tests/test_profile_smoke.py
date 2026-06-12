@@ -23,6 +23,7 @@ def _help(cmd: str) -> str:
         text=True,
         timeout=60,
     )
+    assert out.returncode == 0, out.stderr
     return out.stdout
 
 

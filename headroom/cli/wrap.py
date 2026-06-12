@@ -6600,6 +6600,8 @@ def codex(
     # ~/.codex setup must be skipped.
     resolved, owned_home = _resolve_codex_profile(flag=profile, port_override=port)
     profile_mode = resolved is not None and owned_home is not None
+    # NOTE: resolved.port already incorporates the --port override (passed as
+    # port_override above) -- do not "simplify" that call or the flag breaks.
     effective_port = resolved.port if profile_mode else (port if port is not None else 8787)
 
     if not profile_mode:

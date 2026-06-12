@@ -3,6 +3,8 @@
 Headroom supports three non-API-key access modes: **Claude Max subscription** (OAuth),
 **OpenAI Pro / ChatGPT subscription** (Codex OAuth), and **company Bedrock via a
 Tailscale gateway** ("aperture"). You do not need an API key for any of these modes.
+Named profiles (see the [Profiles](#profiles-personal--company) section) let you
+switch between these modes with a single `--profile` flag.
 See the [design doc](superpowers/specs/2026-06-11-subscription-and-aperture-bedrock-design.md)
 for the full architecture and wire-format analysis.
 
@@ -237,7 +239,8 @@ headroom wrap claude --profile company
 # Terminal 2
 headroom wrap codex --profile company
 
-# Terminal 3 — company's port is 9611 unless overridden
+# Terminal 3 — company's port is 9611 unless overridden; use the port the
+# wrap command prints at startup
 curl -s http://127.0.0.1:9611/stats | jq .
 ```
 

@@ -235,7 +235,7 @@ def test_codex_profile_mode_memory_disabled(tmp_path, monkeypatch):
     with runner.isolated_filesystem():
         result = runner.invoke(codex, ["--profile", "company", "--memory"])
     assert result.exit_code == 0, result.output
-    assert "memory" in result.output  # skip is visible in the profile-mode echo
+    assert "skipping rtk/MCP/Serena/memory" in result.output  # the profile-mode skip echo
     assert calls, "_launch_tool was not called"
     assert calls["memory"] is False
     # No memory MCP write to the user's ~/.codex.
