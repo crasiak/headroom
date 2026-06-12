@@ -4,7 +4,8 @@ A profile is a named backend defined in ``~/.headroom/profiles.toml`` and
 seeded from the user's existing agent config files. The resolver reads the
 profile + its seed files and returns a ``ResolvedProfile`` the wrap commands
 use to start a profile-complete proxy and configure the child agent. Pure
-except for reading those files; never writes anything.
+except for reading those files; the only write is ensure_starter_profiles()
+bootstrapping a starter template.
 """
 
 from __future__ import annotations

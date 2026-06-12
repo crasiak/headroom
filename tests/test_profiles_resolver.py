@@ -5,6 +5,7 @@ import zlib
 from pathlib import Path
 
 import pytest
+import tomllib
 
 from headroom.cli.profiles import (
     ResolvedProfile,
@@ -168,6 +169,11 @@ def test_ensure_starter_profiles_writes_template(tmp_path, monkeypatch):
     body = path.read_text()
     assert "[profiles]" in body and 'default = "personal"' in body
     assert "[profiles.personal]" in body and "[profiles.company]" in body
+    # template must stay valid TOML
+    doc = tomllib.loads(body)
+    assert doc["profiles"]["default"] == "personal"
+    assert isinstance(doc["profiles"]["personal"], dict)
+    assert isinstance(doc["profiles"]["company"], dict)
     # idempotent: second call does not overwrite
     path.write_text(body + "\n# edited\n")
     ensure_starter_profiles()
