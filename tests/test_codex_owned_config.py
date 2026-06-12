@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import tomllib
 from pathlib import Path
 
 import pytest
+import tomllib
 
 from headroom.cli.codex_owned_config import build_owned_codex_config, write_codex_owned_config
 

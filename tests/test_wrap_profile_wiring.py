@@ -11,7 +11,8 @@ def test_resolve_claude_profile_company(tmp_path, monkeypatch):
         "ANTHROPIC_BEDROCK_BASE_URL": "https://ap/bedrock",
         "CLAUDE_CODE_USE_BEDROCK": "1",
     }}))
-    seed_dir = tmp_path / "cx"; seed_dir.mkdir()
+    seed_dir = tmp_path / "cx"
+    seed_dir.mkdir()
     (seed_dir / "config.toml").write_text(
         'model_provider="corelight"\n[model_providers.corelight]\nbase_url="https://ap/v1"\n')
     (tmp_path / "profiles.toml").write_text(
@@ -29,9 +30,11 @@ def test_resolve_claude_profile_company(tmp_path, monkeypatch):
 
 def test_resolve_codex_profile_company(tmp_path, monkeypatch):
     from pathlib import Path
+
     from headroom.cli.wrap import _resolve_codex_profile
 
-    seed_dir = tmp_path / "cx"; seed_dir.mkdir()
+    seed_dir = tmp_path / "cx"
+    seed_dir.mkdir()
     (seed_dir / "config.toml").write_text(
         'model="gpt-5.5"\nmodel_provider="corelight"\n'
         '[model_providers.corelight]\nbase_url="https://ap/v1"\nwire_api="responses"\n')

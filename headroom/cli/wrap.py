@@ -36,7 +36,10 @@ from collections.abc import Callable, Mapping
 from contextlib import contextmanager
 from functools import wraps
 from pathlib import Path
-from typing import Any, NamedTuple, cast
+from typing import TYPE_CHECKING, Any, NamedTuple, cast
+
+if TYPE_CHECKING:
+    from headroom.cli.profiles import ResolvedProfile
 
 from headroom._subprocess import pid_alive, run
 
@@ -3644,12 +3647,15 @@ def _apply_bedrock_child_env(
     return local_bedrock
 
 
-def _resolve_claude_profile(*, flag: str | None, bedrock_base_url: str | None) -> "ResolvedProfile":
+def _resolve_claude_profile(*, flag: str | None, bedrock_base_url: str | None) -> ResolvedProfile:
     """Resolve the profile for `wrap claude`. A --bedrock-base-url flag still
     forces Bedrock mode without a profile (manual override)."""
     from headroom.cli.profiles import (
-        ResolvedProfile, default_profiles_path, load_profiles,
-        resolve_profile, select_profile_name,
+        ResolvedProfile,
+        default_profiles_path,
+        load_profiles,
+        resolve_profile,
+        select_profile_name,
     )
     path = default_profiles_path()
     if flag is not None and not path.exists():
@@ -3680,7 +3686,10 @@ def _resolve_codex_profile(*, flag: str | None, port_override: int | None = None
 
     from headroom.cli.codex_owned_config import write_codex_owned_config
     from headroom.cli.profiles import (
-        default_profiles_path, load_profiles, resolve_profile, select_profile_name,
+        default_profiles_path,
+        load_profiles,
+        resolve_profile,
+        select_profile_name,
     )
     from headroom.paths import workspace_dir
 

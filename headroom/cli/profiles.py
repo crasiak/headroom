@@ -11,10 +11,11 @@ bootstrapping a starter template.
 from __future__ import annotations
 
 import json
-import tomllib
 import zlib
 from dataclasses import dataclass, field
 from pathlib import Path
+
+import tomllib
 
 from headroom.paths import workspace_dir
 

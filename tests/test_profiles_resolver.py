@@ -8,7 +8,6 @@ import pytest
 import tomllib
 
 from headroom.cli.profiles import (
-    ResolvedProfile,
     _profile_port,
     _strip_v1,
     resolve_profile,
@@ -129,7 +128,8 @@ def test_select_profile_precedence(monkeypatch):
 
 
 def test_already_wrapped_codex_seed_returns_none(tmp_path):
-    d = tmp_path / "cx"; d.mkdir()
+    d = tmp_path / "cx"
+    d.mkdir()
     (d / "config.toml").write_text(
         'model_provider="headroom"\n[model_providers.headroom]\nbase_url="http://127.0.0.1:8787/v1"\n')
     _write_profiles(tmp_path, f'[profiles]\ndefault="personal"\n[profiles.personal]\ncodex_seed="{d}"\n')
@@ -138,7 +138,8 @@ def test_already_wrapped_codex_seed_returns_none(tmp_path):
 
 
 def test_codex_seed_provider_not_in_table_falls_back(tmp_path):
-    d = tmp_path / "cx"; d.mkdir()
+    d = tmp_path / "cx"
+    d.mkdir()
     (d / "config.toml").write_text('model_provider="ghost"\nopenai_base_url="https://h/v1"\n')
     _write_profiles(tmp_path, f'[profiles]\ndefault="personal"\n[profiles.personal]\ncodex_seed="{d}"\n')
     rp = resolve_profile("personal", profiles_path=tmp_path / "profiles.toml")

@@ -18,8 +18,9 @@ from __future__ import annotations
 
 import re
 import shutil
-import tomllib
 from pathlib import Path
+
+import tomllib
 
 from headroom.cli.wrap import _strip_codex_headroom_blocks
 
