@@ -9,6 +9,6 @@ def test_health_payload_exposes_bedrock_api_url():
                     rate_limit_enabled=False)
     )
     from headroom.proxy import server as srv
-    payload = srv._build_health_config(proxy.config)   # helper added in Step 3
+    payload = srv._build_health_config(proxy.config)   # module-level health helper
     assert payload["bedrock_api_url"] == "https://ap/bedrock"
     assert payload["openai_api_url"] == proxy.config.openai_api_url
