@@ -3673,6 +3673,37 @@ def _resolve_claude_profile(*, flag: str | None, bedrock_base_url: str | None) -
     return rp
 
 
+def _resolve_codex_profile(*, flag: str | None):
+    """Resolve the profile for `wrap codex` and materialize the owned CODEX_HOME.
+    Returns (ResolvedProfile, owned_codex_home: Path), or (None, None) when no
+    profiles file exists (caller falls back to the legacy in-place wrap)."""
+    from pathlib import Path
+
+    from headroom.cli.codex_owned_config import write_codex_owned_config
+    from headroom.cli.profiles import (
+        default_profiles_path, load_profiles, resolve_profile, select_profile_name,
+    )
+    from headroom.paths import workspace_dir
+
+    path = default_profiles_path()
+    if flag is not None and not path.exists():
+        try:
+            from headroom.cli.profiles import ensure_starter_profiles
+            path = ensure_starter_profiles()
+        except ImportError:
+            pass
+    if not path.exists():
+        return None, None
+    doc = load_profiles(path)
+    default_profile = (doc.get("profiles") or {}).get("default")
+    name = select_profile_name(flag=flag, env=dict(os.environ), config_default=default_profile)
+    rp = resolve_profile(name, profiles_path=path)
+    owned_home = workspace_dir() / "codex" / name
+    if rp.codex_seed_dir:
+        write_codex_owned_config(Path(rp.codex_seed_dir), owned_home, rp.port)
+    return rp, owned_home
+
+
 def _proxy_version(payload: dict[str, Any] | None) -> str | None:
     """Return the running proxy version when it exposes one."""
     if payload is None:
@@ -4829,6 +4860,7 @@ def _launch_tool(
             region=region,
             openai_api_url=openai_api_url,
             anthropic_api_url=anthropic_api_url,
+            bedrock_api_url=bedrock_api_url,
             copilot_api_token=copilot_api_token,
             copilot_refresh_oauth_token=copilot_refresh_oauth_token,
             copilot_api_token_expires_at=copilot_api_token_expires_at,
@@ -6467,7 +6499,11 @@ def _run_codex_wrap(
 @_retired_context_tool_option
 @_serena_instructions_option
 @click.option(
-    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
+    "--port",
+    "-p",
+    default=None,
+    type=click.IntRange(1, 65535),
+    help="Proxy port (default: profile port or 8787)",
 )
 @click.option(
     "--no-mcp",
@@ -6515,12 +6551,17 @@ def _run_codex_wrap(
 @click.option(
     "--region", default=None, help="Cloud region for Bedrock/Vertex (env: HEADROOM_REGION)"
 )
+@click.option(
+    "--profile", "profile", default=None,
+    help="Named backend profile from ~/.headroom/profiles.toml (e.g. personal, company). "
+         "Default resolves from the profiles file; HEADROOM_PROFILE env overrides.",
+)
 @click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
 @click.option("--verbose", "-v", is_flag=True, help="Verbose output")
 @click.option("--prepare-only", is_flag=True, hidden=True)
 @click.argument("codex_args", nargs=-1, type=click.UNPROCESSED)
 def codex(
-    port: int,
+    port: int | None,
     no_mcp: bool,
     no_tokensave: bool,
     serena: bool,
@@ -6532,6 +6573,7 @@ def codex(
     backend: str | None,
     anyllm_provider: str | None,
     region: str | None,
+    profile: str | None,
     verbose: bool,
     prepare_only: bool,
     codex_args: tuple,
@@ -6552,8 +6594,34 @@ def codex(
         headroom wrap codex --port 9999             # Custom proxy port
         headroom wrap codex --backend anyllm --anyllm-provider groq
     """
+    # Resolve the named profile FIRST. In profile mode codex runs from a
+    # headroom-owned CODEX_HOME and the user's ~/.codex is NEVER mutated
+    # (it is reserved for the GUI/desktop apps), so the in-place ~/.codex
+    # wrap flow below must be skipped entirely.
+    resolved, owned_home = _resolve_codex_profile(flag=profile)
+    if resolved is not None and owned_home is not None:
+        codex_bin = shutil.which("codex")
+        if not codex_bin:
+            click.echo("Error: 'codex' not found in PATH.")
+            click.echo("Install Codex CLI: npm install -g @openai/codex")
+            raise SystemExit(1)
+
+        effective_port = port if port is not None else resolved.port
+        env, env_vars_display = _build_codex_launch_env(effective_port, os.environ)
+        env["CODEX_HOME"] = str(owned_home)  # headroom-owned config; user's ~/.codex* untouched
+        _launch_tool(
+            binary=codex_bin, args=codex_args, env=env, port=effective_port,
+            no_proxy=no_proxy, tool_label=f"CODEX [{resolved.name}]",
+            env_vars_display=env_vars_display, learn=learn, memory=memory,
+            agent_type="codex", code_graph=code_graph, backend=backend,
+            anyllm_provider=anyllm_provider, region=region,
+            openai_api_url=resolved.openai_upstream,
+            bedrock_api_url=resolved.bedrock_base_url,
+        )
+        return
+
     return _run_codex_wrap(
-        port=port,
+        port=port if port is not None else 8787,
         no_mcp=no_mcp,
         no_tokensave=no_tokensave,
         serena=serena,
