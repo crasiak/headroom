@@ -150,9 +150,12 @@ def link_shared_skills(owned_dir: Path, shared_skills: Path | None = None) -> Pa
             link.symlink_to(shared_skills)
         return link
     if link.is_dir():
-        if any(link.iterdir()):
+        # Codex auto-creates skills/.system (bundled system skills) in every
+        # home; the shared store carries its own copy, so it doesn't count as
+        # a local install when judging emptiness.
+        if any(p.name != ".system" for p in link.iterdir()):
             return None  # local skills present -> profile stays independent
-        link.rmdir()  # empty dir codex auto-created; replace with the link
+        shutil.rmtree(link)  # only codex boilerplate; replace with the link
     owned_dir.mkdir(parents=True, exist_ok=True)
     link.symlink_to(shared_skills)
     return link

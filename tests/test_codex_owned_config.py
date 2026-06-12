@@ -165,6 +165,20 @@ def test_link_shared_skills_replaces_empty_local_dir(tmp_path: Path):
     assert link.resolve() == shared.resolve()
 
 
+def test_link_shared_skills_replaces_dir_with_only_codex_system_boilerplate(tmp_path: Path):
+    # Codex auto-creates skills/.system in every home; it must not count as a
+    # local install (the shared store has its own copy).
+    shared = _shared_store(tmp_path)
+    owned = tmp_path / "owned"
+    system = owned / "skills" / ".system" / "skill-creator"
+    system.mkdir(parents=True)
+
+    link = link_shared_skills(owned, shared_skills=shared)
+
+    assert link is not None and link.is_symlink()
+    assert link.resolve() == shared.resolve()
+
+
 def test_link_shared_skills_preserves_local_installs(tmp_path: Path):
     shared = _shared_store(tmp_path)
     owned = tmp_path / "owned"
