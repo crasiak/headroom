@@ -7,6 +7,7 @@ import tomllib
 
 from headroom.cli.codex_owned_config import (
     build_owned_codex_config,
+    link_shared_codex_entries,
     link_shared_skills,
     write_codex_owned_config,
 )
@@ -215,3 +216,70 @@ def test_link_shared_skills_repoints_stale_symlink(tmp_path: Path):
 
     assert link is not None and link.is_symlink()
     assert link.resolve() == shared.resolve()
+
+
+def _shared_codex_root(tmp_path: Path) -> Path:
+    """A fake ~/.codex with skills (+ .system), prompts, and AGENTS.md."""
+    root = tmp_path / "dotcodex"
+    (root / "skills" / "glab").mkdir(parents=True)
+    (root / "skills" / ".system").mkdir(parents=True)
+    (root / "prompts").mkdir(parents=True)
+    (root / "prompts" / "deploy.md").write_text("deploy")
+    (root / "AGENTS.md").write_text("# global agents\n")
+    return root
+
+
+def test_link_shared_codex_entries_links_all_three(tmp_path: Path):
+    root = _shared_codex_root(tmp_path)
+    owned = tmp_path / "owned"
+    owned.mkdir()
+
+    res = link_shared_codex_entries(owned, shared_root=root)
+
+    for name in ("skills", "prompts", "AGENTS.md"):
+        assert res[name] == owned / name
+        assert (owned / name).is_symlink()
+        assert (owned / name).resolve() == (root / name).resolve()
+    # content visible through the links
+    assert (owned / "prompts" / "deploy.md").read_text() == "deploy"
+    assert (owned / "AGENTS.md").read_text() == "# global agents\n"
+
+
+def test_link_shared_codex_entries_skips_missing_source(tmp_path: Path):
+    # Only skills exists in the shared root; prompts/AGENTS.md absent.
+    root = tmp_path / "dotcodex"
+    (root / "skills" / "glab").mkdir(parents=True)
+    owned = tmp_path / "owned"
+    owned.mkdir()
+
+    res = link_shared_codex_entries(owned, shared_root=root)
+
+    assert res["skills"] is not None and (owned / "skills").is_symlink()
+    assert res["prompts"] is None and not (owned / "prompts").exists()
+    assert res["AGENTS.md"] is None and not (owned / "AGENTS.md").exists()
+
+
+def test_link_shared_codex_entries_preserves_local_agents_md(tmp_path: Path):
+    root = _shared_codex_root(tmp_path)
+    owned = tmp_path / "owned"
+    owned.mkdir()
+    (owned / "AGENTS.md").write_text("# profile-specific\n")
+
+    res = link_shared_codex_entries(owned, shared_root=root)
+
+    assert res["AGENTS.md"] is None
+    assert not (owned / "AGENTS.md").is_symlink()
+    assert (owned / "AGENTS.md").read_text() == "# profile-specific\n"
+
+
+def test_link_shared_codex_entries_replaces_empty_local_agents_md(tmp_path: Path):
+    root = _shared_codex_root(tmp_path)
+    owned = tmp_path / "owned"
+    owned.mkdir()
+    (owned / "AGENTS.md").write_text("")  # empty placeholder -> replaceable
+
+    res = link_shared_codex_entries(owned, shared_root=root)
+
+    assert res["AGENTS.md"] is not None
+    assert (owned / "AGENTS.md").is_symlink()
+    assert (owned / "AGENTS.md").resolve() == (root / "AGENTS.md").resolve()

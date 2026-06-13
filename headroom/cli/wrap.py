@@ -3728,7 +3728,7 @@ def _resolve_codex_profile(*, flag: str | None, port_override: int | None = None
     from pathlib import Path
 
     from headroom.cli.codex_owned_config import (
-        link_shared_skills,
+        link_shared_codex_entries,
         write_codex_owned_config,
     )
     from headroom.cli.profiles import (
@@ -3760,14 +3760,16 @@ def _resolve_codex_profile(*, flag: str | None, port_override: int | None = None
     owned_home = workspace_dir() / "codex" / name
     if rp.codex_seed_dir:
         write_codex_owned_config(Path(rp.codex_seed_dir), owned_home, rp.port)
-        # All profile homes share one skill store (~/.codex/skills) via a
-        # symlink, so installs from any profile land in the same place.
-        local_skills = owned_home / "skills"
-        if link_shared_skills(owned_home) is None and local_skills.is_dir():
-            click.echo(
-                f"  Note: {local_skills} has local skills; "
-                "not linking shared ~/.codex/skills"
-            )
+        # All profile homes share the default codex skills/prompts/AGENTS.md
+        # (~/.codex/<name>) via symlinks, so installs/edits from any profile
+        # land in one place. A profile home with its own local copy is left
+        # untouched.
+        for shared_name, linked in link_shared_codex_entries(owned_home).items():
+            if linked is None and (owned_home / shared_name).exists():
+                click.echo(
+                    f"  Note: {owned_home / shared_name} has local content; "
+                    f"not linking shared ~/.codex/{shared_name}"
+                )
     return rp, owned_home
 
 

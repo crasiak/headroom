@@ -128,34 +128,79 @@ def write_codex_owned_config(seed_dir: Path, owned_dir: Path, port: int) -> Path
     return owned_cfg
 
 
-def link_shared_skills(owned_dir: Path, shared_skills: Path | None = None) -> Path | None:
-    """Symlink ``owned_dir/skills`` at the user's shared codex skill store.
+# Entries under the default codex home (~/.codex) that every profile home
+# shares via symlink, so installs/edits from any profile land in one place.
+# Each is (name, kind); kind is "dir" or "file". config.toml and auth.json are
+# deliberately NOT shared — they carry the per-profile backend and credentials.
+_SHARED_CODEX_ENTRIES: tuple[tuple[str, str], ...] = (
+    ("skills", "dir"),
+    ("prompts", "dir"),
+    ("AGENTS.md", "file"),
+)
 
-    All profile codex homes share one skill store (default ``~/.codex/skills``)
-    so a skill installed from inside any profile lands in the same place.
-    Never writes into the shared store itself. Returns the symlink path, or
-    None when no link was made (no shared store, or local skills already
-    present in the owned home — those are left untouched).
+# Children of a shared dir that codex auto-creates in every home and that
+# therefore don't count as a "local install" when judging emptiness.
+_CODEX_DIR_BOILERPLATE: dict[str, set[str]] = {"skills": {".system"}}
+
+
+def link_shared_codex_entries(
+    owned_dir: Path, shared_root: Path | None = None
+) -> dict[str, Path | None]:
+    """Symlink each shareable entry in ``owned_dir`` at the user's default
+    codex home (``~/.codex/<name>``), so skills/prompts/AGENTS.md edited or
+    installed from any profile land in one shared place. Never writes into the
+    shared store itself. Returns ``{name: Path | None}`` — None means not linked
+    (no shared source, or a local copy is present and was left untouched).
     """
+    if shared_root is None:
+        shared_root = Path.home() / ".codex"
+    return {
+        name: _link_shared_entry(
+            owned_dir / name,
+            shared_root / name,
+            kind,
+            ignore=_CODEX_DIR_BOILERPLATE.get(name, frozenset()),
+        )
+        for name, kind in _SHARED_CODEX_ENTRIES
+    }
+
+
+def _link_shared_entry(
+    link: Path, target: Path, kind: str, ignore: frozenset[str] | set[str] = frozenset()
+) -> Path | None:
+    """Point ``link`` at ``target`` (a shared file or dir). No-op returning None
+    when the target is absent or ``link`` already holds local content."""
+    if kind == "dir":
+        if not target.is_dir():
+            return None
+    elif not target.is_file():
+        return None
+
+    # is_symlink() before exists()/is_dir(): a symlink to a dir is both.
+    if link.is_symlink():
+        if link.resolve() != target.resolve():
+            link.unlink()
+            link.symlink_to(target)
+        return link
+    if link.exists():
+        if link.is_dir():
+            if any(p.name not in ignore for p in link.iterdir()):
+                return None  # local content -> profile stays independent
+            shutil.rmtree(link)  # only boilerplate; replace with the link
+        else:  # real file
+            if link.stat().st_size > 0:
+                return None  # local content -> leave it
+            link.unlink()
+    link.parent.mkdir(parents=True, exist_ok=True)
+    link.symlink_to(target)
+    return link
+
+
+def link_shared_skills(owned_dir: Path, shared_skills: Path | None = None) -> Path | None:
+    """Back-compat shim: link only ``owned_dir/skills`` at the shared skill
+    store (default ``~/.codex/skills``). See ``link_shared_codex_entries``."""
     if shared_skills is None:
         shared_skills = Path.home() / ".codex" / "skills"
-    if not shared_skills.is_dir():
-        return None  # no shared store -> no dangling link
-
-    link = owned_dir / "skills"
-    # is_symlink() before is_dir(): a symlink to a dir is both.
-    if link.is_symlink():
-        if link.resolve() != shared_skills.resolve():
-            link.unlink()
-            link.symlink_to(shared_skills)
-        return link
-    if link.is_dir():
-        # Codex auto-creates skills/.system (bundled system skills) in every
-        # home; the shared store carries its own copy, so it doesn't count as
-        # a local install when judging emptiness.
-        if any(p.name != ".system" for p in link.iterdir()):
-            return None  # local skills present -> profile stays independent
-        shutil.rmtree(link)  # only codex boilerplate; replace with the link
-    owned_dir.mkdir(parents=True, exist_ok=True)
-    link.symlink_to(shared_skills)
-    return link
+    return _link_shared_entry(
+        owned_dir / "skills", shared_skills, "dir", ignore={".system"}
+    )

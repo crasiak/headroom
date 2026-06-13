@@ -216,12 +216,16 @@ share a single proxy per profile.
 setup is skipped — core compression through the proxy still works. Claude
 profile mode keeps the full setup.
 
-**Skills are shared:** every profile home gets a `skills/` symlink to the
-shared store at `~/.codex/skills`, so all profiles (and the Codex GUI) see the
-same skills, and a skill installed from inside any profile lands in that one
-store. If a profile home already has its own non-empty `skills/` directory,
-headroom leaves it alone and that profile stays independent (a note is echoed
-at wrap time).
+**Shared config (skills, prompts, AGENTS.md):** every profile home gets
+symlinks to the default codex home for `skills/`, `prompts/`, and the global
+`AGENTS.md` (`~/.codex/<name>`), so all profiles (and the Codex GUI) see the
+same skills/prompts/instructions, and anything installed or edited from inside
+a profile lands in that one shared place. Only `config.toml` and `auth.json`
+stay per-profile — that is where the backend and credentials live. An entry
+whose source doesn't exist yet (e.g. no `~/.codex/prompts`) is simply not
+linked, and auto-links the first time you create it. If a profile home already
+holds its own non-empty copy of one of these, headroom leaves it alone and that
+profile stays independent for that entry (a note is echoed at wrap time).
 
 ### Per-profile ports
 
