@@ -106,6 +106,39 @@ async def test_invoke_forwards_to_aperture_and_compresses_request():
         await proxy.http_client.aclose()
 
 
+@pytest.mark.asyncio
+async def test_invoke_logs_outbound_hop_to_aperture(caplog):
+    # The outbound forward must be greppable (event=outbound_request with the
+    # aperture URL + status) so "did claude-company reach Bedrock?" is one line.
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "application/json"},
+            json={"type": "message", "role": "assistant", "content": []},
+        )
+
+    proxy = _proxy()
+    proxy.http_client = _mock_client(handler)
+    try:
+        body = {
+            "anthropic_version": "bedrock-2023-05-31",
+            "max_tokens": 16,
+            "messages": [{"role": "user", "content": "hi"}],
+        }
+        req = _make_request(f"/model/{MODEL}/invoke", body)
+        with caplog.at_level("INFO", logger="headroom.proxy"):
+            resp = await proxy.handle_bedrock_invoke(req, MODEL, stream=False)
+            _ = [c async for c in resp.body_iterator]
+
+        text = caplog.text
+        assert "event=outbound_request forwarder=bedrock_passthrough" in text
+        assert f"{APERTURE}/model/{MODEL}/invoke" in text
+        assert "event=outbound_response forwarder=bedrock_passthrough" in text
+        assert "status=200" in text
+    finally:
+        await proxy.http_client.aclose()
+
+
 # AWS binary event-stream prelude bytes (the real frame header shape we probed).
 EVENTSTREAM_BODY = bytes.fromhex(
     "000002aa0000004bf373"  # truncated frame header sample (even-length hex)

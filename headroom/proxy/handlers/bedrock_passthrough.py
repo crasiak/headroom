@@ -122,7 +122,24 @@ class BedrockHandlerMixin:
         upstream_req = self.http_client.build_request(
             "POST", url, content=outbound, headers=outbound_headers
         )
+        # Log the outbound hop so "did claude-company reach the aperture?" is a
+        # one-line grep (parity with the OpenAI/streaming forwarder). The proxy
+        # framework logs the matching inbound_response with the status.
+        logger.info(
+            "event=outbound_request forwarder=bedrock_passthrough method=POST "
+            "path=%s model=%s stream=%s body_bytes=%d",
+            url,
+            model_id,
+            stream,
+            len(outbound),
+        )
         upstream = await self.http_client.send(upstream_req, stream=True)
+        logger.info(
+            "event=outbound_response forwarder=bedrock_passthrough path=%s model=%s status=%d",
+            url,
+            model_id,
+            upstream.status_code,
+        )
 
         # Relay upstream headers verbatim (Content-Type drives event-stream vs
         # json on the client side; X-Amzn-Bedrock-* carry token accounting).
