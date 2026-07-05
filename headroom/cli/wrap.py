@@ -736,6 +736,13 @@ def _start_proxy(
     # when wrapping a Vertex-mode client so upstream requests succeed.
     if os.environ.get("CLAUDE_CODE_USE_VERTEX") or os.environ.get("ANTHROPIC_VERTEX_PROJECT_ID"):
         proxy_env.setdefault("HEADROOM_HTTP2", "false")
+    # Isolate the proxy's sys.path from the agent's cwd. We launch with
+    # `python -m`, which prepends the current working directory to sys.path[0].
+    # When the wrapped agent runs from a repo whose root holds a module that
+    # shadows the stdlib (e.g. an __init__.py making the cwd a package, or a
+    # stray platform.py/queue.py), that import poisons the proxy and it exits
+    # before binding. PYTHONSAFEPATH (3.11+) disables that cwd injection.
+    proxy_env["PYTHONSAFEPATH"] = "1"
     # Tell the proxy which agent is being wrapped (for traffic learning output)
     if agent_type != "unknown":
         proxy_env["HEADROOM_AGENT_TYPE"] = agent_type
