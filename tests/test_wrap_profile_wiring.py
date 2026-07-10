@@ -52,14 +52,14 @@ def test_resolve_codex_profile_company(tmp_path, monkeypatch):
     assert 'https://ap/v1' in (seed_dir / "config.toml").read_text()
 
 
-def test_health_payload_exposes_bedrock_api_url():
+def test_health_payload_exposes_bedrock_base_url():
     proxy = HeadroomProxy(
         ProxyConfig(bedrock_base_url="https://ap/bedrock", cache_enabled=False,
                     rate_limit_enabled=False)
     )
     from headroom.proxy import server as srv
     payload = srv._build_health_config(proxy.config)   # module-level health helper
-    assert payload["bedrock_api_url"] == "https://ap/bedrock"
+    assert payload["bedrock_base_url"] == "https://ap/bedrock"
     assert payload["openai_api_url"] == proxy.config.openai_api_url
 
 

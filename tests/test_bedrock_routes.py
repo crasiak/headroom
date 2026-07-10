@@ -44,13 +44,30 @@ def test_bedrock_routes_dispatch_with_model_and_stream_flag(monkeypatch):
     assert (f"/model/{model}/invoke-with-response-stream", model, True) in calls
 
 
-def test_bedrock_route_501_when_unconfigured():
+def test_bedrock_route_not_registered_when_unconfigured():
+    """Post-v0.31 contract: without bedrock_base_url (aperture passthrough) or
+    bedrock_api_url (upstream native), no dedicated /model/{id}/invoke route is
+    registered — the path falls through to the generic catch-all verbatim.
+    (Replaces the pre-merge 501 not_configured contract.)"""
     app = create_app(
         ProxyConfig(optimize=False, cache_enabled=False, rate_limit_enabled=False)
     )
-    client = TestClient(app)
-    body = {"anthropic_version": "bedrock-2023-05-31", "max_tokens": 8,
-            "messages": [{"role": "user", "content": "hi"}]}
-    r = client.post("/model/global.anthropic.claude-sonnet-4-6/invoke", json=body)
-    assert r.status_code == 501
-    assert r.json()["error"]["type"] == "not_configured"
+    bedrock_paths = [
+        r.path for r in app.routes
+        if getattr(r, "path", "").startswith("/model/") and "invoke" in r.path
+    ]
+    assert bedrock_paths == []
+
+    # And WITH the aperture configured, both routes exist.
+    app2 = create_app(
+        ProxyConfig(optimize=False, cache_enabled=False, rate_limit_enabled=False,
+                    bedrock_base_url="https://aperture.test/bedrock")
+    )
+    bedrock_paths2 = sorted(
+        r.path for r in app2.routes
+        if getattr(r, "path", "").startswith("/model/") and "invoke" in r.path
+    )
+    assert bedrock_paths2 == [
+        "/model/{model_id:path}/invoke",
+        "/model/{model_id:path}/invoke-with-response-stream",
+    ]

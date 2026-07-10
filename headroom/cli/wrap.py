@@ -6719,6 +6719,11 @@ def codex(
         click.echo(f"  Owned Codex config: {owned_home / 'config.toml'}")
         return
 
+    if prepare_only and profile_mode:
+        # The owned config was already written by _resolve_codex_profile.
+        click.echo(f"  Owned Codex config: {owned_home / 'config.toml'}")
+        return
+
     codex_bin = shutil.which("codex")
     if not codex_bin:
         click.echo("Error: 'codex' not found in PATH.")
