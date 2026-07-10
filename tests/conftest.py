@@ -426,3 +426,33 @@ def sample_request_metrics():
         turns_dropped=0,
         messages_hash="def456",
     )
+
+
+@pytest.fixture(autouse=True)
+def _never_kill_real_proxies(request, monkeypatch):
+    """Local fork guard: tests must never stop a REAL Headroom proxy.
+
+    This machine runs production proxies on 8787 (personal) and 9611
+    (company aperture) with live agent sessions attached. Upstream's
+    `unwrap <tool>` deliberately calls `_stop_local_proxy_for_unwrap(port)`
+    (and stale-version restarts call `_kill_proxy_by_pid`); on upstream CI
+    nothing listens on those ports so the calls no-op, but here they kill
+    the real proxies mid-session (observed 2026-07-10).
+
+    Newer upstream tests already mock `_stop_local_proxy_for_unwrap`
+    explicitly (test_unwrap_claude, test_wrap_copilot); this fixture extends
+    that hygiene suite-wide. Tests that patch these attributes themselves
+    simply override this default. Return values mirror the no-proxy-running
+    CI environment.
+    """
+    if "stop_local_proxy_for_unwrap" in request.node.name:
+        # Unit tests OF the stopper itself; they mock _check_proxy /
+        # _query_proxy_config / _kill_proxy_by_pid internally and are hermetic.
+        yield
+        return
+
+    from headroom.cli import wrap as _wrap_mod
+
+    monkeypatch.setattr(_wrap_mod, "_stop_local_proxy_for_unwrap", lambda port: "not_running")
+    monkeypatch.setattr(_wrap_mod, "_kill_proxy_by_pid", lambda pid, port: True)
+    yield
