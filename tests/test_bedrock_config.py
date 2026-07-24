@@ -25,7 +25,7 @@ def test_env_wires_bedrock_base_url(monkeypatch):
 
     # Clear the multi-worker JSON config env so the env-var path is taken.
     monkeypatch.delenv("HEADROOM_PROXY_CONFIG_JSON", raising=False)
-    monkeypatch.setenv("BEDROCK_TARGET_API_URL", "https://aperture.test/bedrock")
+    monkeypatch.setenv("HEADROOM_BEDROCK_BASE_URL", "https://aperture.test/bedrock")
     cfg = _proxy_config_from_env()
     assert cfg.bedrock_base_url == "https://aperture.test/bedrock"
 

@@ -759,7 +759,7 @@ def _start_proxy(
     if vertex_api_url:
         proxy_env["VERTEX_TARGET_API_URL"] = vertex_api_url
     if bedrock_api_url:
-        proxy_env["BEDROCK_TARGET_API_URL"] = bedrock_api_url
+        proxy_env["HEADROOM_BEDROCK_BASE_URL"] = bedrock_api_url
     # Pin the wrapper-validated Copilot token for this proxy instance only.
     # Injected into the subprocess env here (not the parent's os.environ) so it
     # never leaks into shared state. The proxy's CopilotTokenProvider honours
@@ -4503,11 +4503,11 @@ def _ensure_proxy_unlocked(
                         missing.append("vertex-api-url")
                 if bedrock_api_url:
                     running_bedrock_url = _normalize_proxy_api_url(
-                        running_config.get("bedrock_api_url")
+                        running_config.get("bedrock_base_url")
                     )
                     requested_bedrock_url = _normalize_proxy_api_url(bedrock_api_url)
                     if running_bedrock_url != requested_bedrock_url:
-                        missing.append("bedrock-api-url")
+                        missing.append("bedrock-base-url")
 
                 if missing:
                     flags_str = ", ".join(

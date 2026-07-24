@@ -27,7 +27,7 @@ def test_bedrock_routes_dispatch_with_model_and_stream_flag(monkeypatch):
         return JSONResponse({"path": request.url.path, "model": model_id, "stream": stream})
 
     monkeypatch.setattr(
-        "headroom.proxy.server.HeadroomProxy.handle_bedrock_invoke", fake_invoke, raising=True
+        "headroom.proxy.server.HeadroomProxy.handle_bedrock_passthrough", fake_invoke, raising=True
     )
 
     client = TestClient(_app())

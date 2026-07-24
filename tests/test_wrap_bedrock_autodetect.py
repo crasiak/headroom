@@ -67,7 +67,7 @@ def test_apply_bedrock_child_env_preserves_existing_flags():
 
 
 def test_start_proxy_forwards_bedrock_flag(monkeypatch):
-    """_start_proxy passes --bedrock-base-url and sets BEDROCK_TARGET_API_URL."""
+    """_start_proxy passes --bedrock-base-url and sets HEADROOM_BEDROCK_BASE_URL."""
     import headroom.cli.wrap as wrap
 
     captured = {}
@@ -96,4 +96,4 @@ def test_start_proxy_forwards_bedrock_flag(monkeypatch):
     assert "--bedrock-base-url" in captured["cmd"]
     i = captured["cmd"].index("--bedrock-base-url")
     assert captured["cmd"][i + 1] == "https://aperture.test/bedrock"
-    assert captured["env"]["BEDROCK_TARGET_API_URL"] == "https://aperture.test/bedrock"
+    assert captured["env"]["HEADROOM_BEDROCK_BASE_URL"] == "https://aperture.test/bedrock"

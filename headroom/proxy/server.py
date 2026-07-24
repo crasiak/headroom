@@ -669,6 +669,7 @@ from headroom.proxy.handlers import (  # noqa: E402
     AnthropicHandlerMixin,
     BatchHandlerMixin,
     BedrockHandlerMixin,
+    BedrockPassthroughMixin,
     GeminiHandlerMixin,
     OpenAIHandlerMixin,
     StreamingMixin,
@@ -826,7 +827,7 @@ class HeadroomProxy(
     OpenAIHandlerMixin,
     GeminiHandlerMixin,
     BatchHandlerMixin,
-    BedrockHandlerMixin,
+    BedrockPassthroughMixin,
 ):
     """Production-ready Headroom optimization proxy."""
 
@@ -3445,9 +3446,8 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 "code_graph": config.code_graph_watcher,
                 "anthropic_api_url": config.anthropic_api_url,
                 "openai_api_url": config.openai_api_url,
-                # Health/wrap vocabulary is `*_api_url`; the ProxyConfig field is named
-                # `bedrock_base_url` (from the Bedrock-aperture work). Translated here.
-                "bedrock_api_url": config.bedrock_base_url,
+                # Local fork: company-aperture Bedrock upstream (`--bedrock-base-url`).
+                "bedrock_base_url": config.bedrock_base_url,
                 "gemini_api_url": config.gemini_api_url,
                 "cloudcode_api_url": config.cloudcode_api_url,
                 "vertex_api_url": config.vertex_api_url,
@@ -5682,7 +5682,7 @@ def _proxy_config_from_env() -> ProxyConfig:
             DEFAULT_BUFFERED_CCR_GRACE_SECONDS,
         ),
         vertex_api_url=os.environ.get("VERTEX_TARGET_API_URL"),
-        bedrock_base_url=os.environ.get("BEDROCK_TARGET_API_URL"),
+        bedrock_base_url=os.environ.get("HEADROOM_BEDROCK_BASE_URL"),
         bedrock_compression=_get_env_str("HEADROOM_BEDROCK_COMPRESSION", "aggressive"),
         backend=_get_env_str("HEADROOM_BACKEND", "anthropic"),
         bedrock_region=_get_env_str("HEADROOM_BEDROCK_REGION", "us-west-2"),
@@ -6447,7 +6447,7 @@ if __name__ == "__main__":
             min_value=1,
         ),
         vertex_api_url=_get_env_str("VERTEX_TARGET_API_URL", args.vertex_api_url),
-        bedrock_base_url=args.bedrock_base_url or os.environ.get("BEDROCK_TARGET_API_URL"),
+        bedrock_base_url=args.bedrock_base_url or os.environ.get("HEADROOM_BEDROCK_BASE_URL"),
         bedrock_compression=_get_env_str("HEADROOM_BEDROCK_COMPRESSION", args.bedrock_compression),
         # Backend settings
         backend=_get_env_str("HEADROOM_BACKEND", args.backend),  # type: ignore[arg-type]

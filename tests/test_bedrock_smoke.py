@@ -48,7 +48,7 @@ async def test_live_invoke_roundtrip_and_savings():
             "messages": [{"role": "user", "content": "Reply with the single word: ok"}],
         }
         req = _build_request(f"/model/{SMOKE_MODEL}/invoke", body)
-        resp = await proxy.handle_bedrock_invoke(req, SMOKE_MODEL, stream=False)
+        resp = await proxy.handle_bedrock_passthrough(req, SMOKE_MODEL, stream=False)
         chunks = [c async for c in resp.body_iterator]
         payload = b"".join(c if isinstance(c, bytes) else c.encode() for c in chunks)
         data = json.loads(payload)
@@ -56,7 +56,7 @@ async def test_live_invoke_roundtrip_and_savings():
         assert data["role"] == "assistant"
 
         sreq = _build_request(f"/model/{SMOKE_MODEL}/invoke-with-response-stream", body)
-        sresp = await proxy.handle_bedrock_invoke(sreq, SMOKE_MODEL, stream=True)
+        sresp = await proxy.handle_bedrock_passthrough(sreq, SMOKE_MODEL, stream=True)
         assert sresp.media_type == "application/vnd.amazon.eventstream"
         sbytes = b"".join(
             [c if isinstance(c, bytes) else c.encode() async for c in sresp.body_iterator]

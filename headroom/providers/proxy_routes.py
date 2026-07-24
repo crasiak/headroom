@@ -307,7 +307,20 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
     # converter captures inference-profile ids that contain dots, colons and
     # slashes (e.g. `us.anthropic.claude-sonnet-4-5-20250929-v1:0`). See
     # headroom/proxy/handlers/bedrock.py for the SigV4 caveat.
-    if getattr(proxy.config, "bedrock_api_url", None):
+    # Local fork: the company-aperture passthrough (`--bedrock-base-url`) and
+    # upstream's native SigV4 handler (`--bedrock-api-url`) both want
+    # `/model/{id}/…`. The aperture passthrough wins when both are configured.
+    if getattr(proxy.config, "bedrock_base_url", None):
+
+        @app.post("/model/{model_id:path}/invoke")
+        async def bedrock_passthrough_invoke(request: Request, model_id: str):
+            return await proxy.handle_bedrock_passthrough(request, model_id, stream=False)
+
+        @app.post("/model/{model_id:path}/invoke-with-response-stream")
+        async def bedrock_passthrough_invoke_stream(request: Request, model_id: str):
+            return await proxy.handle_bedrock_passthrough(request, model_id, stream=True)
+
+    elif getattr(proxy.config, "bedrock_api_url", None):
 
         @app.post("/model/{model_id:path}/invoke")
         async def bedrock_invoke(request: Request, model_id: str):
@@ -487,14 +500,6 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
             publisher,
             VERTEX_STREAM_RAW_PREDICT.name,
         )
-
-    @app.post("/model/{model_id}/invoke")
-    async def bedrock_invoke(request: Request, model_id: str):
-        return await proxy.handle_bedrock_invoke(request, model_id, stream=False)
-
-    @app.post("/model/{model_id}/invoke-with-response-stream")
-    async def bedrock_invoke_stream(request: Request, model_id: str):
-        return await proxy.handle_bedrock_invoke(request, model_id, stream=True)
 
     @app.get("/v1/models")
     async def list_models(request: Request):

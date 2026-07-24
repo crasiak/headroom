@@ -42,10 +42,10 @@ _HOP_BY_HOP = {
 }
 
 
-class BedrockHandlerMixin:
+class BedrockPassthroughMixin:
     """Mixin providing the company-Bedrock aperture passthrough for HeadroomProxy."""
 
-    async def handle_bedrock_invoke(
+    async def handle_bedrock_passthrough(
         self,
         request: Request,
         model_id: str,
@@ -63,7 +63,7 @@ class BedrockHandlerMixin:
                         "type": "not_configured",
                         "message": (
                             "Bedrock passthrough is not configured. Start the proxy "
-                            "with --bedrock-base-url or set BEDROCK_TARGET_API_URL."
+                            "with --bedrock-base-url or set HEADROOM_BEDROCK_BASE_URL."
                         ),
                     }
                 },

@@ -88,7 +88,7 @@ async def test_invoke_forwards_to_aperture_and_compresses_request():
             ],
         }
         req = _make_request(f"/model/{MODEL}/invoke", body)
-        resp = await proxy.handle_bedrock_invoke(req, MODEL, stream=False)
+        resp = await proxy.handle_bedrock_passthrough(req, MODEL, stream=False)
 
         chunks = [c async for c in resp.body_iterator]
         payload = b"".join(
@@ -127,7 +127,7 @@ async def test_invoke_logs_outbound_hop_to_aperture(caplog):
         }
         req = _make_request(f"/model/{MODEL}/invoke", body)
         with caplog.at_level("INFO", logger="headroom.proxy"):
-            resp = await proxy.handle_bedrock_invoke(req, MODEL, stream=False)
+            resp = await proxy.handle_bedrock_passthrough(req, MODEL, stream=False)
             _ = [c async for c in resp.body_iterator]
 
         text = caplog.text
@@ -166,7 +166,7 @@ async def test_invoke_with_response_stream_relays_eventstream_verbatim():
             "messages": [{"role": "user", "content": "hi"}],
         }
         req = _make_request(f"/model/{MODEL}/invoke-with-response-stream", body)
-        resp = await proxy.handle_bedrock_invoke(req, MODEL, stream=True)
+        resp = await proxy.handle_bedrock_passthrough(req, MODEL, stream=True)
 
         assert resp.media_type == "application/vnd.amazon.eventstream"
         assert resp.headers["x-amzn-bedrock-content-type"] == "application/json"
@@ -186,7 +186,7 @@ async def test_missing_config_returns_501():
     body = {"anthropic_version": "bedrock-2023-05-31", "max_tokens": 8,
             "messages": [{"role": "user", "content": "hi"}]}
     req = _make_request(f"/model/{MODEL}/invoke", body)
-    resp = await proxy.handle_bedrock_invoke(req, MODEL, stream=False)
+    resp = await proxy.handle_bedrock_passthrough(req, MODEL, stream=False)
     assert resp.status_code == 501
     assert b"not configured" in resp.body.lower()
 
@@ -214,7 +214,7 @@ async def test_bypass_header_skips_compression():
         }
         req = _make_request(f"/model/{MODEL}/invoke", body,
                             headers={"x-headroom-bypass": "true"})
-        await proxy.handle_bedrock_invoke(req, MODEL, stream=False)
+        await proxy.handle_bedrock_passthrough(req, MODEL, stream=False)
         assert captured["body"] == body
     finally:
         await proxy.http_client.aclose()
