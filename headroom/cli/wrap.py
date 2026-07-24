@@ -5480,7 +5480,7 @@ def claude(
         # location) using Claude Code's own ADC token — no API key, no creds held
         # by Headroom. This is the turnkey Vertex compression path.
         use_vertex = bool(os.environ.get("CLAUDE_CODE_USE_VERTEX"))
-        proxy_url = _claude_proxy_base_url(port)
+        proxy_url = _claude_proxy_base_url(effective_port)
         vertex_upstream = _vertex_target_api_url_from_claude_env(proxy_url) if use_vertex else None
 
         if foundry_upstream and bedrock_upstream:
@@ -5505,8 +5505,8 @@ def claude(
             bedrock_api_url=bedrock_upstream,
             openai_api_url=resolved.openai_upstream,
         )
-        if actual_port != port:
-            _unregister_proxy_client(port)
+        if actual_port != effective_port:
+            _unregister_proxy_client(effective_port)
             _register_proxy_client(actual_port)
         port_holder[0] = actual_port
         _push_runtime_env(actual_port, no_proxy)
