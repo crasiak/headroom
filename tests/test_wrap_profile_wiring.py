@@ -53,14 +53,32 @@ def test_resolve_codex_profile_company(tmp_path, monkeypatch):
 
 
 def test_health_payload_exposes_bedrock_base_url():
-    proxy = HeadroomProxy(
-        ProxyConfig(bedrock_base_url="https://ap/bedrock", cache_enabled=False,
-                    rate_limit_enabled=False)
+    """/health's config block (read by wrap's running-proxy checks) carries
+    the company-aperture upstream under the local-fork key ``bedrock_base_url``.
+    Upstream v0.32 inlined the config block into the /health endpoint, so this
+    goes through the endpoint rather than a module-level helper."""
+    from fastapi.testclient import TestClient
+
+    from headroom.proxy.server import create_app
+
+    config = ProxyConfig(
+        bedrock_base_url="https://ap/bedrock",
+        optimize=False,
+        image_optimize=False,
+        cache_enabled=False,
+        rate_limit_enabled=False,
+        cost_tracking_enabled=False,
+        log_requests=False,
+        ccr_inject_tool=False,
+        ccr_handle_responses=False,
+        ccr_context_tracking=False,
     )
-    from headroom.proxy import server as srv
-    payload = srv._build_health_config(proxy.config)   # module-level health helper
-    assert payload["bedrock_base_url"] == "https://ap/bedrock"
-    assert payload["openai_api_url"] == proxy.config.openai_api_url
+    with TestClient(
+        create_app(config), base_url="http://127.0.0.1", client=("127.0.0.1", 12345)
+    ) as client:
+        payload = client.get("/health").json()
+    assert payload["config"]["bedrock_base_url"] == "https://ap/bedrock"
+    assert payload["config"]["openai_api_url"] == config.openai_api_url
 
 
 def test_launch_tool_accepts_bedrock_api_url():
