@@ -394,7 +394,7 @@ def test_codex_legacy_prepare_only_uses_default_port(tmp_path, monkeypatch):
     runner = CliRunner()
     with runner.isolated_filesystem():
         result = runner.invoke(
-            codex, ["--prepare-only", "--no-rtk", "--no-serena"]
+            codex, ["--prepare-only", "--no-serena"]
         )
     assert result.exit_code == 0, result.output
 
