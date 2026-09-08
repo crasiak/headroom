@@ -491,7 +491,14 @@ async def test_large_ordinary_stream_stays_live_after_reconstruction_window_clos
     ],
 )
 async def test_anthropic_visible_indexes_are_consumable_by_sdk(names):
-    from anthropic import Anthropic
+    from anthropic import Anthropic, DefaultHttpxClient
+
+    # Anthropic migrated from httpx to httpx2. Match the SDK's transport so this
+    # regression exercises stream parsing with both supported SDK generations.
+    if issubclass(DefaultHttpxClient, httpx.Client):
+        sdk_http = httpx
+    else:
+        import httpx2 as sdk_http
 
     events = [
         {
@@ -557,12 +564,14 @@ async def test_anthropic_visible_indexes_are_consumable_by_sdk(names):
             )
         ]
     )
-    transport = httpx.MockTransport(
-        lambda request: httpx.Response(
+    transport = sdk_http.MockTransport(
+        lambda request: sdk_http.Response(
             200, headers={"content-type": "text/event-stream"}, content=output
         )
     )
-    with Anthropic(api_key="local-test", http_client=httpx.Client(transport=transport)) as client:
+    with Anthropic(
+        api_key="local-test", http_client=DefaultHttpxClient(transport=transport)
+    ) as client:
         with client.messages.stream(
             model="claude", max_tokens=10, messages=[{"role": "user", "content": "test"}]
         ) as stream:
