@@ -12,10 +12,20 @@ pytest.importorskip("fastapi")
 
 from fastapi.testclient import TestClient
 
+from headroom import paths
 from headroom.proxy.outcome import RequestOutcome
+from headroom.telemetry.toin import reset_toin
 from headroom.transport.protocol import AcquireRequest, ReceiptWriter
 from headroom.transport.runtime import TransportLease, create_transport_app, serve_transport
 from tests.test_transport_protocol import _acquire_payload
+
+
+@pytest.fixture(autouse=True)
+def _restore_stateless_globals(monkeypatch):
+    """In-process transport tests must not disable later tests' persistence."""
+    monkeypatch.setattr(paths, "_PROCESS_STATELESS", paths._PROCESS_STATELESS)
+    yield
+    reset_toin()
 
 
 def test_transport_lease_release_is_idempotent_and_bound() -> None:

@@ -64,15 +64,28 @@ async def test_count_tokens_preserves_body_and_is_metadata(mode, path):
 async def test_optional_bedrock_discovery_preserves_404_evidence(path):
     binding = AcquireRequest.from_dict(mode_payload("bedrock_aperture_passthrough"))
     seen, records = [], []
+
     def respond(request):
         seen.append(request)
         return httpx.Response(404, stream=RawChunks())
+
     async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
-        proxy = SimpleNamespace(http_client=client, openai_pipeline=None,
-                                _next_request_id=AsyncMock(return_value="discovery"))
-        request = Request({"type": "http", "method": "GET", "scheme": "http",
-                           "path": path, "query_string": b"maxResults=10", "headers": [],
-                           "server": ("127.0.0.1", 80)})
+        proxy = SimpleNamespace(
+            http_client=client,
+            openai_pipeline=None,
+            _next_request_id=AsyncMock(return_value="discovery"),
+        )
+        request = Request(
+            {
+                "type": "http",
+                "method": "GET",
+                "scheme": "http",
+                "path": path,
+                "query_string": b"maxResults=10",
+                "headers": [],
+                "server": ("127.0.0.1", 80),
+            }
+        )
         response = await forward(binding, ReceiptWriter(binding, records.append), proxy, request)
         async for _ in response.body_iterator:
             pass

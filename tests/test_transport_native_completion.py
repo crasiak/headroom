@@ -22,10 +22,13 @@ class CompletedThenOpen(httpx.AsyncByteStream):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("chunks", [
-    [b'event: response.completed\ndata: {}\n\n'],
-    [b'event: response.', b'completed\r\n', b'data: ' + b'x' * 100000, b'\r\n\r\n'],
-])
+@pytest.mark.parametrize(
+    "chunks",
+    [
+        [b"event: response.completed\ndata: {}\n\n"],
+        [b"event: response.", b"completed\r\n", b"data: " + b"x" * 100000, b"\r\n\r\n"],
+    ],
+)
 async def test_native_disconnect_after_delivered_completion_is_success(chunks):
     binding = AcquireRequest.from_dict(mode_payload("openai_oauth_passthrough"))
     records = []
