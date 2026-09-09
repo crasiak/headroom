@@ -62,6 +62,19 @@ from headroom.proxy.thinking_tokens import ThinkingTokens, extract_thinking_toke
 logger = logging.getLogger("headroom.proxy")
 
 
+async def _record_transport_rejection(
+    handler: Any,
+    *,
+    reason: str,
+    bypass: bool = False,
+) -> None:
+    """Emit a transport-only refusal without requiring mixin inheritance."""
+
+    writer = getattr(handler, "transport_receipt_writer", None)
+    if writer is not None:
+        await writer.record_rejection(reason=reason, bypass=bypass)
+
+
 @lru_cache(maxsize=1)
 def _thinking_estimator() -> Callable[[str], int] | None:
     """A process-wide local token counter for thinking-block estimation.
@@ -1716,6 +1729,19 @@ class AnthropicHandlerMixin:
                     "[%s] Compression skipped: reason=pre_upstream_backpressure",
                     request_id,
                 )
+                if self.config.compression_required:
+                    await _finalize_pre_upstream()
+                    await _record_transport_rejection(self, reason="pre_upstream_backpressure")
+                    return JSONResponse(
+                        status_code=503,
+                        content={
+                            "type": "error",
+                            "error": {
+                                "type": "transport_compression_error",
+                                "message": "pre_upstream_backpressure",
+                            },
+                        },
+                    )
             if not _decision.should_compress:
                 logger.info(
                     f"[{request_id}] Compression skipped: reason={_decision.passthrough_reason}"
@@ -2123,6 +2149,21 @@ class AnthropicHandlerMixin:
                         "timeout" if isinstance(e, asyncio.TimeoutError | TimeoutError) else "error"
                     )
                     self.metrics.record_compression_failed(reason)
+                    failure_reason = f"compression_{reason}"
+                    tags["passthrough_reason"] = failure_reason
+                    if self.config.compression_required:
+                        await _finalize_pre_upstream()
+                        await _record_transport_rejection(self, reason=failure_reason)
+                        return JSONResponse(
+                            status_code=503,
+                            content={
+                                "type": "error",
+                                "error": {
+                                    "type": "transport_compression_error",
+                                    "message": failure_reason,
+                                },
+                            },
+                        )
 
             # Cache-safety (ALL modes): forward the previously-cached (compressed)
             # prefix byte-identical. The freeze path can emit the agent's ORIGINAL
@@ -4892,6 +4933,10 @@ class AnthropicHandlerMixin:
                     # once waiting silently would risk the client's idle
                     # watchdog. Both halves live in one shared place so the
                     # OpenAI twin cannot drift from it (#3079).
+                    async def _record_buffered_failure(*, provider):
+                        await self.metrics.record_failed(provider=provider)
+                        await _record_transport_rejection(self, reason="upstream_request_error")
+
                     _buffered_call = buffered_ccr_asgi_call(
                         operation=operation,
                         fmt=ANTHROPIC_ERROR_FORMAT,
@@ -4900,7 +4945,7 @@ class AnthropicHandlerMixin:
                             "buffered_ccr_grace_seconds",
                             DEFAULT_BUFFERED_CCR_GRACE_SECONDS,
                         ),
-                        record_failed=self.metrics.record_failed,
+                        record_failed=_record_buffered_failure,
                         request_id=request_id,
                     )
 
@@ -4922,6 +4967,7 @@ class AnthropicHandlerMixin:
                 await self.metrics.record_failed(provider=provider_name)
                 # Log full error details internally for debugging
                 logger.error(f"[{request_id}] Request failed: {type(e).__name__}: {e}")
+                await _record_transport_rejection(self, reason="upstream_request_error")
 
                 # Try fallback if enabled
                 if self.config.fallback_enabled and self.config.fallback_provider == "openai":

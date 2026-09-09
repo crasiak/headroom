@@ -459,6 +459,10 @@ class SubscriptionTracker(QuotaTracker):
     # ------------------------------------------------------------------
 
     def _persist_state(self) -> None:
+        from headroom.paths import process_is_stateless
+
+        if process_is_stateless():
+            return
         try:
             self._persist_path.parent.mkdir(parents=True, exist_ok=True)
             with self._lock:

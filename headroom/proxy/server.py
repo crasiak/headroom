@@ -1918,7 +1918,7 @@ class HeadroomProxy(
         self._kompress_status = "not installed"
         eager_status: dict[str, str] = {}
 
-        if self.config.optimize:
+        if self.config.optimize and not self.config.isolated_transport:
             logger.info("Pre-loading compressors and parsers...")
             # Run the preload OFF the event loop with a bound. The loop body
             # already swallows per-transform Exceptions, so the only thing that
@@ -2194,7 +2194,20 @@ class HeadroomProxy(
         # The shield does not swallow the cancellation — the await below still
         # raises CancelledError, so generator teardown propagates exactly as
         # before. It only keeps the bookkeeping from being torn in half.
-        await asyncio.shield(emit_request_outcome(self, outcome))
+        async def _finalize() -> None:
+            await emit_request_outcome(self, outcome)
+            writer = getattr(self, "transport_receipt_writer", None)
+            if writer is not None:
+                await writer.record(outcome)
+
+        await asyncio.shield(_finalize())
+
+    async def _record_transport_receipt(self, outcome: RequestOutcome) -> None:
+        """Emit the optional isolated-transport receipt for this outcome."""
+
+        writer = getattr(self, "transport_receipt_writer", None)
+        if writer is not None:
+            await writer.record(outcome)
 
     async def _next_request_id(self) -> str:
         """Generate unique request ID."""
@@ -2737,24 +2750,26 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
     from contextlib import asynccontextmanager
 
+    config = config or ProxyConfig()
+
     # Always-on file logging to ~/.headroom/logs/ for `headroom perf` analysis.
     # Installed here (not at module import) so importing headroom.proxy.server
     # in tests or library contexts does not silently attach a RotatingFileHandler
     # to the user's live proxy.log.
-    _setup_file_logging()
-
-    config = config or ProxyConfig()
+    if not config.stateless:
+        _setup_file_logging()
 
     # Defensive re-apply of file-backed settings for embedded/non-CLI callers
     # that construct the app without going through the `headroom` CLI entrypoint
     # (which already applies them before Click parsing). setdefault keeps
     # explicit env exports authoritative; fail-open so it never blocks startup.
-    try:
-        from headroom import settings_store
+    if not config.isolated_transport:
+        try:
+            from headroom import settings_store
 
-        settings_store.apply_to_environ(settings_store.load())
-    except Exception:  # noqa: BLE001 — settings load must never break startup
-        pass
+            settings_store.apply_to_environ(settings_store.load())
+        except Exception:  # noqa: BLE001 — settings load must never break startup
+            pass
 
     # Air-gap master switch. Propagate config.offline to the env so the
     # env-based egress predicates (telemetry, update check, license) all honor
@@ -2812,6 +2827,8 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
         Returns True if this process is the beacon owner.
         """
+        if config.stateless:
+            return False
         if not HAS_FCNTL:
             return True
 

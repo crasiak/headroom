@@ -38,17 +38,18 @@ def main(ctx: click.Context) -> None:
     # group callback runs). ``os.environ.setdefault`` keeps explicit shell
     # exports authoritative over the stored file. Fail-open so a corrupt
     # settings.json can never block the CLI.
-    try:
-        from headroom import settings_store
+    if ctx.invoked_subcommand != "transport":
+        try:
+            from headroom import settings_store
 
-        settings_store.apply_to_environ(settings_store.load())
-    except Exception:  # noqa: BLE001 — settings load must never break the CLI
-        pass
+            settings_store.apply_to_environ(settings_store.load())
+        except Exception:  # noqa: BLE001 — settings load must never break the CLI
+            pass
 
     # Fire a rate-limited, opt-out background check for newer releases so other
     # surfaces (e.g. the proxy banner) can show an "update available" notice.
     # Never blocks, never raises; skipped for `update` (it checks explicitly).
-    if ctx.invoked_subcommand != "update":
+    if ctx.invoked_subcommand not in {"transport", "update"}:
         try:
             from headroom.update_check import maybe_check_async
 
@@ -79,6 +80,7 @@ def _register_commands() -> None:
         rollout,  # noqa: F401
         savings,  # noqa: F401
         tools,  # noqa: F401
+        transport,  # noqa: F401
         update,  # noqa: F401
         wrap,  # noqa: F401
     )
