@@ -22,6 +22,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 from urllib.parse import urlsplit
 
+from headroom._subprocess import run as subprocess_run
 from headroom.proxy.outcome import RequestOutcome
 
 ACQUIRE_SCHEMA = "headroom.transport.acquire.v1"
@@ -243,7 +244,7 @@ def _proc_process_identity(pid: int) -> ProcessIdentity | None:
 
 def _ps_process_identity(pid: int) -> ProcessIdentity | None:
     try:
-        completed = subprocess.run(
+        completed = subprocess_run(
             ["ps", "-o", "lstart=", "-p", str(pid)],
             check=True,
             capture_output=True,
