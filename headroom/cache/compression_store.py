@@ -1007,6 +1007,10 @@ def _create_default_ccr_backend() -> CompressionStoreBackend | None:
     adapters via setuptools entry point 'headroom.ccr_backend'.
     Returns None to use InMemoryBackend.
     """
+    from headroom.paths import process_is_stateless
+
+    if process_is_stateless():
+        return None
     backend_type = (os.environ.get("HEADROOM_CCR_BACKEND") or "").strip().lower()
     if backend_type == "memory":
         return None

@@ -247,6 +247,15 @@ class ProxyConfig:
 
     lossless: bool = False  # CLI: --lossless; env: HEADROOM_LOSSLESS=1. No-CCR mode: compress without any retrieval marker.
 
+    # Managed transports can require compression to fail closed. The regular
+    # proxy remains backward-compatible: it may pass through small requests or
+    # transient compression errors unless this explicit binding policy is set.
+    compression_required: bool = False
+
+    # The per-launch transport is fully described by its inherited acquire
+    # record. It must not merge the user's persistent Headroom settings.
+    isolated_transport: bool = False
+
     # Compress requests that fall through to the catch-all passthrough handler
     # (custom proxy paths that don't match a built-in API route, e.g.
     # `/api/codex-proxy/<key>/v1/responses` fronted by another proxy). Off by
