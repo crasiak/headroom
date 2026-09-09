@@ -276,15 +276,48 @@ def _load_custom_model_config() -> dict[str, Any]:
                 # Try to parse as JSON string
                 loaded = json.loads(env_config)
 
+            if not isinstance(loaded, dict):
+                raise ValueError(
+                    f"HEADROOM_MODEL_LIMITS must be a JSON object, got {type(loaded).__name__}"
+                )
+
             # Check for anthropic-specific config, fall back to root level
             anthropic_config = loaded.get("anthropic", loaded)
             if "context_limits" in anthropic_config:
                 config["context_limits"].update(anthropic_config["context_limits"])
             if "pricing" in anthropic_config:
                 config["pricing"].update(anthropic_config["pricing"])
+            # Another provider's namespaced section ({"openai": {"context_limits":
+            # ...}}) is a correctly shaped config that this loader is simply not
+            # meant to consume, so it must not trip the no-effect warning below.
+            other_provider_section = "anthropic" not in loaded and any(
+                isinstance(section, dict)
+                and any(key in section for key in ("context_limits", "pricing", "encodings"))
+                for section in loaded.values()
+            )
+            if (
+                "context_limits" not in anthropic_config
+                and "pricing" not in anthropic_config
+                and not other_provider_section
+            ):
+                # Valid JSON object, but none of the keys we consume. Previously
+                # this was a SILENT no-op: the unknown-model warning tells the
+                # operator to "set HEADROOM_MODEL_LIMITS", they set the obvious
+                # flat shape {"my-model": 262144}, nothing happens, and there is
+                # no diagnostic anywhere. Name the expected shape instead.
+                logger.warning(
+                    "HEADROOM_MODEL_LIMITS parsed but contained no 'context_limits' "
+                    "or 'pricing' key, so it had NO EFFECT. Expected shape: "
+                    '{"context_limits": {"<model>": <int>}, "pricing": {...}} '
+                    '(optionally nested under an "anthropic" key). '
+                    f"Got top-level keys: {sorted(map(str, anthropic_config))[:10]}"
+                )
 
             logger.debug(f"Loaded custom model config from HEADROOM_MODEL_LIMITS: {loaded}")
-        except (json.JSONDecodeError, OSError) as e:
+        except (ValueError, OSError) as e:
+            # ValueError covers json.JSONDecodeError (a subclass) and the
+            # non-object guard above, so a malformed value warns and falls back
+            # to defaults instead of crashing provider init.
             logger.warning(f"Failed to load HEADROOM_MODEL_LIMITS: {e}")
 
     # Check config file. Prefer the canonical config-dir location, then fall
@@ -299,6 +332,9 @@ def _load_custom_model_config() -> dict[str, Any]:
             with open(config_file, encoding="utf-8") as f:
                 loaded = json.load(f)
 
+            if not isinstance(loaded, dict):
+                raise ValueError(f"{config_file} must contain a JSON object")
+
             # Only load anthropic-specific config
             anthropic_config = loaded.get("anthropic", loaded)
             if "context_limits" in anthropic_config:
@@ -312,7 +348,7 @@ def _load_custom_model_config() -> dict[str, Any]:
                         config["pricing"][model] = pricing
 
             logger.debug(f"Loaded custom model config from {config_file}")
-        except (json.JSONDecodeError, OSError) as e:
+        except (ValueError, OSError) as e:
             logger.warning(f"Failed to load {config_file}: {e}")
 
     return config

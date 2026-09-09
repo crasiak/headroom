@@ -560,6 +560,39 @@ def _powershell_executable() -> str | None:
     return shutil.which("pwsh") or shutil.which("powershell") or shutil.which("powershell.exe")
 
 
+def _read_user_path_entry() -> tuple[str, int] | None:
+    """Read the raw ``HKCU\\Environment`` PATH value and its registry kind, if it exists.
+
+    Reading the registry directly rather than through
+    ``[Environment]::GetEnvironmentVariable('Path','User')`` keeps two things visible that the
+    .NET getter hides: the unexpanded value (the getter expands ``%USERPROFILE%``-style
+    references) and the value kind, so a ``REG_EXPAND_SZ`` -> ``REG_SZ`` downgrade cannot pass
+    unnoticed.
+    """
+    import winreg
+
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment") as key:
+        try:
+            value, kind = winreg.QueryValueEx(key, "Path")
+        except FileNotFoundError:
+            return None
+    return str(value), int(kind)
+
+
+def _restore_user_path_entry(previous: tuple[str, int] | None) -> None:
+    import winreg
+
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment", 0, winreg.KEY_SET_VALUE) as key:
+        if previous is None:
+            try:
+                winreg.DeleteValue(key, "Path")
+            except FileNotFoundError:
+                pass
+            return
+        value, kind = previous
+        winreg.SetValueEx(key, "Path", 0, kind, value)
+
+
 @pytest.mark.skipif(
     os.name != "nt" or _powershell_executable() is None,
     reason="Windows PowerShell coverage runs on Windows hosts only",
@@ -572,37 +605,46 @@ def test_powershell_installer_does_not_leak_into_user_path(tmp_path: Path) -> No
     used to leak the temp shim dir into the developer's real PATH. ``_build_env``
     now sets ``HEADROOM_INSTALL_PATH_SCOPE=Process`` to keep the update
     ephemeral; the real User PATH must be unchanged across the run.
+
+    The assertion reads ``HKCU\\Environment`` itself instead of counting the entries the .NET
+    getter reports, so it verifies the guard rather than trusting the environment variable to
+    have taken effect: it catches a count-preserving mutation and a change of the value kind,
+    neither of which an entry count can see.
     """
     powershell = _powershell_executable()
     assert powershell is not None
-
-    count_cmd = [
-        powershell,
-        "-NoProfile",
-        "-Command",
-        "([Environment]::GetEnvironmentVariable('Path','User') -split ';').Count",
-    ]
-    before = _run(count_cmd, env=os.environ.copy()).stdout.strip()
 
     home = tmp_path / "home"
     (home / ".local").mkdir(parents=True)
     env = _build_env(home, tmp_path)
     env["HEADROOM_DOCKER_IMAGE"] = "headroom:test-image"
-    _run(
-        [
-            powershell,
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
-            str(REPO_ROOT / "scripts" / "install.ps1"),
-        ],
-        env=env,
-        cwd=REPO_ROOT,
-    )
 
-    after = _run(count_cmd, env=os.environ.copy()).stdout.strip()
-    assert after == before, f"installer leaked into the real User PATH: {before} -> {after}"
+    before = _read_user_path_entry()
+    try:
+        _run(
+            [
+                powershell,
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(REPO_ROOT / "scripts" / "install.ps1"),
+            ],
+            env=env,
+            cwd=REPO_ROOT,
+        )
+
+        after = _read_user_path_entry()
+        assert str(home) not in (after[0] if after else ""), (
+            f"installer leaked the throwaway install dir into the real User PATH: {home}"
+        )
+        assert after == before, "installer mutated the real User PATH"
+    finally:
+        _cleanup_fake_docker(env)
+        # A passing run never writes to the registry; this only fires if the guard regresses, so
+        # that a failing test cannot leave the developer's PATH polluted.
+        if _read_user_path_entry() != before:
+            _restore_user_path_entry(before)
 
 
 # AST-extract Ensure-PathEntry from install.ps1 and invoke it in isolation under
