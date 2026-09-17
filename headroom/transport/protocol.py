@@ -208,6 +208,16 @@ class ProcessIdentity:
         }
 
     def matches_live_process(self) -> bool:
+        # Acquiring a new lease still requires positively verified identity.
+        return self.observe_live_process() is True
+
+    def observe_live_process(self) -> bool | None:
+        """Return a match, confirmed death/reuse, or an unavailable observation.
+
+        Failure to run an identity reader (for example, a `ps` timeout under
+        load) does not establish that an already-verified parent has died.
+        The lease control channel remains authoritative while we retry.
+        """
         reader = {
             "psutil": _psutil_process_identity,
             "proc": _proc_process_identity,
@@ -217,7 +227,14 @@ class ProcessIdentity:
             return False
         current = reader(self.pid)
         if current is None:
-            return False
+            try:
+                os.kill(self.pid, 0)
+            except ProcessLookupError:
+                return False
+            except OSError:
+                # Permission and other inspection failures are not death.
+                return None
+            return None
         return current.start_time == self.start_time
 
 

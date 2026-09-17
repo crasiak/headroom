@@ -3078,7 +3078,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 loop.set_exception_handler(previous)
 
             app.state.ready = False
-            logger.info("event=proxy_shutdown reason=signal pid=%d", os.getpid())
+            logger.info("event=proxy_shutdown reason=lifespan_exit pid=%d", os.getpid())
 
             async def _timed(coro: Any, *, label: str, timeout: float) -> None:
                 try:

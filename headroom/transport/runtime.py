@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import socket
 import uuid
@@ -27,6 +28,7 @@ from .protocol import (
 
 MAX_CONTROL_RECORD_BYTES = 64 * 1024
 RELEASE_SCHEMA = "headroom.transport.release.v1"
+logger = logging.getLogger(__name__)
 
 
 class TransportLease:
@@ -292,11 +294,14 @@ async def _monitor_control(
         while True:
             release = await channel.read_record()
             if lease.release(_validate_release(release)):
+                logger.info("event=transport_shutdown reason=lease_release")
                 server.should_exit = True
                 return
     except EOFError:
+        logger.info("event=transport_shutdown reason=control_eof")
         server.should_exit = True
     except (ProtocolError, ValueError):
+        logger.warning("event=transport_shutdown reason=invalid_control_record")
         server.force_exit = True
         server.should_exit = True
         raise
@@ -306,13 +311,29 @@ async def _monitor_parent(
     parent: ProcessIdentity,
     server: uvicorn.Server,
     *,
-    interval: float = 0.25,
+    interval: float = 1.0,
 ) -> None:
+    retry_delay = interval
+    observation_unavailable = False
     while not server.should_exit:
-        await asyncio.sleep(interval)
-        if not parent.matches_live_process():
+        await asyncio.sleep(retry_delay)
+        # Process inspection may spend two seconds waiting for `ps`. Never
+        # block request handling or lease release on that synchronous work.
+        live = await asyncio.to_thread(parent.observe_live_process)
+        if live is None:
+            if not observation_unavailable:
+                logger.warning("event=parent_observation_unavailable pid=%d", parent.pid)
+                observation_unavailable = True
+            retry_delay = min(max(retry_delay * 2, interval), 5.0)
+            continue
+        if live is False:
+            logger.info("event=transport_shutdown reason=parent_not_live pid=%d", parent.pid)
             server.should_exit = True
             return
+        if observation_unavailable:
+            logger.info("event=parent_observation_recovered pid=%d", parent.pid)
+            observation_unavailable = False
+        retry_delay = interval
 
 
 async def serve_transport(
@@ -389,6 +410,7 @@ async def serve_transport(
                 task.result()
         return 0
     except Exception:
+        logger.exception("event=transport_failure readiness_written=%s", readiness_written)
         if not readiness_written:
             _write_record(readiness_stream, _error_record("startup_failed"))
         return 4
