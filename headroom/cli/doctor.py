@@ -20,8 +20,10 @@ from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import click
+from click.core import ParameterSource
 
 from headroom._version import format_version_label, normalize_release_version
 from headroom.install.health import probe_json
@@ -40,6 +42,7 @@ from headroom.providers.claude import (
     remote_control_gate_message,
 )
 
+from .doctor_binding import BINDING_ENV, parse_binding
 from .main import get_version, main
 from .wrap import _read_wrap_marker, _wrap_marker_is_stale
 
@@ -649,7 +652,7 @@ _STATUS_STYLE = {PASS: "green", WARN: "yellow", FAIL: "red", SKIP: "dim"}
 _STATUS_GLYPH = {PASS: "✓", WARN: "⚠", FAIL: "✗", SKIP: "·"}
 
 
-def _render(checks: list[CheckResult], port: int, installed: str) -> None:
+def _render(checks: list[CheckResult], port: int | None, installed: str) -> None:
     from rich.console import Console
     from rich.markup import escape
     from rich.table import Table
@@ -689,7 +692,6 @@ def _render(checks: list[CheckResult], port: int, installed: str) -> None:
     "-p",
     default=8787,
     type=click.IntRange(1, 65535),
-    envvar="HEADROOM_PORT",
     help="Proxy port to check (default: 8787, env: HEADROOM_PORT)",
 )
 @click.option("--json", "emit_json", is_flag=True, help="Emit JSON instead of formatted output.")
@@ -702,6 +704,16 @@ def doctor(port: int, emit_json: bool) -> None:
         1  warnings only (working, but not optimally wired)
         2  at least one failure (proxy down / deployment down)
     """
+    explicit = (
+        click.get_current_context().get_parameter_source("port") == ParameterSource.COMMANDLINE
+    )
+    raw_binding = os.environ.get(BINDING_ENV)
+    if raw_binding is not None:
+        _ledger_doctor(raw_binding, port if explicit else None, emit_json)
+        return
+    if not explicit and "HEADROOM_PORT" in os.environ:
+        raw_port: Any = os.environ["HEADROOM_PORT"]
+        port = click.IntRange(1, 65535).convert(raw_port, None, None)
     base_url = f"http://127.0.0.1:{port}"
     livez = probe_json(f"{base_url}/livez")
     stats = probe_json(f"{base_url}/stats", timeout=5.0) if livez else None
@@ -758,9 +770,144 @@ def doctor(port: int, emit_json: bool) -> None:
             json.dumps(
                 {
                     "port": port,
+                    "binding": None,
+                    "endpoint_source": "explicit-port"
+                    if explicit
+                    else "HEADROOM_PORT"
+                    if "HEADROOM_PORT" in os.environ
+                    else "default",
                     "installed_version": installed,
                     "exit_code": exit_code,
                     "checks": [asdict(c) for c in checks],
+                },
+                indent=2,
+            )
+        )
+    else:
+        _render(checks, port, installed)
+    raise SystemExit(exit_code)
+
+
+def _ledger_doctor(raw: str, explicit_port: int | None, emit_json: bool) -> None:
+    binding = None
+    checks = []
+    try:
+        binding = parse_binding(raw)
+    except ValueError as exc:
+        checks.append(
+            CheckResult(
+                "binding",
+                FAIL,
+                str(exc),
+                "relaunch through Ledger to obtain current binding metadata",
+            )
+        )
+    endpoint = str(binding["endpoint"]) if binding else None
+    port = (
+        explicit_port
+        if explicit_port is not None
+        else urlsplit(endpoint).port
+        if endpoint
+        else None
+    )
+    selected = f"http://127.0.0.1:{explicit_port}" if explicit_port is not None else endpoint
+    source = (
+        "explicit-port"
+        if explicit_port is not None
+        else "ledger-binding"
+        if binding
+        else "invalid-binding"
+    )
+    installed = get_version()
+    if binding and endpoint:
+        checks.append(
+            CheckResult(
+                "binding",
+                PASS,
+                f"{binding['harness']} / {binding['mode']}: {endpoint} (diagnostic metadata)",
+            )
+        )
+        if (
+            explicit_port is not None
+            and selected is not None
+            and selected.rstrip("/") != endpoint.rstrip("/")
+        ):
+            checks.append(
+                CheckResult(
+                    "override",
+                    WARN,
+                    f"explicit probe {selected} differs from active endpoint {endpoint}",
+                )
+            )
+    if selected:
+        livez = probe_json(selected.rstrip("/") + "/livez", allow_redirects=False)
+        healthy = (
+            livez is not None
+            and livez.get("service") == "headroom-proxy"
+            and livez.get("alive") is True
+        )
+        checks.append(
+            CheckResult(
+                "proxy",
+                PASS if healthy else FAIL,
+                f"{'healthy' if healthy else 'unavailable or invalid health response'} at {selected}",
+            )
+        )
+        version = check_version_drift(livez if healthy else None, installed)
+        version.hint = None  # Managed lifecycle belongs to Ledger, not `headroom proxy`.
+        checks.append(version)
+    if binding and endpoint:
+        checks.append(
+            CheckResult(
+                str(binding["harness"]),
+                PASS,
+                f"Ledger published active route {endpoint}; native command-line overrides are not independently inspected",
+            )
+        )
+        if binding["harness"] == "claude":
+            route = (
+                os.environ.get("ANTHROPIC_BEDROCK_BASE_URL")
+                if os.environ.get("CLAUDE_CODE_USE_BEDROCK") == "1"
+                else os.environ.get("ANTHROPIC_BASE_URL")
+            )
+            if route:
+                matches = route.rstrip("/") == endpoint.rstrip("/")
+                checks.append(
+                    CheckResult(
+                        "claude-environment",
+                        PASS if matches else FAIL,
+                        "active routing environment matches binding"
+                        if matches
+                        else "active routing environment differs from binding",
+                    )
+                )
+        checks.append(
+            CheckResult(
+                "statistics",
+                SKIP,
+                "isolated liveness does not prove compression"
+                if binding["mode"] == "isolated"
+                else "shared aggregate statistics not used as launch evidence",
+            )
+        )
+    exit_code = (
+        2
+        if any(c.status == FAIL for c in checks)
+        else 1
+        if any(c.status == WARN for c in checks)
+        else 0
+    )
+    if emit_json:
+        click.echo(
+            json.dumps(
+                {
+                    "port": port,
+                    "installed_version": installed,
+                    "exit_code": exit_code,
+                    "checks": [asdict(c) for c in checks],
+                    "binding": binding,
+                    "endpoint_source": source,
+                    "selected_endpoint": selected,
                 },
                 indent=2,
             )
