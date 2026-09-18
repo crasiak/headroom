@@ -652,7 +652,7 @@ _STATUS_STYLE = {PASS: "green", WARN: "yellow", FAIL: "red", SKIP: "dim"}
 _STATUS_GLYPH = {PASS: "✓", WARN: "⚠", FAIL: "✗", SKIP: "·"}
 
 
-def _render(checks: list[CheckResult], port: int, installed: str) -> None:
+def _render(checks: list[CheckResult], port: int | None, installed: str) -> None:
     from rich.console import Console
     from rich.markup import escape
     from rich.table import Table
@@ -712,7 +712,8 @@ def doctor(port: int, emit_json: bool) -> None:
         _ledger_doctor(raw_binding, port if explicit else None, emit_json)
         return
     if not explicit and "HEADROOM_PORT" in os.environ:
-        port = click.IntRange(1, 65535).convert(os.environ["HEADROOM_PORT"], None, None)
+        raw_port: Any = os.environ["HEADROOM_PORT"]
+        port = click.IntRange(1, 65535).convert(raw_port, None, None)
     base_url = f"http://127.0.0.1:{port}"
     livez = probe_json(f"{base_url}/livez")
     stats = probe_json(f"{base_url}/stats", timeout=5.0) if livez else None
@@ -818,7 +819,7 @@ def _ledger_doctor(raw: str, explicit_port: int | None, emit_json: bool) -> None
         else "invalid-binding"
     )
     installed = get_version()
-    if binding:
+    if binding and endpoint:
         checks.append(
             CheckResult(
                 "binding",
@@ -826,7 +827,11 @@ def _ledger_doctor(raw: str, explicit_port: int | None, emit_json: bool) -> None
                 f"{binding['harness']} / {binding['mode']}: {endpoint} (diagnostic metadata)",
             )
         )
-        if explicit_port is not None and selected.rstrip("/") != endpoint.rstrip("/"):
+        if (
+            explicit_port is not None
+            and selected is not None
+            and selected.rstrip("/") != endpoint.rstrip("/")
+        ):
             checks.append(
                 CheckResult(
                     "override",
@@ -851,7 +856,7 @@ def _ledger_doctor(raw: str, explicit_port: int | None, emit_json: bool) -> None
         version = check_version_drift(livez if healthy else None, installed)
         version.hint = None  # Managed lifecycle belongs to Ledger, not `headroom proxy`.
         checks.append(version)
-    if binding:
+    if binding and endpoint:
         checks.append(
             CheckResult(
                 str(binding["harness"]),

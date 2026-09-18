@@ -38,7 +38,7 @@ def parse_binding(raw: str) -> dict[str, object]:
             or "#" in endpoint
             or url.path not in ("", "/")
             or not url.port
-            or not ipaddress.ip_address(url.hostname).is_loopback
+            or not ipaddress.ip_address(url.hostname or "").is_loopback
         ):
             raise ValueError()
     except (ValueError, TypeError):
