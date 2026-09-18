@@ -510,9 +510,18 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - uses: wagoid/commitlint-github-action@v6
+      - uses: actions/setup-node@v6
         with:
-          configFile: .commitlintrc.json
+          node-version: '24'
+      - name: Lint new fork commits, preserving imported history
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          npm install --prefix "$RUNNER_TEMP/commitlint" --ignore-scripts --no-audit --no-fund @commitlint/cli@19.8.1 @commitlint/config-conventional@19.8.1
+          # Validate every first-parent contribution, including merge messages.
+          # Imported upstream/history keeps its original messages and authorship.
+          NODE_PATH="$RUNNER_TEMP/commitlint/node_modules" "$RUNNER_TEMP/commitlint/node_modules/.bin/commitlint" --config .commitlintrc.json --from "$BASE_SHA" --to "$HEAD_SHA" --git-log-args=--first-parent
 
   build:
     needs: changes

@@ -451,7 +451,13 @@ def _never_kill_real_proxies(request, monkeypatch):
         yield
         return
 
-    from headroom.cli import wrap as _wrap_mod
+    try:
+        from headroom.cli import wrap as _wrap_mod
+    except ModuleNotFoundError:
+        # Installer-only Windows/macOS jobs intentionally omit Python CLI
+        # dependencies. They cannot invoke the proxy-stopping Python paths.
+        yield
+        return
 
     monkeypatch.setattr(_wrap_mod, "_stop_local_proxy_for_unwrap", lambda port: "not_running")
     monkeypatch.setattr(_wrap_mod, "_kill_proxy_by_pid", lambda pid, port: True)
