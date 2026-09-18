@@ -71,6 +71,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
 
+# Pin npm: Node 22 with npm 10.9.8 crashes in Arborist (edgesOut) when
+# installing the local SDK tarball into the OpenClaw plugin. Keep this
+# shared image on the version verified by the local-source E2E.
 # Install Node.js 22 from NodeSource (matches what node:22-trixie gives,
 # but layered onto python:3.11-slim so we get py3.11 + node22 + glibc 2.41
 # in one image). Also install git for any package that clones at install.
@@ -82,6 +85,7 @@ RUN apt-get update && \
       gnupg && \
     curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
     apt-get install -y --no-install-recommends nodejs && \
+    npm install -g --no-fund --no-audit npm@11.12.1 && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /workspace
