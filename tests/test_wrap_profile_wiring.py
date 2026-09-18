@@ -419,7 +419,7 @@ def test_codex_legacy_prepare_only_uses_default_port(tmp_path, monkeypatch):
 
     runner = CliRunner()
     with runner.isolated_filesystem():
-        result = runner.invoke(codex, ["--prepare-only", "--no-serena"])
+        result = runner.invoke(codex, ["--prepare-only", "--no-proxy", "--no-serena"])
     assert result.exit_code == 0, result.output
 
     cfg = (fake_home / ".codex" / "config.toml").read_text()
