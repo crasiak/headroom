@@ -445,9 +445,13 @@ def _never_kill_real_proxies(request, monkeypatch):
     simply override this default. Return values mirror the no-proxy-running
     CI environment.
     """
-    if "stop_local_proxy_for_unwrap" in request.node.name:
+    if (
+        "stop_local_proxy_for_unwrap" in request.node.name
+        or request.node.name == "test_kill_proxy_uses_taskkill_tree_on_windows"
+    ):
         # Unit tests OF the stopper itself; they mock _check_proxy /
         # _query_proxy_config / _kill_proxy_by_pid internally and are hermetic.
+        # The Windows kill-helper test also mocks subprocess.run completely.
         yield
         return
 
