@@ -17,6 +17,7 @@ import uvicorn
 from headroom.proxy.models import ProxyConfig
 from headroom.proxy.server import create_app
 
+from .diagnostics import Diagnostics, ParentEpisode, current_request, route_name, trace_request
 from .protocol import (
     READY_SCHEMA,
     AcquireRequest,
@@ -85,14 +86,75 @@ class _TransportBoundaryMiddleware:
     _HEALTH_PATHS = frozenset({"/health", "/healthz", "/livez", "/readyz"})
 
     def __init__(
-        self, app: Any, *, receipt_writer: ReceiptWriter, binding: AcquireRequest, proxy: Any
+        self,
+        app: Any,
+        *,
+        receipt_writer: ReceiptWriter,
+        binding: AcquireRequest,
+        proxy: Any,
+        diagnostics: Diagnostics | None = None,
     ) -> None:
         self.app = app
         self.receipt_writer = receipt_writer
         self.binding = binding
         self.proxy = proxy
+        self.diagnostics = diagnostics or Diagnostics(run_id=binding.run_id)
 
     async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
+        if scope.get("type") != "http" or scope.get("path") in self._HEALTH_PATHS:
+            await self._dispatch(scope, receive, send)
+            return
+        for name in ("http_client", "http_client_h1"):
+            client = getattr(self.proxy, name, None)
+            if client is not None and hasattr(client, "event_hooks"):
+                hooks = client.event_hooks.setdefault("request", [])
+                if trace_request not in hooks:
+                    hooks.append(trace_request)
+        record = self.diagnostics.begin(
+            route_name(scope.get("path", ""), self.binding.account.provider_mode)
+        )
+        token = current_request.set(record)
+        completed = False
+        disconnected = False
+
+        async def tracked_receive():
+            nonlocal disconnected
+            message = await receive()
+            if message.get("type") == "http.disconnect":
+                disconnected = True
+            return message
+
+        async def tracked_send(message):
+            nonlocal completed
+            await send(message)
+            if message.get("type") == "http.response.start":
+                record.status = message.get("status")
+            elif message.get("type") == "http.response.body" and not message.get(
+                "more_body", False
+            ):
+                completed = True
+
+        try:
+            record.stage("validating")
+            await self._dispatch(scope, tracked_receive, tracked_send)
+        except asyncio.CancelledError:
+            record.finish("cancelled")
+            raise
+        except BaseException:
+            record.finish("failed")
+            raise
+        finally:
+            if not record.finished:
+                record.finish(
+                    "cancelled"
+                    if disconnected and not completed
+                    else "failed"
+                    if not completed or (record.status or 200) >= 400
+                    else "completed"
+                )
+            current_request.reset(token)
+
+    async def _dispatch(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
         if scope.get("type") == "websocket":
             await self.receipt_writer.record_rejection(
                 reason="unsupported_transport_websocket", bypass=False
@@ -194,6 +256,7 @@ def create_transport_app(
     receipt_writer: ReceiptWriter,
     *,
     port: int,
+    diagnostics: Diagnostics | None = None,
 ):
     """Build a stateless, no-fallback proxy bound to one prepared request."""
 
@@ -222,12 +285,15 @@ def create_transport_app(
         isolated_transport=True,
     )
     app = create_app(config)
+    diagnostics = diagnostics or Diagnostics(run_id=request.run_id)
+    app.state.transport_diagnostics = diagnostics
     app.state.proxy.transport_receipt_writer = receipt_writer
     app.add_middleware(
         _TransportBoundaryMiddleware,
         receipt_writer=receipt_writer,
         binding=request,
         proxy=app.state.proxy,
+        diagnostics=diagnostics,
     )
     return app
 
@@ -289,18 +355,26 @@ async def _monitor_control(
     channel: _ControlChannel,
     lease: TransportLease,
     server: uvicorn.Server,
+    diagnostics: Diagnostics | None = None,
 ) -> None:
+    def diagnostic(reason: str) -> None:
+        if diagnostics:
+            diagnostics.emit("transport_shutdown", reason=reason)
+
     try:
         while True:
             release = await channel.read_record()
             if lease.release(_validate_release(release)):
+                diagnostic("lease_release")
                 logger.info("event=transport_shutdown reason=lease_release")
                 server.should_exit = True
                 return
     except EOFError:
+        diagnostic("control_eof")
         logger.info("event=transport_shutdown reason=control_eof")
         server.should_exit = True
     except (ProtocolError, ValueError):
+        diagnostic("invalid_control_record")
         logger.warning("event=transport_shutdown reason=invalid_control_record")
         server.force_exit = True
         server.should_exit = True
@@ -312,28 +386,35 @@ async def _monitor_parent(
     server: uvicorn.Server,
     *,
     interval: float = 1.0,
+    diagnostics: Diagnostics | None = None,
 ) -> None:
     retry_delay = interval
     observation_unavailable = False
-    while not server.should_exit:
-        await asyncio.sleep(retry_delay)
-        # Process inspection may spend two seconds waiting for `ps`. Never
-        # block request handling or lease release on that synchronous work.
-        live = await asyncio.to_thread(parent.observe_live_process)
-        if live is None:
-            if not observation_unavailable:
-                logger.warning("event=parent_observation_unavailable pid=%d", parent.pid)
-                observation_unavailable = True
-            retry_delay = min(max(retry_delay * 2, interval), 5.0)
-            continue
-        if live is False:
-            logger.info("event=transport_shutdown reason=parent_not_live pid=%d", parent.pid)
-            server.should_exit = True
-            return
-        if observation_unavailable:
-            logger.info("event=parent_observation_recovered pid=%d", parent.pid)
-            observation_unavailable = False
-        retry_delay = interval
+    diagnostics = diagnostics or Diagnostics(run_id="unknown")
+    episode = ParentEpisode(diagnostics, parent.pid)
+    try:
+        while not server.should_exit:
+            await asyncio.sleep(retry_delay)
+            # Identity readers are synchronous and bounded; keep them off-loop.
+            observation = await asyncio.to_thread(parent.observe_diagnostics)
+            episode.observe(observation)
+            if observation.state == "unavailable":
+                if not observation_unavailable:
+                    logger.warning("event=parent_observation_unavailable pid=%d", parent.pid)
+                    observation_unavailable = True
+                retry_delay = min(max(retry_delay * 2, interval), 5.0)
+                continue
+            if observation.state == "dead":
+                diagnostics.emit("transport_shutdown", reason="parent_not_live", pid=parent.pid)
+                logger.info("event=transport_shutdown reason=parent_not_live pid=%d", parent.pid)
+                server.should_exit = True
+                return
+            if observation_unavailable:
+                logger.info("event=parent_observation_recovered pid=%d", parent.pid)
+                observation_unavailable = False
+            retry_delay = interval
+    finally:
+        episode.report("monitor_stopped")
 
 
 async def serve_transport(
@@ -367,7 +448,12 @@ async def serve_transport(
             _write_record(receipt_stream, value)
 
         writer = ReceiptWriter(request, receipt_sink)
-        app = create_transport_app(request, writer, port=port)
+        diagnostics = Diagnostics(
+            run_id=request.run_id,
+            lease_id=lease.lease_id,
+            runtime_set_digest=request.runtime_set_digest,
+        )
+        app = create_transport_app(request, writer, port=port, diagnostics=diagnostics)
         config = uvicorn.Config(
             app,
             host="127.0.0.1",
@@ -383,6 +469,7 @@ async def serve_transport(
         process_identity = current_process_identity()
         if not process_identity.matches_live_process():
             raise RuntimeError("transport process identity changed during startup")
+        diagnostics.capture_boot(process_identity)
         endpoint = f"http://127.0.0.1:{port}"
         _write_record(
             readiness_stream,
@@ -395,8 +482,11 @@ async def serve_transport(
         readiness_written = True
 
         monitor_tasks = [
-            asyncio.create_task(_monitor_control(channel, lease, server)),
-            asyncio.create_task(_monitor_parent(request.parent_process, server)),
+            asyncio.create_task(_monitor_control(channel, lease, server, diagnostics)),
+            asyncio.create_task(
+                _monitor_parent(request.parent_process, server, diagnostics=diagnostics)
+            ),
+            asyncio.create_task(diagnostics.sample_loop()),
         ]
         done, _ = await asyncio.wait(
             [serve_task, *monitor_tasks],

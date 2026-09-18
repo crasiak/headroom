@@ -1,0 +1,10 @@
+{
+  "requests": 10000,
+  "events_per_request": 6,
+  "disabled_loop_us_per_request": 0.01393329985148739,
+  "enabled_encoding_flush_us_per_request_with_tracemalloc": 477.6907957999356,
+  "retained_bytes": 12494,
+  "peak_bytes": 16762,
+  "log_bytes_per_request": 2498.1993,
+  "active_at_end": 0
+}

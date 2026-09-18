@@ -1,0 +1,58 @@
+============================= test session starts ==============================
+platform darwin -- Python 3.11.15, pytest-9.0.3, pluggy-1.6.0
+rootdir: /Users/jws/code/headroom-worktrees/crash-attribution
+configfile: pyproject.toml
+plugins: anyio-4.12.1, asyncio-1.3.0, langsmith-0.10.10, respx-0.23.1, cov-7.0.0
+asyncio: mode=Mode.AUTO, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collected 8 items
+
+tests/test_transport_diagnostics.py FFFFFFFF                             [100%]
+
+=================================== FAILURES ===================================
+__________ test_typed_reader_failure_is_unavailable[failure0-timeout] __________
+tests/test_transport_diagnostics.py:24: in test_typed_reader_failure_is_unavailable
+    observed = ProcessIdentity(os.getpid(), 'ps', 1).observe_diagnostics()
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E   AttributeError: 'ProcessIdentity' object has no attribute 'observe_diagnostics'
+_____ test_typed_reader_failure_is_unavailable[failure1-permission_denied] _____
+tests/test_transport_diagnostics.py:24: in test_typed_reader_failure_is_unavailable
+    observed = ProcessIdentity(os.getpid(), 'ps', 1).observe_diagnostics()
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E   AttributeError: 'ProcessIdentity' object has no attribute 'observe_diagnostics'
+_________ test_typed_reader_failure_is_unavailable[failure2-os_error] __________
+tests/test_transport_diagnostics.py:24: in test_typed_reader_failure_is_unavailable
+    observed = ProcessIdentity(os.getpid(), 'ps', 1).observe_diagnostics()
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E   AttributeError: 'ProcessIdentity' object has no attribute 'observe_diagnostics'
+________ test_typed_reader_failure_is_unavailable[failure3-parse_error] ________
+tests/test_transport_diagnostics.py:24: in test_typed_reader_failure_is_unavailable
+    observed = ProcessIdentity(os.getpid(), 'ps', 1).observe_diagnostics()
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E   AttributeError: 'ProcessIdentity' object has no attribute 'observe_diagnostics'
+____________________ test_missing_pid_retains_reader_error _____________________
+tests/test_transport_diagnostics.py:39: in test_missing_pid_retains_reader_error
+    observed = ProcessIdentity(999999, 'ps', 1).observe_diagnostics()
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E   AttributeError: 'ProcessIdentity' object has no attribute 'observe_diagnostics'
+_________________ test_tracker_bounds_privacy_and_finalization _________________
+tests/test_transport_diagnostics.py:44: in test_tracker_bounds_privacy_and_finalization
+    from headroom.transport.diagnostics import Diagnostics
+E   ModuleNotFoundError: No module named 'headroom.transport.diagnostics'
+___________ test_httpx_trace_uses_context_only_and_allowlists_values ___________
+tests/test_transport_diagnostics.py:69: in test_httpx_trace_uses_context_only_and_allowlists_values
+    from headroom.transport.diagnostics import Diagnostics, current_request, trace_request
+E   ModuleNotFoundError: No module named 'headroom.transport.diagnostics'
+_______________ test_lag_sampler_detects_blockage_and_tears_down _______________
+tests/test_transport_diagnostics.py:90: in test_lag_sampler_detects_blockage_and_tears_down
+    from headroom.transport.diagnostics import Diagnostics
+E   ModuleNotFoundError: No module named 'headroom.transport.diagnostics'
+=========================== short test summary info ============================
+FAILED tests/test_transport_diagnostics.py::test_typed_reader_failure_is_unavailable[failure0-timeout]
+FAILED tests/test_transport_diagnostics.py::test_typed_reader_failure_is_unavailable[failure1-permission_denied]
+FAILED tests/test_transport_diagnostics.py::test_typed_reader_failure_is_unavailable[failure2-os_error]
+FAILED tests/test_transport_diagnostics.py::test_typed_reader_failure_is_unavailable[failure3-parse_error]
+FAILED tests/test_transport_diagnostics.py::test_missing_pid_retains_reader_error
+FAILED tests/test_transport_diagnostics.py::test_tracker_bounds_privacy_and_finalization
+FAILED tests/test_transport_diagnostics.py::test_httpx_trace_uses_context_only_and_allowlists_values
+FAILED tests/test_transport_diagnostics.py::test_lag_sampler_detects_blockage_and_tears_down
+============================== 8 failed in 0.48s ===============================

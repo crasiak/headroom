@@ -3431,6 +3431,9 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             # on `rust_core != "loaded"` (Finding #2).
             "rust_core": getattr(app.state, "rust_core_status", "missing"),
         }
+        transport_diagnostics = getattr(app.state, "transport_diagnostics", None)
+        if transport_diagnostics is not None:
+            payload["transport_diagnostics"] = transport_diagnostics.snapshot()
         rust_core_error = getattr(app.state, "rust_core_error", None)
         if rust_core_error:
             payload["rust_core_error"] = rust_core_error

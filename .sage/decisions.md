@@ -1,0 +1,5 @@
+# Decisions
+
+## 2026-09-17 — CRA-467 implementation verified; rollout remains with parent
+
+User authorized autonomous execution of approved crash-attribution plans. Implement metadata-only diagnostics in the isolated transport; preserve strict v1 and unavailable-parent semantics. Use existing run/lease/runtime-set identities and the Ledger per-run stderr log sink. Parent rejected a separate diagnostic-file pool to avoid duplicate retention and coordination. Use one bounded ASGI request tracker plus request-local httpx trace for both native families rather than invasive edits to provider handlers. Bound active records to 128, nonterminal request transitions to 32, and parent/loop summaries to once/minute. Capture disk-at-launch and selected-loaded-function fingerprints separately; full loaded-code/dirty/source drift remain explicit unknown/not-checked. Keep public health identity-free. Verification and measurements are in `work/20260917-headroom-diagnostics/execution.md`. No live processes restarted; parent integration and deployment remain pending.
