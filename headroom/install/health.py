@@ -8,11 +8,24 @@ import urllib.request
 from typing import Any
 
 
-def probe_json(url: str, timeout: float = 2.0) -> dict[str, Any] | None:
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def probe_json(
+    url: str, timeout: float = 2.0, *, allow_redirects: bool = True
+) -> dict[str, Any] | None:
     """Return a JSON payload from the URL when reachable."""
 
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as response:
+        # Binding probes ignore ambient HTTP proxies and never follow redirects.
+        opener = (
+            urllib.request.urlopen
+            if allow_redirects
+            else urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect()).open
+        )
+        with opener(url, timeout=timeout) as response:
             payload = json.loads(response.read().decode("utf-8"))
     except (OSError, urllib.error.URLError, ValueError, json.JSONDecodeError):
         return None

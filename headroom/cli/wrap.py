@@ -701,6 +701,7 @@ def _start_proxy(
 
     # Ensure proxy subprocess uses UTF-8 (Windows defaults to cp1252)
     proxy_env = os.environ.copy()
+    proxy_env.pop("LEDGER_HEADROOM_BINDING", None)  # Native-child diagnostics only.
     _scrub_copilot_proxy_seed_env(proxy_env)
     proxy_env["PYTHONIOENCODING"] = "utf-8"
     # `python -m headroom.cli` prepends the launch cwd to sys.path, so running
