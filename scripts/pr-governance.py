@@ -52,6 +52,7 @@ COMMIT_TYPES = (
     "docs",
     "feat",
     "fix",
+    "merge",
     "parity",
     "perf",
     "refactor",

@@ -14,6 +14,7 @@ from headroom.providers.codex.endpoints import codex_backend_url
 from headroom.providers.codex.headers import drop_header
 from headroom.providers.codex.live import (
     CODEX_LIVE_ROUTE_PATHS,
+    handle_codex_live_http,
     handle_codex_live_websocket,
 )
 from headroom.providers.codex.responses import handle_chatgpt_codex_responses_subpath
@@ -213,6 +214,25 @@ def _register_openai_responses_routes(app: FastAPI, proxy: Any) -> None:
 def _register_codex_live_routes(app: FastAPI, proxy: Any) -> None:
     for path in CODEX_LIVE_ROUTE_PATHS:
 
+        async def codex_live_http(request: Request, route_path: str = path):
+            response = await handle_codex_live_http(
+                request,
+                proxy.http_client,
+                _api_target(proxy, "openai"),
+                route_path,
+            )
+            if response is not None:
+                return response
+            return await proxy.handle_passthrough(
+                request,
+                _api_target(proxy, "openai"),
+                route_path,
+                "openai",
+            )
+
+        codex_live_http.__name__ = path.strip("/").replace("/", "_") + "_live_http"
+        app.post(path)(codex_live_http)
+
         def register_websocket_route(route_path: str) -> None:
             async def codex_live_websocket(websocket: WebSocket):
                 await handle_codex_live_websocket(
@@ -287,7 +307,20 @@ def register_provider_routes(app: FastAPI, proxy: Any) -> None:
     # converter captures inference-profile ids that contain dots, colons and
     # slashes (e.g. `us.anthropic.claude-sonnet-4-5-20250929-v1:0`). See
     # headroom/proxy/handlers/bedrock.py for the SigV4 caveat.
-    if getattr(proxy.config, "bedrock_api_url", None):
+    # Local fork: the company-aperture passthrough (`--bedrock-base-url`) and
+    # upstream's native SigV4 handler (`--bedrock-api-url`) both want
+    # `/model/{id}/…`. The aperture passthrough wins when both are configured.
+    if getattr(proxy.config, "bedrock_base_url", None):
+
+        @app.post("/model/{model_id:path}/invoke")
+        async def bedrock_passthrough_invoke(request: Request, model_id: str):
+            return await proxy.handle_bedrock_passthrough(request, model_id, stream=False)
+
+        @app.post("/model/{model_id:path}/invoke-with-response-stream")
+        async def bedrock_passthrough_invoke_stream(request: Request, model_id: str):
+            return await proxy.handle_bedrock_passthrough(request, model_id, stream=True)
+
+    elif getattr(proxy.config, "bedrock_api_url", None):
 
         @app.post("/model/{model_id:path}/invoke")
         async def bedrock_invoke(request: Request, model_id: str):

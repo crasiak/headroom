@@ -17,6 +17,7 @@ import subprocess
 import time
 import uuid
 from collections.abc import Callable, Mapping
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -209,17 +210,83 @@ class ProcessIdentity:
         }
 
     def matches_live_process(self) -> bool:
+        # Acquiring a new lease still requires positively verified identity.
+        return self.observe_live_process() is True
+
+    def observe_live_process(self) -> bool | None:
+        """Compatibility facade: unavailable inspection never establishes death."""
+        return {"live": True, "dead": False, "unavailable": None}[self.observe_diagnostics().state]
+
+    def observe_diagnostics(self) -> ProcessObservation:
+        started = time.monotonic()
         reader = {
             "psutil": _psutil_process_identity,
             "proc": _proc_process_identity,
             "ps": _ps_process_identity,
         }.get(self.start_source)
-        if reader is None:
-            return False
-        current = reader(self.pid)
-        if current is None:
-            return False
-        return current.start_time == self.start_time
+        token = _reader_error.set(None)
+        try:
+            current = reader(self.pid) if reader else None
+            error = _reader_error.get() or ("unsupported_reader" if reader is None else None)
+        finally:
+            _reader_error.reset(token)
+        if current is not None:
+            state, reason = (
+                ("live", "match")
+                if current.start_time == self.start_time
+                else ("dead", "identity_mismatch")
+            )
+        else:
+            state, reason = "unavailable", error or "parse_error"
+            try:
+                os.kill(self.pid, 0)
+            except ProcessLookupError:
+                state, reason = "dead", "missing_pid"
+            except OSError:
+                pass
+        return ProcessObservation(
+            state,
+            reason,
+            self.start_source,
+            self.start_time,
+            current.start_time if current else None,
+            error,
+            (time.monotonic() - started) * 1000,
+        )
+
+
+@dataclass(frozen=True)
+class ProcessObservation:
+    state: str
+    reason: str
+    reader: str
+    expected_start_time: float
+    observed_start_time: float | None
+    reader_error: str | None
+    read_elapsed_ms: float
+
+
+# Preserve the identity-or-None reader API. Context-local error metadata lets
+# the typed observer retain categories without sharing mutable state across
+# concurrent readers or changing callers that use the compatibility facade.
+_reader_error: ContextVar[str | None] = ContextVar("process_reader_error", default=None)
+
+
+def _record_reader_error(error: Exception) -> None:
+    name = type(error).__name__
+    if isinstance(error, subprocess.TimeoutExpired):
+        reason = "timeout"
+    elif isinstance(error, PermissionError) or name == "AccessDenied":
+        reason = "permission_denied"
+    elif isinstance(error, ProcessLookupError) or name in {"NoSuchProcess", "ZombieProcess"}:
+        reason = "missing_pid"
+    elif isinstance(error, (ImportError, NotImplementedError)):
+        reason = "unsupported_reader"
+    elif isinstance(error, (OSError, subprocess.SubprocessError)):
+        reason = "os_error"
+    else:
+        reason = "parse_error"
+    _reader_error.set(reason)
 
 
 def _psutil_process_identity(pid: int) -> ProcessIdentity | None:
@@ -229,7 +296,8 @@ def _psutil_process_identity(pid: int) -> ProcessIdentity | None:
         return ProcessIdentity(
             pid=pid, start_source="psutil", start_time=psutil.Process(pid).create_time()
         )
-    except Exception:
+    except Exception as error:
+        _record_reader_error(error)
         return None
 
 
@@ -238,7 +306,8 @@ def _proc_process_identity(pid: int) -> ProcessIdentity | None:
         with open(f"/proc/{pid}/stat", "rb") as handle:
             fields = handle.read().rpartition(b")")[2].split()
         return ProcessIdentity(pid=pid, start_source="proc", start_time=float(fields[19]))
-    except (OSError, IndexError, ValueError):
+    except (OSError, IndexError, ValueError) as error:
+        _record_reader_error(error)
         return None
 
 
@@ -253,10 +322,12 @@ def _ps_process_identity(pid: int) -> ProcessIdentity | None:
         )
         value = completed.stdout.strip()
         if not value:
+            _reader_error.set("parse_error")
             return None
         parsed = time.strptime(value, "%a %b %d %H:%M:%S %Y")
         return ProcessIdentity(pid=pid, start_source="ps", start_time=time.mktime(parsed))
-    except (OSError, subprocess.SubprocessError, ValueError):
+    except (OSError, subprocess.SubprocessError, ValueError) as error:
+        _record_reader_error(error)
         return None
 
 
