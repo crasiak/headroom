@@ -1,0 +1,7 @@
+=== RUN   TestActualHeadroomTransportTwoAccountFakeProviderGate
+ledger: lifecycle evidence unavailable
+PASS
+PASS
+--- PASS: TestActualHeadroomTransportTwoAccountFakeProviderGate (18.51s)
+PASS
+ok  	github.com/jws/ledger/cmd/ledger	19.261s
