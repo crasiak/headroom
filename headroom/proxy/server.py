@@ -476,6 +476,58 @@ logging.basicConfig(
 logger = logging.getLogger("headroom.proxy")
 
 
+def _output_reduction_payload(shaper_active: bool, est: Any = None) -> dict[str, Any]:
+    """/stats payload for the output-shaping layer.
+
+    A deployment whose shaper is off (rollout-blocked channel, kill switch,
+    disabled config) is shaping nothing, so /stats must not publish the
+    persisted ledger's estimate as this deployment's live layer: the ledger
+    survives restarts and can span periods or key schemas where arms
+    accumulated unshaped traffic — which is how a rollout-blocked stable
+    install came to advertise a "measured" -147.9% output reduction it never
+    performed. The ledger itself stays untouched; only the claim is gated.
+
+    Every branch emits the SAME key set, nulls where a value does not exist,
+    so a consumer reading ``ci_low_percent`` or ``band_is_ci`` cannot KeyError
+    on the inactive or no-data paths. Numeric totals stay 0 rather than null:
+    callers already sum them.
+    """
+    payload: dict[str, Any] = {
+        "available": False,
+        "active": bool(shaper_active),
+        "method": None,
+        "band_is_ci": None,
+        "tokens_saved": 0,
+        "baseline_tokens": 0,
+        "reduction_percent": 0.0,
+        "ci_low_percent": None,
+        "ci_high_percent": None,
+        "requests": 0,
+    }
+    if not shaper_active:
+        payload["available"] = True
+        payload["method"] = "inactive"
+        return payload
+    if getattr(est, "n_requests", 0) <= 0:
+        return payload
+    payload.update(
+        {
+            "available": True,
+            "method": est.kind,  # "measured" | "estimated" | "modelled"
+            # A modelled band is the spread between the two benchmarked
+            # models, not a sampling CI. The UI must not call it one.
+            "band_is_ci": est.kind != "modelled",
+            "tokens_saved": round(est.tokens_saved),
+            "baseline_tokens": round(est.baseline_tokens),
+            "reduction_percent": round(est.pct, 1),
+            "ci_low_percent": round(est.ci_low_pct, 1),
+            "ci_high_percent": round(est.ci_high_pct, 1),
+            "requests": est.n_requests,
+        }
+    )
+    return payload
+
+
 def _code_syntax_breaker_status() -> dict[str, Any]:
     """Per-language AST-compression breaker state, or {} if unavailable."""
     try:
@@ -617,6 +669,7 @@ from headroom.proxy.handlers import (  # noqa: E402
     AnthropicHandlerMixin,
     BatchHandlerMixin,
     BedrockHandlerMixin,
+    BedrockPassthroughMixin,
     GeminiHandlerMixin,
     OpenAIHandlerMixin,
     StreamingMixin,
@@ -770,10 +823,11 @@ def _external_compressor_selection(compressors: set[str] | None) -> list[str] | 
 class HeadroomProxy(
     StreamingMixin,
     AnthropicHandlerMixin,
+    BedrockHandlerMixin,
     OpenAIHandlerMixin,
     GeminiHandlerMixin,
     BatchHandlerMixin,
-    BedrockHandlerMixin,
+    BedrockPassthroughMixin,
 ):
     """Production-ready Headroom optimization proxy."""
 
@@ -1051,6 +1105,11 @@ class HeadroomProxy(
         self._compression_cache_last_seen: dict[str, float] = {}
         self._compression_caches_last_cleanup: float = time.time()
         self._compression_caches_lock = threading.RLock()
+
+        # Gateway turn contract: its pending-turn registry (`gateway_turns`) is
+        # attached by headroom.proxy.gateway_extension.install, which
+        # create_app runs by default (HEADROOM_GATEWAY_CONTRACT=0 leaves it out).
+        self.gateway_turns = None
 
         self.logger = (
             RequestLogger(
@@ -1816,6 +1875,75 @@ class HeadroomProxy(
 
         return eager_status, transform_statuses
 
+    def _start_kompress_background_warmup(self) -> bool:
+        """Load the Kompress model on a daemon thread once startup has returned.
+
+        Startup must not build the model (native init before the port binds
+        segfaults on RHEL/CentOS 7-family hosts, #1908), so it used to load
+        inside the first request that needed it: a benchmark turn through a
+        gateway stalled 21 s while transformers, torch and the ONNX session
+        came up. Loading on a background thread after a short delay moves that
+        cost off the request path. Skipped on glibc older than 2.28 (the
+        affected host family) and when ``HEADROOM_KOMPRESS_WARMUP`` is ``0``;
+        ``1`` forces it. Returns ``True`` when a warm-up thread was started.
+        """
+        raw = os.environ.get("HEADROOM_KOMPRESS_WARMUP", "").strip().lower()
+        if raw in ("0", "false", "no", "off"):
+            return False
+        if not raw and os.environ.get("PYTEST_CURRENT_TEST"):
+            # Test apps boot by the hundred; none of them should load a model.
+            return False
+        if raw not in ("1", "true", "yes", "on"):
+            import platform
+
+            libc, version = platform.libc_ver()
+            if libc == "glibc":
+                try:
+                    major, minor = (int(part) for part in version.split(".")[:2])
+                except ValueError:
+                    major, minor = 0, 0
+                if (major, minor) < (2, 28):
+                    return False
+        compressor = None
+        for pipeline in (self.anthropic_pipeline, self.openai_pipeline):
+            for transform in getattr(pipeline, "transforms", []):
+                getter = getattr(transform, "_get_kompress", None)
+                if getter is None:
+                    continue
+                try:
+                    compressor = getter()
+                except Exception:
+                    compressor = None
+                if compressor is not None and hasattr(compressor, "preload"):
+                    break
+                compressor = None
+            if compressor is not None:
+                break
+        if compressor is None:
+            return False
+
+        try:
+            delay = float(os.environ.get("HEADROOM_KOMPRESS_WARMUP_DELAY_SECONDS", "2") or 2)
+        except ValueError:
+            delay = 2.0
+
+        def _warm() -> None:
+            time.sleep(max(0.0, delay))
+            started = time.monotonic()
+            try:
+                backend = compressor.preload(allow_download=True)
+            except Exception as exc:  # the lazy request path still loads on first use
+                logger.warning("Kompress background warm-up failed: %s", exc)
+                return
+            logger.info(
+                "Kompress: warmed in the background in %.0f ms (backend %s)",
+                (time.monotonic() - started) * 1000,
+                backend,
+            )
+
+        threading.Thread(target=_warm, name="kompress-warmup", daemon=True).start()
+        return True
+
     async def startup(self):
         """Initialize async resources."""
         self._get_shutdown_event().clear()
@@ -1956,7 +2084,10 @@ class HeadroomProxy(
         if self._kompress_status == "enabled":
             logger.info("Kompress: ENABLED (ModernBERT token compressor)")
         elif self._kompress_status == "deferred":
-            logger.info("Kompress: DEFERRED (model loads on first request)")
+            if self._start_kompress_background_warmup():
+                logger.info("Kompress: DEFERRED (warming in the background after startup)")
+            else:
+                logger.info("Kompress: DEFERRED (model loads on first request)")
         elif self.config.optimize:
             logger.info("Kompress: not installed (pip install headroom-ai[ml] for ML compression)")
 
@@ -2750,14 +2881,24 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
 
     from contextlib import asynccontextmanager
 
+    # Resolve config before file logging so the log can be keyed by port
+    # (below). Tradeoff: any log record emitted while ``ProxyConfig`` is
+    # constructed on the no-config path (e.g. an invalid HEADROOM_QDRANT_PORT
+    # warning) predates the file handler and so is not captured in the file log;
+    # the port must be known first, and it is always present (``port`` defaults
+    # to 8787), so this is accepted.
     config = config or ProxyConfig()
 
     # Always-on file logging to ~/.headroom/logs/ for `headroom perf` analysis.
     # Installed here (not at module import) so importing headroom.proxy.server
     # in tests or library contexts does not silently attach a RotatingFileHandler
-    # to the user's live proxy.log.
+    # to the user's live proxy log. Multi-worker processes add their PID so
+    # same-port workers never share a RotatingFileHandler target.
     if not config.stateless:
-        _setup_file_logging()
+        _setup_file_logging(
+            config.port,
+            process_id=os.getpid() if config.worker_processes > 1 else None,
+        )
 
     # Defensive re-apply of file-backed settings for embedded/non-CLI callers
     # that construct the app without going through the `headroom` CLI entrypoint
@@ -2937,7 +3078,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 loop.set_exception_handler(previous)
 
             app.state.ready = False
-            logger.info("event=proxy_shutdown reason=signal pid=%d", os.getpid())
+            logger.info("event=proxy_shutdown reason=lifespan_exit pid=%d", os.getpid())
 
             async def _timed(coro: Any, *, label: str, timeout: float) -> None:
                 try:
@@ -3290,6 +3431,9 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             # on `rust_core != "loaded"` (Finding #2).
             "rust_core": getattr(app.state, "rust_core_status", "missing"),
         }
+        transport_diagnostics = getattr(app.state, "transport_diagnostics", None)
+        if transport_diagnostics is not None:
+            payload["transport_diagnostics"] = transport_diagnostics.snapshot()
         rust_core_error = getattr(app.state, "rust_core_error", None)
         if rust_core_error:
             payload["rust_core_error"] = rust_core_error
@@ -3322,6 +3466,8 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
                 "code_graph": config.code_graph_watcher,
                 "anthropic_api_url": config.anthropic_api_url,
                 "openai_api_url": config.openai_api_url,
+                # Local fork: company-aperture Bedrock upstream (`--bedrock-base-url`).
+                "bedrock_base_url": config.bedrock_base_url,
                 "gemini_api_url": config.gemini_api_url,
                 "cloudcode_api_url": config.cloudcode_api_url,
                 "vertex_api_url": config.vertex_api_url,
@@ -3797,6 +3943,8 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         payload["runtime"] = _runtime_payload()
         return JSONResponse(status_code=200, content=payload)
 
+    _MAX_RUNTIME_ENV_BODY_BYTES = 64 * 1024
+
     @app.post(
         "/admin/runtime-env",
         dependencies=[Depends(_require_loopback), Depends(_require_same_origin)],
@@ -3816,8 +3964,16 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         the resulting live config. Last writer wins in a single-worker proxy;
         multi-worker proxies reject the update because overrides are process-local.
         """
+        body_bytes = bytearray()
+        async for chunk in request.stream():
+            body_bytes.extend(chunk)
+            if len(body_bytes) > _MAX_RUNTIME_ENV_BODY_BYTES:
+                return JSONResponse(
+                    status_code=413,
+                    content={"error": "request body too large"},
+                )
         try:
-            body = await request.json()
+            body = json.loads(bytes(body_bytes))
         except (ValueError, UnicodeDecodeError):
             body = None
         if not isinstance(body, dict):
@@ -3867,7 +4023,7 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             },
         )
 
-    # Vendored dashboard JS (tailwind/htmx/alpine). Mounted before
+    # Vendored dashboard JS (tailwind/alpine). Mounted before
     # register_provider_routes' catch-all so it is not tunneled upstream.
     from starlette.staticfiles import StaticFiles
 
@@ -4330,44 +4486,51 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
         # tokens the model didn't emit because we steered verbosity / routed
         # effort down. Always labelled estimated-vs-measured + a CI so it's
         # never mistaken for an exact count. Best-effort — never break /stats.
-        output_reduction: dict[str, Any] = {"available": False}
+        # Same key set as every other branch: a consumer must not have to
+        # discriminate on which failure produced the payload.
+        output_reduction: dict[str, Any] = _output_reduction_payload(False)
+        output_reduction["available"] = False
+        output_reduction["method"] = None
         try:
             from headroom.proxy.output_savings import get_recorder
             from headroom.proxy.output_shaper import (
                 OutputShaperSettings,
                 resolve_verbosity_level,
                 shaper_enabled_for,
+                steering_allowed_for,
             )
 
             # The active steering level enables the modelled fallback, which is
             # what a deployment with no holdout and no learned baseline has --
             # i.e. every fresh install, since `learn --verbosity` needs history
             # that predates the shaper.
+            _shaper_active = False
             _olevel: int | None = None
             try:
+                _oconfig = getattr(proxy, "config", None)
                 _osettings = OutputShaperSettings.from_env(
-                    enabled=shaper_enabled_for(getattr(proxy, "config", None))
+                    enabled=shaper_enabled_for(_oconfig),
+                    # Cache mode forces the resolved level to 0. The request
+                    # handlers pass this too; /stats has to build the SAME
+                    # settings or it reads a level the handlers never used.
+                    steering_enabled=steering_allowed_for(_oconfig),
                 )
                 if _osettings.enabled:
                     _olevel = resolve_verbosity_level(_osettings)[0]
+                    # Steering is the only lever this layer's ledger measures,
+                    # and level 0 is the documented "no steering" value -- the
+                    # same test `shape_request` applies before it touches a
+                    # body. An enabled shaper resolved to 0 (cache mode, an
+                    # explicit HEADROOM_VERBOSITY_LEVEL=0, a learned or
+                    # controller zero) shapes nothing, so it must not publish
+                    # the persisted ledger as a live claim either.
+                    _shaper_active = _olevel > 0
             except Exception:  # pragma: no cover - defensive
+                _shaper_active = False
                 _olevel = None
 
             _oest = get_recorder().estimate(_olevel)
-            if _oest.n_requests > 0:
-                output_reduction = {
-                    "available": True,
-                    "method": _oest.kind,  # "measured" | "estimated" | "modelled"
-                    # A modelled band is the spread between the two benchmarked
-                    # models, not a sampling CI. The UI must not call it one.
-                    "band_is_ci": _oest.kind != "modelled",
-                    "tokens_saved": round(_oest.tokens_saved),
-                    "baseline_tokens": round(_oest.baseline_tokens),
-                    "reduction_percent": round(_oest.pct, 1),
-                    "ci_low_percent": round(_oest.ci_low_pct, 1),
-                    "ci_high_percent": round(_oest.ci_high_pct, 1),
-                    "requests": _oest.n_requests,
-                }
+            output_reduction = _output_reduction_payload(_shaper_active, _oest)
         except Exception:  # pragma: no cover - defensive
             pass
 
@@ -4618,10 +4781,9 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             "savings_history": m.savings_history[-100:],  # Last 100 data points
             "display_session": display_session,
             # Whether LiteLLM is importable. Pricing (the "$ Saved" tile) is
-            # derived entirely from LiteLLM's cost tables, and LiteLLM is gated
-            # off on Python >=3.14 in pyproject — so when this is False the
-            # dashboard tells the user to reinstall on 3.13 instead of just
-            # showing $0.00 forever.
+            # derived entirely from LiteLLM's cost tables, so when this is False
+            # (LiteLLM missing from the environment) clients can tell "pricing
+            # unavailable" apart from a genuine $0.00.
             "litellm_available": LITELLM_AVAILABLE,
             "persistent_savings": persistent_savings,
             "prefix_cache": prefix_cache_stats,
@@ -5457,6 +5619,16 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
     async def compress_usage(request: Request):
         return await proxy.handle_compress_usage(request)
 
+    # Contracts layered on /v1/compress install through the compress-turn seam
+    # (headroom/proxy/compress_turn.py). The gateway turn contract is built in
+    # and on by default; it adds /v1/compress/response under the same exposure
+    # policy as /v1/compress. A third-party contract's install(app, config)
+    # can read the policy from app.state.compress_route_dependencies.
+    app.state.compress_route_dependencies = list(_compress_dependencies)
+    from headroom.proxy.gateway_extension import install_builtin as _install_gateway_contract
+
+    _install_gateway_contract(app, config, route_dependencies=_compress_dependencies)
+
     register_provider_routes(app, proxy)
 
     return app
@@ -5530,6 +5702,11 @@ def _proxy_config_from_env() -> ProxyConfig:
             DEFAULT_BUFFERED_CCR_GRACE_SECONDS,
         ),
         vertex_api_url=os.environ.get("VERTEX_TARGET_API_URL"),
+        bedrock_base_url=os.environ.get("HEADROOM_BEDROCK_BASE_URL"),
+        bedrock_compression=cast(
+            Literal["aggressive", "lossless", "off"],
+            _get_env_str("HEADROOM_BEDROCK_COMPRESSION", "aggressive"),
+        ),
         backend=_get_env_str("HEADROOM_BACKEND", "anthropic"),
         bedrock_region=_get_env_str("HEADROOM_BEDROCK_REGION", "us-west-2"),
         bedrock_profile=os.environ.get("AWS_PROFILE"),
@@ -5969,6 +6146,16 @@ if __name__ == "__main__":
         "--vertex-api-url",
         help=f"Custom Vertex AI regional API URL (default: {DEFAULT_VERTEX_API_URL})",
     )
+    parser.add_argument(
+        "--bedrock-base-url",
+        help="Company-Bedrock (Tailscale aperture) upstream URL (env: BEDROCK_TARGET_API_URL)",
+    )
+    parser.add_argument(
+        "--bedrock-compression",
+        choices=["aggressive", "lossless", "off"],
+        default="aggressive",
+        help="Request-side compression policy for Bedrock passthrough (default: aggressive)",
+    )
 
     # Backend (anthropic direct, bedrock, openrouter, anyllm, or litellm-<provider>)
     parser.add_argument(
@@ -6283,6 +6470,11 @@ if __name__ == "__main__":
             min_value=1,
         ),
         vertex_api_url=_get_env_str("VERTEX_TARGET_API_URL", args.vertex_api_url),
+        bedrock_base_url=args.bedrock_base_url or os.environ.get("HEADROOM_BEDROCK_BASE_URL"),
+        bedrock_compression=cast(
+            Literal["aggressive", "lossless", "off"],
+            _get_env_str("HEADROOM_BEDROCK_COMPRESSION", args.bedrock_compression),
+        ),
         # Backend settings
         backend=_get_env_str("HEADROOM_BACKEND", args.backend),  # type: ignore[arg-type]
         bedrock_region=_get_env_str("HEADROOM_BEDROCK_REGION", args.bedrock_region),

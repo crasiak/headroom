@@ -1,0 +1,277 @@
+# Getting Started: Subscriptions & Company Bedrock
+
+Headroom supports three non-API-key access modes: **Claude Max subscription** (OAuth),
+**OpenAI Pro / ChatGPT subscription** (Codex OAuth), and **company Bedrock via a
+Tailscale gateway** ("aperture"). You do not need an API key for any of these modes.
+Named profiles (see the [Profiles](#profiles-personal--company) section) let you
+switch between these modes with a single `--profile` flag.
+See the [design doc](superpowers/specs/2026-06-11-subscription-and-aperture-bedrock-design.md)
+for the full architecture and wire-format analysis.
+
+---
+
+## Mode 1: Claude Max subscription (`headroom wrap claude`)
+
+Claude Code authenticates with a `sk-ant-oat-*` OAuth bearer token (not an API key).
+`headroom wrap claude` sets `ANTHROPIC_BASE_URL` to the local proxy; the proxy
+classifies the token as `OAuth` mode and passes it through unchanged to Anthropic.
+
+```bash
+headroom wrap claude
+```
+
+No extra flags are needed. Claude Code proceeds normally; the proxy handles compression
+transparently.
+
+**Confirm traffic is flowing through the proxy:**
+
+```bash
+# Check live counters
+curl -s http://127.0.0.1:8787/stats | jq .
+
+# Or tail the proxy log
+tail -f ~/.headroom/logs/proxy.log
+```
+
+---
+
+## Mode 2: OpenAI Pro / ChatGPT subscription (`headroom wrap codex`)
+
+Codex CLI authenticates via a 3-segment JWT bearer token. Without intervention, Codex
+can resolve its provider URL independently and bypass the proxy. `headroom wrap codex`
+calls `_inject_codex_provider_config` to override Codex's `openai_base_url`, forcing
+all traffic through the local proxy. The proxy passes the JWT through unchanged.
+
+```bash
+headroom wrap codex
+```
+
+**Confirm traffic is flowing through the proxy:**
+
+```bash
+curl -s http://127.0.0.1:8787/stats | jq .
+```
+
+---
+
+## Mode 3: Company Bedrock via Tailscale aperture
+
+This is the main new capability. Headroom proxies Bedrock wire-protocol traffic
+(`POST /model/{id}/invoke` and `POST /model/{id}/invoke-with-response-stream`)
+to a company Bedrock gateway reachable over Tailscale. The proxy compresses the
+request body (Anthropic Messages JSON) and relays the response verbatim — both
+non-streaming (`application/json`) and streaming
+(`application/vnd.amazon.eventstream`) responses are handled correctly.
+
+### Zero-flag auto-detect (corelight profile)
+
+If your environment already has the corelight profile variables set, `headroom wrap claude`
+auto-detects the aperture with no extra flags:
+
+```bash
+# These three env vars in your environment trigger auto-detect:
+export CLAUDE_CODE_USE_BEDROCK=1
+export CLAUDE_CODE_SKIP_BEDROCK_AUTH=1
+export ANTHROPIC_BEDROCK_BASE_URL=https://ai.taileb6e.ts.net/bedrock
+
+headroom wrap claude
+```
+
+On startup you will see a line like:
+
+```
+  Bedrock aperture: https://ai.taileb6e.ts.net/bedrock (via http://127.0.0.1:8787)
+```
+
+The proxy rewrites the child's `ANTHROPIC_BEDROCK_BASE_URL` to point at the local
+proxy. The gateway authorizes by Tailscale identity — no client SigV4 is required
+(hence `CLAUDE_CODE_SKIP_BEDROCK_AUTH=1`).
+
+### Explicit / force a specific aperture URL
+
+Pass `--bedrock-base-url` to force the aperture regardless of the environment:
+
+```bash
+headroom wrap claude --bedrock-base-url https://ai.taileb6e.ts.net/bedrock
+```
+
+### Standalone proxy (no `wrap`)
+
+Start the proxy directly and point any Bedrock client at it:
+
+```bash
+# Via flag:
+headroom proxy --bedrock-base-url https://ai.taileb6e.ts.net/bedrock
+
+# Or via env var:
+BEDROCK_TARGET_API_URL=https://ai.taileb6e.ts.net/bedrock headroom proxy
+```
+
+Then configure your Bedrock client to use the local proxy. For Claude Code:
+
+```bash
+export CLAUDE_CODE_USE_BEDROCK=1
+export CLAUDE_CODE_SKIP_BEDROCK_AUTH=1
+export ANTHROPIC_BEDROCK_BASE_URL=http://127.0.0.1:8787   # bare — no /bedrock suffix
+                                                           # the proxy forwards the path
+```
+
+### Compression policy
+
+The `--bedrock-compression` flag (or `HEADROOM_BEDROCK_COMPRESSION` env var) controls
+request-body compression. Since this is your company's paid endpoint, the default is
+`aggressive`.
+
+```bash
+headroom proxy --bedrock-base-url https://ai.taileb6e.ts.net/bedrock \
+               --bedrock-compression aggressive   # default — compress request body
+               # --bedrock-compression lossless   # lossless only (not yet distinct from aggressive in v1)
+               # --bedrock-compression off        # disable compression entirely
+```
+
+To skip compression for a single request, set the header:
+
+```
+x-headroom-bypass: true
+```
+
+Request-side token savings are reported on `GET /stats`. Response-side token
+accounting is available on the non-streaming path only in v1.
+
+### What the proxy does and does not change
+
+- **Does:** compresses the Anthropic Messages JSON request body before forwarding.
+- **Does:** relays the response byte-for-byte (`application/json` and AWS binary
+  `application/vnd.amazon.eventstream` both work).
+- **Does not:** add or verify SigV4 signatures. The existing `litellm-bedrock` backend
+  (real-AWS SigV4) is untouched.
+
+---
+
+## Profiles (personal / company)
+
+Profiles let you switch both agents between named backends — e.g. a `personal`
+profile (Claude Max + ChatGPT Pro) and a `company` profile (Bedrock aperture +
+company Codex endpoint) — with one flag:
+
+```bash
+headroom wrap claude --profile company
+headroom wrap codex --profile company
+```
+
+Profiles live in `~/.headroom/profiles.toml`. The file is created automatically
+(as a starter template) the first time you pass `--profile` explicitly:
+
+```toml
+# Headroom wrap profiles. Select with: headroom wrap <agent> --profile <name>
+# (or set HEADROOM_PROFILE, or change `default` below).
+[profiles]
+default = "personal"
+
+[profiles.personal]
+codex_seed = "~/.codex"                              # ChatGPT / OpenAI Pro
+# no claude_seed -> Claude Max (default Anthropic, no Bedrock)
+
+[profiles.company]
+claude_seed = "~/.claude/settings.corelight.json"    # Bedrock aperture
+codex_seed  = "~/.codex-corelight"                    # aperture /v1 Responses
+```
+
+Edit the seed paths to match your machine, then wrap as usual.
+
+### Selecting a profile
+
+Precedence: `--profile` flag > `HEADROOM_PROFILE` env var > `default` in
+`profiles.toml` (which itself falls back to `personal`).
+
+```bash
+headroom wrap claude                      # uses the configured default (personal)
+headroom wrap claude --profile company    # explicit flag
+HEADROOM_PROFILE=company headroom wrap codex   # env-driven, e.g. per shell
+```
+
+If no `~/.headroom/profiles.toml` exists and you don't pass `--profile`, both
+commands keep their original (legacy) behavior described in Modes 1–3 above.
+
+### Seeds are read-only
+
+A profile references your *existing* config files as seeds; Headroom never
+modifies them:
+
+- **`claude_seed`** — a Claude settings JSON whose `env` block supplies
+  `ANTHROPIC_BEDROCK_BASE_URL` and the Bedrock flags. Omit it for plain
+  Claude Max (Mode 1).
+- **`codex_seed`** — a Codex home directory whose `config.toml` provider
+  `base_url` supplies the upstream. In profile mode Codex runs from a
+  **headroom-owned `CODEX_HOME`** at `~/.headroom/codex/<profile>/`: the seed's
+  `config.toml` is copied with the provider `base_url` rewritten to the local
+  proxy, and `auth.json` is carried over so your login persists. Your
+  `~/.codex*` directories are **never touched** in profile mode.
+
+Each profile starts one profile-complete proxy carrying both the Bedrock
+aperture URL (for Claude) and the OpenAI upstream (for Codex), so both agents
+share a single proxy per profile.
+
+**v1 limitation (codex profile mode):** rtk / MCP-retrieve / Serena / memory
+setup is skipped — core compression through the proxy still works. Claude
+profile mode keeps the full setup.
+
+**Shared config (skills, prompts, AGENTS.md):** every profile home gets
+symlinks to the default codex home for `skills/`, `prompts/`, and the global
+`AGENTS.md` (`~/.codex/<name>`), so all profiles (and the Codex GUI) see the
+same skills/prompts/instructions, and anything installed or edited from inside
+a profile lands in that one shared place. Only `config.toml` and `auth.json`
+stay per-profile — that is where the backend and credentials live. An entry
+whose source doesn't exist yet (e.g. no `~/.codex/prompts`) is simply not
+linked, and auto-links the first time you create it. If a profile home already
+holds its own non-empty copy of one of these, headroom leaves it alone and that
+profile stays independent for that entry (a note is echoed at wrap time).
+
+### Per-profile ports
+
+Each profile gets its own proxy port so profiles can run side by side:
+
+- the configured default profile (e.g. `personal`) pins the canonical **8787**;
+- every other profile gets a deterministic crc32-derived port in 8788–9787
+  (`8788 + crc32(name) % 1000` — `company` lands on **9611**);
+- an explicit `port = <n>` field in the profile, or the `--port` flag,
+  overrides the derived port. The owned Codex config is always written against
+  the effective proxy port, so config and proxy can't drift apart.
+
+### Verify both agents through one profile proxy
+
+Run a company Claude and a company Codex, then watch the shared proxy's
+counters move:
+
+```bash
+# Terminal 1
+headroom wrap claude --profile company
+
+# Terminal 2
+headroom wrap codex --profile company
+
+# Terminal 3 — company's port is 9611 unless overridden; use the port the
+# wrap command prints at startup
+curl -s http://127.0.0.1:9611/stats | jq .
+```
+
+Issue a prompt in each agent and re-run the `curl`; the request counters and
+token-savings figures should increase for both.
+
+---
+
+## Troubleshooting
+
+- **HTTP 501 "not configured"** — the proxy received a Bedrock invoke path but no
+  aperture URL was configured. Set `--bedrock-base-url` or `BEDROCK_TARGET_API_URL`.
+
+- **Connection errors to the aperture** — verify Tailscale is connected and the
+  aperture is reachable: `curl -s https://ai.taileb6e.ts.net/bedrock` (or the relevant
+  path) from your machine.
+
+- **Auth errors** — confirm `CLAUDE_CODE_SKIP_BEDROCK_AUTH=1` is set so Claude Code
+  does not attempt SigV4 signing. The gateway authenticates by Tailscale identity
+  automatically.
+
+- **General proxy issues** — check `~/.headroom/logs/proxy.log` for structured log
+  lines including `auth_mode_classified` and any upstream error details.

@@ -36,7 +36,10 @@ from collections.abc import Callable, Mapping
 from contextlib import contextmanager
 from functools import wraps
 from pathlib import Path
-from typing import Any, NamedTuple, cast
+from typing import TYPE_CHECKING, Any, NamedTuple, cast
+
+if TYPE_CHECKING:
+    from headroom.cli.profiles import ResolvedProfile
 
 from headroom._subprocess import pid_alive, run
 
@@ -611,18 +614,31 @@ def _find_available_port(start_port: int, max_attempts: int = 100) -> int:
     raise RuntimeError(f"No available port found in range {start_port}-{end_port - 1}")
 
 
-def _get_log_path() -> Path:
-    """Get path for proxy log file."""
+def _get_log_path(port: int | None = None) -> Path:
+    """Get path for the proxy runtime log file.
+
+    Per-port (``proxy-<port>.log``) so concurrent wrap sessions on different
+    ports do not rotate a single shared log away; the legacy ``proxy.log``
+    name is used when *port* is omitted.
+    """
     from headroom import paths as _paths
 
     log_dir = _paths.log_dir()
     log_dir.mkdir(parents=True, exist_ok=True)
-    return log_dir / "proxy.log"
+    return _paths.proxy_log_path(port)
 
 
-def _get_proxy_stdio_log_path() -> Path:
-    """Get path for dedicated proxy stdio capture."""
-    return _get_log_path().with_name("proxy-stdio.log")
+def _get_proxy_stdio_log_path(port: int | None = None) -> Path:
+    """Get path for dedicated proxy stdio capture (per-port when *port* given).
+
+    The filename comes from :func:`headroom.paths.proxy_stdio_log_path` (the
+    single source of truth) while the directory comes from :func:`_get_log_path`,
+    so a caller (or test) that redirects the log directory via that helper
+    redirects the stdio capture with it.
+    """
+    from headroom import paths as _paths
+
+    return _get_log_path(port).with_name(_paths.proxy_stdio_log_path(port).name)
 
 
 def _start_proxy(
@@ -639,15 +655,16 @@ def _start_proxy(
     anthropic_api_url: str | None = None,
     vertex_api_url: str | None = None,
     clear_vertex_api_url: bool = False,
+    bedrock_api_url: str | None = None,
     copilot_api_token: str | None = None,
     copilot_refresh_oauth_token: str | None = None,
     copilot_api_token_expires_at: float | None = None,
 ) -> subprocess.Popen:
     """Start Headroom proxy as a background subprocess.
 
-    Stdout and stderr are written to a dedicated sibling file, usually
-    `~/.headroom/logs/proxy-stdio.log`, to avoid pipe deadlock risk without
-    competing with the rotating `proxy.log` runtime log.
+    Stdout and stderr are written to a dedicated per-port sibling file,
+    `~/.headroom/logs/proxy-stdio-<port>.log`, to avoid pipe deadlock risk
+    without competing with the rotating `proxy-<port>.log` runtime log.
 
     The caller is responsible for ensuring *port* is available
     (see ``_find_available_port``).
@@ -694,13 +711,17 @@ def _start_proxy(
     if vertex_api_url:
         cmd.extend(["--vertex-api-url", vertex_api_url])
 
+    if bedrock_api_url:
+        cmd.extend(["--bedrock-base-url", bedrock_api_url])
+
     timeout_seconds = _resolve_wrap_proxy_timeout_seconds()
-    log_path = _get_log_path()
-    stdio_log_path = _get_proxy_stdio_log_path()
+    log_path = _get_log_path(port)
+    stdio_log_path = _get_proxy_stdio_log_path(port)
     stdio_log_file = open(stdio_log_path, "a", encoding="utf-8")  # noqa: SIM115
 
     # Ensure proxy subprocess uses UTF-8 (Windows defaults to cp1252)
     proxy_env = os.environ.copy()
+    proxy_env.pop("LEDGER_HEADROOM_BINDING", None)  # Native-child diagnostics only.
     _scrub_copilot_proxy_seed_env(proxy_env)
     proxy_env["PYTHONIOENCODING"] = "utf-8"
     # `python -m headroom.cli` prepends the launch cwd to sys.path, so running
@@ -716,6 +737,13 @@ def _start_proxy(
     # when wrapping a Vertex-mode client so upstream requests succeed.
     if os.environ.get("CLAUDE_CODE_USE_VERTEX") or os.environ.get("ANTHROPIC_VERTEX_PROJECT_ID"):
         proxy_env.setdefault("HEADROOM_HTTP2", "false")
+    # Isolate the proxy's sys.path from the agent's cwd. We launch with
+    # `python -m`, which prepends the current working directory to sys.path[0].
+    # When the wrapped agent runs from a repo whose root holds a module that
+    # shadows the stdlib (e.g. an __init__.py making the cwd a package, or a
+    # stray platform.py/queue.py), that import poisons the proxy and it exits
+    # before binding. PYTHONSAFEPATH (3.11+) disables that cwd injection.
+    proxy_env["PYTHONSAFEPATH"] = "1"
     # Tell the proxy which agent is being wrapped (for traffic learning output)
     if agent_type != "unknown":
         proxy_env["HEADROOM_AGENT_TYPE"] = agent_type
@@ -731,6 +759,8 @@ def _start_proxy(
         proxy_env.pop("VERTEX_TARGET_API_URL", None)
     if vertex_api_url:
         proxy_env["VERTEX_TARGET_API_URL"] = vertex_api_url
+    if bedrock_api_url:
+        proxy_env["HEADROOM_BEDROCK_BASE_URL"] = bedrock_api_url
     # Pin the wrapper-validated Copilot token for this proxy instance only.
     # Injected into the subprocess env here (not the parent's os.environ) so it
     # never leaks into shared state. The proxy's CopilotTokenProvider honours
@@ -3587,6 +3617,177 @@ def _normalize_proxy_api_url(url: object) -> str | None:
     return normalized or None
 
 
+_TRUTHY = frozenset({"1", "true", "yes", "y", "on"})
+
+
+def _detect_bedrock_aperture(env: dict[str, str], flag_override: str | None) -> str | None:
+    """Resolve the company-Bedrock aperture URL for ``wrap claude``.
+
+    A ``--bedrock-base-url`` flag forces/overrides. Otherwise auto-detect the
+    corelight profile: ``CLAUDE_CODE_USE_BEDROCK`` truthy AND
+    ``ANTHROPIC_BEDROCK_BASE_URL`` set. Returns the upstream aperture URL, or
+    None when Bedrock mode should not engage.
+    """
+    if flag_override:
+        return flag_override
+    if env.get("CLAUDE_CODE_USE_BEDROCK", "").strip().lower() not in _TRUTHY:
+        return None
+    base = env.get("ANTHROPIC_BEDROCK_BASE_URL")
+    return base or None
+
+
+def _apply_bedrock_child_env(
+    env: dict[str, str], bedrock_upstream: str | None, port: int
+) -> str | None:
+    """Rewrite the child Claude Code env for Bedrock-aperture mode.
+
+    When bedrock_upstream is set, point the child's Bedrock client at the
+    local proxy (bare host:port — the handler forwards request.url.path
+    verbatim) and ensure the skip-auth flags are present. Returns the local
+    URL written (for logging), or None when Bedrock mode is not engaged.
+    """
+    if not bedrock_upstream:
+        return None
+    local_bedrock = f"http://127.0.0.1:{port}"
+    env["ANTHROPIC_BEDROCK_BASE_URL"] = local_bedrock
+    env.setdefault("CLAUDE_CODE_USE_BEDROCK", "1")
+    env.setdefault("CLAUDE_CODE_SKIP_BEDROCK_AUTH", "1")
+    return local_bedrock
+
+
+_AMBIENT_BEDROCK_VARS = (
+    "CLAUDE_CODE_USE_BEDROCK",
+    "ANTHROPIC_BEDROCK_BASE_URL",
+    "CLAUDE_CODE_SKIP_BEDROCK_AUTH",
+)
+
+
+def _scrub_ambient_bedrock_env(
+    env: dict[str, str], *, profile_name: str, bedrock_base_url: str | None
+) -> None:
+    """Drop ambient Bedrock routing vars when a real profile resolved without
+    Bedrock. A profile without Bedrock must not inherit ambient Bedrock
+    routing from the parent shell — Claude Code would route to Bedrock
+    directly and silently bypass the proxy; that ambient seam is exactly what
+    profiles exist to eliminate. Must run BEFORE the profile's own claude_env
+    is applied, so env supplied by the profile's seed is never scrubbed (a
+    seed may set CLAUDE_CODE_USE_BEDROCK without ANTHROPIC_BEDROCK_BASE_URL,
+    leaving bedrock_base_url None). The "(none)" sentinel — the legacy
+    no-profiles fallback — keeps the ambient-detect behavior untouched.
+    """
+    if profile_name == "(none)" or bedrock_base_url is not None:
+        return
+    for key in _AMBIENT_BEDROCK_VARS:
+        env.pop(key, None)
+
+
+def _profile_resolution_error(e: Exception) -> click.ClickException:
+    """Turn resolver failures (missing seed, unknown profile) into a friendly
+    ClickException pointing at the profiles file instead of a raw traceback."""
+    from headroom.cli.profiles import default_profiles_path
+
+    msg = str(e.args[0]) if isinstance(e, KeyError) and e.args else str(e)
+    return click.ClickException(
+        f"Profile resolution failed: {msg}. "
+        f"Edit {default_profiles_path()} (or pass --profile <name>)."
+    )
+
+
+def _resolve_claude_profile(*, flag: str | None, bedrock_base_url: str | None) -> ResolvedProfile:
+    """Resolve the profile for `wrap claude`. A --bedrock-base-url flag still
+    forces Bedrock mode without a profile (manual override)."""
+    from headroom.cli.profiles import (
+        ResolvedProfile,
+        default_profiles_path,
+        load_profiles,
+        resolve_profile,
+        select_profile_name,
+    )
+
+    path = default_profiles_path()
+    if flag is not None and not path.exists():
+        from headroom.cli.profiles import ensure_starter_profiles
+
+        path = ensure_starter_profiles()
+    if not path.exists():
+        # No profiles configured and no --profile: preserve legacy behavior via
+        # the flag / ambient detect, on the default port.
+        bedrock = _detect_bedrock_aperture(dict(os.environ), bedrock_base_url)
+        return ResolvedProfile(name="(none)", port=8787, bedrock_base_url=bedrock)
+    try:
+        doc = load_profiles(path)
+        default_profile = (doc.get("profiles") or {}).get("default")
+        name = select_profile_name(flag=flag, env=dict(os.environ), config_default=default_profile)
+        rp = resolve_profile(name, profiles_path=path)
+    except (FileNotFoundError, KeyError, ValueError) as e:
+        # ValueError covers tomllib.TOMLDecodeError (malformed profiles.toml)
+        # and non-integer `port` values.
+        raise _profile_resolution_error(e) from e
+    if bedrock_base_url:  # explicit flag overrides the profile's bedrock url
+        import dataclasses
+
+        rp = dataclasses.replace(rp, bedrock_base_url=bedrock_base_url)
+    return rp
+
+
+def _resolve_codex_profile(
+    *, flag: str | None, port_override: int | None = None
+) -> tuple[ResolvedProfile, Path] | tuple[None, None]:
+    """Resolve the profile for `wrap codex` and materialize the owned CODEX_HOME.
+    Returns (ResolvedProfile, owned_codex_home: Path), or (None, None) when no
+    profiles file exists (caller falls back to the legacy in-place wrap).
+    A --port override replaces the profile's derived port BEFORE the owned
+    config is written, so the config's base_url always matches the proxy."""
+    from pathlib import Path
+
+    from headroom.cli.codex_owned_config import (
+        link_shared_codex_entries,
+        write_codex_owned_config,
+    )
+    from headroom.cli.profiles import (
+        default_profiles_path,
+        load_profiles,
+        resolve_profile,
+        select_profile_name,
+    )
+    from headroom.paths import workspace_dir
+
+    path = default_profiles_path()
+    if flag is not None and not path.exists():
+        from headroom.cli.profiles import ensure_starter_profiles
+
+        path = ensure_starter_profiles()
+    if not path.exists():
+        return None, None
+    try:
+        doc = load_profiles(path)
+        default_profile = (doc.get("profiles") or {}).get("default")
+        name = select_profile_name(flag=flag, env=dict(os.environ), config_default=default_profile)
+        rp = resolve_profile(name, profiles_path=path)
+    except (FileNotFoundError, KeyError, ValueError) as e:
+        # ValueError covers tomllib.TOMLDecodeError (malformed profiles.toml)
+        # and non-integer `port` values.
+        raise _profile_resolution_error(e) from e
+    if port_override is not None:
+        import dataclasses
+
+        rp = dataclasses.replace(rp, port=port_override)
+    owned_home = workspace_dir() / "codex" / name
+    if rp.codex_seed_dir:
+        write_codex_owned_config(Path(rp.codex_seed_dir), owned_home, rp.port)
+        # All profile homes share the default codex skills/prompts/AGENTS.md
+        # (~/.codex/<name>) via symlinks, so installs/edits from any profile
+        # land in one place. A profile home with its own local copy is left
+        # untouched.
+        for shared_name, linked in link_shared_codex_entries(owned_home).items():
+            if linked is None and (owned_home / shared_name).exists():
+                click.echo(
+                    f"  Note: {owned_home / shared_name} has local content; "
+                    f"not linking shared ~/.codex/{shared_name}"
+                )
+    return rp, owned_home
+
+
 def _proxy_version(payload: dict[str, Any] | None) -> str | None:
     """Return the running proxy version when it exposes one."""
     if payload is None:
@@ -4053,6 +4254,7 @@ def _ensure_proxy_unlocked(
     anthropic_api_url: str | None = None,
     vertex_api_url: str | None = None,
     clear_vertex_api_url: bool = False,
+    bedrock_api_url: str | None = None,
     copilot_api_token: str | None = None,
     copilot_refresh_oauth_token: str | None = None,
     copilot_api_token_expires_at: float | None = None,
@@ -4307,6 +4509,13 @@ def _ensure_proxy_unlocked(
                     requested_vertex_url = _normalize_proxy_api_url(vertex_api_url)
                     if running_vertex_url != requested_vertex_url:
                         missing.append("vertex-api-url")
+                if bedrock_api_url:
+                    running_bedrock_url = _normalize_proxy_api_url(
+                        running_config.get("bedrock_base_url")
+                    )
+                    requested_bedrock_url = _normalize_proxy_api_url(bedrock_api_url)
+                    if running_bedrock_url != requested_bedrock_url:
+                        missing.append("bedrock-base-url")
 
                 if missing:
                     flags_str = ", ".join(
@@ -4396,6 +4605,7 @@ def _ensure_proxy_unlocked(
                     anthropic_api_url=anthropic_api_url,
                     vertex_api_url=vertex_api_url,
                     clear_vertex_api_url=clear_vertex_api_url,
+                    bedrock_api_url=bedrock_api_url,
                     copilot_api_token=copilot_api_token,
                     copilot_refresh_oauth_token=copilot_refresh_oauth_token,
                     copilot_api_token_expires_at=copilot_api_token_expires_at,
@@ -4697,6 +4907,7 @@ def _launch_tool(
     region: str | None = None,
     openai_api_url: str | None = None,
     anthropic_api_url: str | None = None,
+    bedrock_api_url: str | None = None,
     copilot_api_token: str | None = None,
     copilot_refresh_oauth_token: str | None = None,
     copilot_api_token_expires_at: float | None = None,
@@ -4734,6 +4945,7 @@ def _launch_tool(
             region=region,
             openai_api_url=openai_api_url,
             anthropic_api_url=anthropic_api_url,
+            bedrock_api_url=bedrock_api_url,
             copilot_api_token=copilot_api_token,
             copilot_refresh_oauth_token=copilot_refresh_oauth_token,
             copilot_api_token_expires_at=copilot_api_token_expires_at,
@@ -5040,9 +5252,9 @@ def wrap_selfheal(marker: str | None) -> None:
 @click.option(
     # no "-p" short alias here: claude's own -p/--print must fall through to CLAUDE_ARGS
     "--port",
-    default=8787,
+    default=None,
     type=click.IntRange(1, 65535),
-    help="Proxy port (default: 8787)",
+    help="Proxy port (default: profile port or 8787)",
 )
 @click.option(
     "--no-mcp",
@@ -5114,11 +5326,24 @@ def wrap_selfheal(marker: str | None) -> None:
         "window activates through the proxy (issue #1158)."
     ),
 )
+@click.option(
+    "--bedrock-base-url",
+    default=None,
+    help="Force company-Bedrock aperture mode and route Claude Code's Bedrock "
+    "traffic through the proxy to this upstream URL (overrides auto-detect).",
+)
+@click.option(
+    "--profile",
+    "profile",
+    default=None,
+    help="Named backend profile from ~/.headroom/profiles.toml (e.g. personal, company). "
+    "Default resolves from the profiles file; HEADROOM_PROFILE env overrides.",
+)
 @click.option("--verbose", "-v", is_flag=True, help="Verbose output")
 @click.option("--prepare-only", is_flag=True, hidden=True)
 @click.argument("claude_args", nargs=-1, type=click.UNPROCESSED)
 def claude(
-    port: int,
+    port: int | None,
     no_mcp: bool,
     no_tokensave: bool,
     serena: bool,
@@ -5131,6 +5356,8 @@ def claude(
     backend: str | None,
     region: str | None,
     context_1m: bool,
+    bedrock_base_url: str | None,
+    profile: str | None,
     verbose: bool,
     prepare_only: bool,
     claude_args: tuple,
@@ -5164,12 +5391,14 @@ def claude(
     if tool_search is not None:
         tool_search = _normalize_tool_search_mode(tool_search)
 
+    resolved = _resolve_claude_profile(flag=profile, bedrock_base_url=bedrock_base_url)
+    effective_port = port if port is not None else resolved.port
     proxy_holder: list[subprocess.Popen | None] = [None]
     _saved_base_url: list[str | None] = [None]  # previous settings.json value for restore
     _tool_search_not_written = object()
     _saved_tool_search: list[object | str | None] = [_tool_search_not_written]
     _settings_foundry: list[bool] = [False]
-    port_holder: list[int] = [port]
+    port_holder: list[int] = [effective_port]
     _settings_vertex: list[bool] = [False]
     # Bind before the try so the finally can always reference it. It is otherwise
     # only assigned inside the try (after _ensure_proxy, which can raise), so an
@@ -5237,6 +5466,8 @@ def claude(
         click.echo("  ╚═══════════════════════════════════════════════╝")
         click.echo()
 
+        bedrock_upstream = resolved.bedrock_base_url
+
         # Detect Foundry mode: Claude Code uses ANTHROPIC_FOUNDRY_BASE_URL instead of
         # ANTHROPIC_BASE_URL when CLAUDE_CODE_USE_FOUNDRY=1 is set.
         # Users typically set ANTHROPIC_FOUNDRY_RESOURCE (the resource name) rather
@@ -5259,12 +5490,18 @@ def claude(
         # location) using Claude Code's own ADC token — no API key, no creds held
         # by Headroom. This is the turnkey Vertex compression path.
         use_vertex = bool(os.environ.get("CLAUDE_CODE_USE_VERTEX"))
-        proxy_url = _claude_proxy_base_url(port)
+        proxy_url = _claude_proxy_base_url(effective_port)
         vertex_upstream = _vertex_target_api_url_from_claude_env(proxy_url) if use_vertex else None
 
-        _register_proxy_client(port)
+        if foundry_upstream and bedrock_upstream:
+            click.echo(
+                "  Warning: both Foundry and Bedrock modes detected; Claude Code uses "
+                "Foundry first, so Bedrock-aperture compression will be inert."
+            )
+
+        _register_proxy_client(effective_port)
         proxy_holder[0], actual_port = _ensure_proxy(
-            port,
+            effective_port,
             no_proxy,
             learn=learn,
             memory=memory,
@@ -5275,9 +5512,11 @@ def claude(
             anthropic_api_url=foundry_upstream,
             vertex_api_url=vertex_upstream,
             clear_vertex_api_url=use_vertex and vertex_upstream is None,
+            bedrock_api_url=bedrock_upstream,
+            openai_api_url=resolved.openai_upstream,
         )
-        if actual_port != port:
-            _unregister_proxy_client(port)
+        if actual_port != effective_port:
+            _unregister_proxy_client(effective_port)
             _register_proxy_client(actual_port)
         port_holder[0] = actual_port
         _push_runtime_env(actual_port, no_proxy)
@@ -5354,6 +5593,13 @@ def claude(
         click.echo()
 
         env = os.environ.copy()
+        # A profile without Bedrock must not inherit ambient Bedrock routing —
+        # that seam is exactly what profiles exist to eliminate. Scrub before
+        # claude_env so env supplied by the profile's own seed survives.
+        _scrub_ambient_bedrock_env(
+            env, profile_name=resolved.name, bedrock_base_url=resolved.bedrock_base_url
+        )
+        env.update(resolved.claude_env)
         if use_vertex:
             # Claude Code stays in Vertex mode (keeps CLAUDE_CODE_USE_VERTEX,
             # ANTHROPIC_VERTEX_PROJECT_ID, CLOUD_ML_REGION, ADC — all inherited);
@@ -5391,7 +5637,7 @@ def claude(
             foundry_mode=_settings_foundry[0],
             vertex_mode=_settings_vertex[0],
             settings_path=_wrap_settings_path,
-            port=port,
+            port=actual_port,
         )
         # Issue #2221: pair the marker just written with a reader. wrap installs
         # no hook of its own, so a session that only ran `wrap` (never `init`)
@@ -5401,6 +5647,11 @@ def claude(
         # Per-project savings attribution: tag every request with the launch
         # directory's name via X-Headroom-Project (user override wins).
         _apply_project_header_env(env)
+
+        local_bedrock = _apply_bedrock_child_env(env, bedrock_upstream, actual_port)
+        if local_bedrock:
+            label = "" if resolved.name == "(none)" else f" [{resolved.name}]"
+            click.echo(f"  Bedrock aperture{label}: {bedrock_upstream} (via {local_bedrock})")
 
         # Issue #746: keep Claude Code's on-demand tool loading on through the
         # proxy so tool schemas are not eagerly materialized into local context.
@@ -6341,7 +6592,11 @@ def _run_codex_wrap(
 @_retired_context_tool_option
 @_serena_instructions_option
 @click.option(
-    "--port", "-p", default=8787, type=click.IntRange(1, 65535), help="Proxy port (default: 8787)"
+    "--port",
+    "-p",
+    default=None,
+    type=click.IntRange(1, 65535),
+    help="Proxy port (default: profile port or 8787)",
 )
 @click.option(
     "--no-mcp",
@@ -6389,12 +6644,19 @@ def _run_codex_wrap(
 @click.option(
     "--region", default=None, help="Cloud region for Bedrock/Vertex (env: HEADROOM_REGION)"
 )
+@click.option(
+    "--profile",
+    "profile",
+    default=None,
+    help="Named backend profile from ~/.headroom/profiles.toml (e.g. personal, company). "
+    "Default resolves from the profiles file; HEADROOM_PROFILE env overrides.",
+)
 @click.option("--memory", is_flag=True, help="Enable persistent cross-session memory")
 @click.option("--verbose", "-v", is_flag=True, help="Verbose output")
 @click.option("--prepare-only", is_flag=True, hidden=True)
 @click.argument("codex_args", nargs=-1, type=click.UNPROCESSED)
 def codex(
-    port: int,
+    port: int | None,
     no_mcp: bool,
     no_tokensave: bool,
     serena: bool,
@@ -6406,6 +6668,7 @@ def codex(
     backend: str | None,
     anyllm_provider: str | None,
     region: str | None,
+    profile: str | None,
     verbose: bool,
     prepare_only: bool,
     codex_args: tuple,
@@ -6426,22 +6689,78 @@ def codex(
         headroom wrap codex --port 9999             # Custom proxy port
         headroom wrap codex --backend anyllm --anyllm-provider groq
     """
-    return _run_codex_wrap(
-        port=port,
-        no_mcp=no_mcp,
-        no_tokensave=no_tokensave,
-        serena=serena,
-        no_serena=no_serena,
-        code_graph=code_graph,
+    # Resolve the named profile FIRST. In profile mode codex runs from a
+    # headroom-owned CODEX_HOME and the user's ~/.codex is NEVER mutated
+    # (it is reserved for the GUI/desktop apps), so all of the in-place
+    # ~/.codex setup must be skipped.
+    resolved, owned_home = _resolve_codex_profile(flag=profile, port_override=port)
+    # NOTE: resolved.port already incorporates the --port override (passed as
+    # port_override above) -- do not "simplify" that call or the flag breaks.
+    effective_port = (
+        resolved.port
+        if resolved is not None and owned_home is not None
+        else (port if port is not None else 8787)
+    )
+
+    if resolved is None or owned_home is None:
+        # Legacy in-place wrap (no profiles file): original behavior.
+        return _run_codex_wrap(
+            port=effective_port,
+            no_mcp=no_mcp,
+            no_tokensave=no_tokensave,
+            serena=serena,
+            no_serena=no_serena,
+            code_graph=code_graph,
+            no_proxy=no_proxy,
+            learn=learn,
+            memory=memory,
+            backend=backend,
+            anyllm_provider=anyllm_provider,
+            region=region,
+            verbose=verbose,
+            prepare_only=prepare_only,
+            codex_args=codex_args,
+        )
+
+    # v1 limitation: rtk/markers/Serena/memory MCP are not set up for
+    # profile codex; core compression still works via the proxy.
+    click.echo(
+        f"  Profile mode [{resolved.name}]: skipping rtk/MCP/Serena/memory "
+        "setup (v1); ~/.codex untouched"
+    )
+
+    if prepare_only:
+        # The owned config was already written by _resolve_codex_profile.
+        click.echo(f"  Owned Codex config: {owned_home / 'config.toml'}")
+        return
+
+    codex_bin = shutil.which("codex")
+    if not codex_bin:
+        click.echo("Error: 'codex' not found in PATH.")
+        click.echo("Install Codex CLI: npm install -g @openai/codex")
+        raise SystemExit(1)
+
+    env, env_vars_display = _build_codex_launch_env(effective_port, os.environ)
+    env["CODEX_HOME"] = str(owned_home)  # headroom-owned config; user's ~/.codex* untouched
+    _launch_tool(
+        binary=codex_bin,
+        args=codex_args,
+        env=env,
+        port=effective_port,
         no_proxy=no_proxy,
+        tool_label=f"CODEX [{resolved.name}]",
+        # Profile mode is compression-only in v1: the owned CODEX_HOME has
+        # no memory MCP registered, so proxy-side memory stays off too.
+        env_vars_display=env_vars_display,
         learn=learn,
-        memory=memory,
+        memory=False,
+        agent_type="codex",
+        code_graph=code_graph,
         backend=backend,
         anyllm_provider=anyllm_provider,
         region=region,
-        verbose=verbose,
-        prepare_only=prepare_only,
-        codex_args=codex_args,
+        openai_api_url=resolved.openai_upstream,
+        bedrock_api_url=resolved.bedrock_base_url,
     )
 
 
@@ -7596,13 +7915,34 @@ def openclaw(
         install_cmd.append(plugin_spec)
         install_cwd = None
 
-    click.echo("  Installing OpenClaw plugin with required unsafe-install flag...")
+    click.echo("  Installing OpenClaw plugin...")
     install_result = run(
         install_cmd,
         cwd=str(install_cwd) if install_cwd else None,
         capture_output=True,
         text=True,
     )
+    if install_result.returncode != 0:
+        combined_error = "\n".join(
+            x for x in [install_result.stderr.strip(), install_result.stdout.strip()] if x
+        )
+        # New OpenClaw releases retired the legacy scan override and require
+        # source/capability confirmation instead. Retry only this explicit CLI
+        # migration request for the selected plugin, preserving older releases
+        # and terminal install-policy blocks.
+        if (
+            "--dangerously-force-unsafe-install is deprecated" in combined_error
+            and "Install cancelled; rerun with --force" in combined_error
+        ):
+            install_cmd[3:4] = ["--force", "--accept-capabilities"]
+            click.echo("  Confirming the selected plugin source and its declared capabilities...")
+            install_result = run(
+                install_cmd,
+                cwd=str(install_cwd) if install_cwd else None,
+                capture_output=True,
+                text=True,
+            )
+
     if install_result.returncode != 0:
         combined_error = "\n".join(
             x for x in [install_result.stderr.strip(), install_result.stdout.strip()] if x

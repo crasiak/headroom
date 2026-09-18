@@ -391,7 +391,7 @@ class HeadroomChatModel(BaseChatModel):
         pass them explicitly.
         """
         bound_kwargs: dict[str, Any] = {}
-        if not RunnableBinding:
+        if not LANGCHAIN_AVAILABLE:
             return model, bound_kwargs
         # isinstance, not hasattr: a Mock answers hasattr("bound") truthfully
         # and would be unwrapped into one of its own auto-created children.
@@ -570,6 +570,16 @@ class HeadroomChatModel(BaseChatModel):
             "total_tokens_before": sum(m.tokens_before for m in self._metrics_history),
             "total_tokens_after": sum(m.tokens_after for m in self._metrics_history),
         }
+
+    def get_metrics(self) -> dict[str, Any]:
+        """Get metrics from the optimization history (see wiki/langchain.md).
+
+        Same aggregate data as get_savings_summary(), with a ``tokens_saved``
+        key so ``llm.get_metrics()['tokens_saved']`` works as documented.
+        """
+        summary = self.get_savings_summary()
+        summary["tokens_saved"] = summary["total_tokens_saved"]
+        return summary
 
 
 class HeadroomCallbackHandler(BaseCallbackHandler):

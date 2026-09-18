@@ -156,6 +156,15 @@ class ProxyConfig:
     # openai_extra_headers and providers.registry.resolve_extra_headers.
     anthropic_extra_headers: dict[str, str] | None = None
     openai_extra_headers: dict[str, str] | None = None
+    # Company-Bedrock (Tailscale aperture) passthrough. When set, the proxy
+    # serves /model/{id}/invoke[-with-response-stream] by compressing the
+    # request body and streaming the upstream bytes back verbatim. None means
+    # the Bedrock routes return a 501 misconfig error (never falls back to AWS).
+    bedrock_base_url: str | None = None
+    # Request-side compression policy for the Bedrock passthrough:
+    # "aggressive" (default — full lossy compression, it's the user's paid
+    # company endpoint), "lossless", or "off" (forward unchanged).
+    bedrock_compression: Literal["aggressive", "lossless", "off"] = "aggressive"
 
     # Backend: "anthropic" (direct API), "litellm-*" (via LiteLLM), or "anyllm" (via any-llm)
     backend: str = "anthropic"
