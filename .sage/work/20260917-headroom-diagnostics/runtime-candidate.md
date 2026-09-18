@@ -1,7 +1,7 @@
 ---
 status: completed
 phase: runtime-candidate
-activation_status: not-activated
+activation_status: activated-new-launches
 source_revision: 584f22a342c19dd3320d4f4055f9a82320c9f5fd
 ---
 # Dedicated runtime candidate
@@ -52,3 +52,13 @@ This is a dedicated, independently copied runtime closure with editable package 
 The persistent Ledger daemon runtime-set cache uses the unresolved input executable path and a ten-minute TTL. Swapping the same `~/.local/bin/headroom` symlink can continue producing the old cached resolved runtime until expiry. Parent must wait for cache expiry or deliberately invalidate it, then inspect a freshly prepared run's Headroom component path/digest. Existing process leases remain untouched; rollback is restoring the previous link for subsequent launches, with the same cache consideration.
 
 Global activation is pending the parent rollout step and bounded Headroom log-retention integration.
+
+## Activation verification, September 18 UTC
+
+Parent activated both `~/.local/bin/headroom` (02:59 UTC) and the actual Ledger daemon-resolved `~/.headroom/bin/headroom` (03:05 UTC). Atomic symlink replacements retain both previous targets in `/Users/jws/.ledger/backups/crash-attribution-20260917/`; no Nix-store file or existing loaded process changed. This is a local launcher override, not declarative Home Manager promotion.
+
+After the resident daemon runtime cache expired, installed personal/work Codex and Claude version-only launches all returned exit0 with complete normal21-event Ledger timelines, no gaps, and typed transport boot/shutdown. The six-file launch source manifest matches this candidate exactly; selected loaded-function and runtime-set fingerprints are retained. No inference call was made. The initial post-cache verification parser missed the logger prefix; rereading the same retained run with the corrected parser recovered the events.
+
+[Four-binding receipt](/Users/jws/code/attic-worktrees/cra-465-crash-attribution/.sage/work/20260917-ledger-supervisor-journal/verification/installed-four-binding-verification.json). The installed collector subsequently sealed and checksum-verified an actual smoke run bundle containing23 exact-run lifecycle/Headroom events, including boot, shutdown, nativewait, signals and daemonfinish. [Bundle evidence verification](/Users/jws/code/attic-worktrees/cra-465-crash-attribution/.sage/work/20260917-independent-collector/installed-live-run-evidence-verification.json).
+
+Current report: `/Users/jws/corelight/labs/artifacts/jws/reports/ledger/ledger-crash-attribution-implementation-2026-09-17.md`. Existing loaded transports retain their old code. Long-canary/actual-resume acceptance remains tracked by CRA-465/468/469; this successful version-only smoke does not prove paid inference or native resume.

@@ -2,7 +2,7 @@
 status: in-progress
 phase: implementation-verified
 tracker: CRA-467
-rollout_status: pending-parent-integration
+rollout_status: activated-new-launches
 ---
 # Headroom crash-attribution implementation
 
@@ -48,3 +48,7 @@ This is measured component overhead including instrumentation/profiling and sync
 Parent must integrate the Headroom commit with Ledger's collector parser and choose new-launch deployment. No daily rollout or long-running process replacement was performed. Existing loaded processes cannot acquire these diagnostics without being replaced; code verified in the isolated fake-provider canary is not proof of a live daily process's loaded revision.
 
 Rollback this commit to remove added diagnostics while preserving the baseline tri-state parent watchdog repair. No migrations, strict-wire changes or persistent settings were made.
+
+## Current activation state
+
+New-launch activation and installed four-binding verification passed; see [runtime candidate and activation receipt](runtime-candidate.md). Earlier pending rollout paragraphs are historical execution checkpoints. Existing long-running transports were preserved. Shared acceptance/canary remains open; no claim of real paid-provider or native-resume verification.
