@@ -6,6 +6,10 @@ import os
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
+# Pricing assertions must use the installed SDK snapshot, not mutable network
+# data. LiteLLM reads this at import time, so set it before test collection.
+os.environ["LITELLM_LOCAL_MODEL_COST_MAP"] = "True"
+
 import json
 import tempfile
 from datetime import datetime
