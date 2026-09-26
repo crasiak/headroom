@@ -3,7 +3,14 @@
 This module provides pricing information and cost estimation utilities
 for various LLM providers. Uses LiteLLM's community-maintained pricing
 database for up-to-date costs across 100+ models.
+
+The LiteLLM-backed exports resolve on first attribute access: importing this
+package (or a pure submodule such as ``model_catalog``) must not import the
+LiteLLM SDK, which costs ~1.6s and would land on a request's critical path.
 """
+
+from importlib import import_module
+from typing import Any
 
 # Legacy imports for backwards compatibility
 from .anthropic_prices import (
@@ -29,13 +36,6 @@ from .deepseek_prices import (
 from .deepseek_prices import (
     LAST_UPDATED as DEEPSEEK_LAST_UPDATED,
 )
-from .litellm_pricing import (
-    LiteLLMModelPricing,
-    estimate_cost,
-    get_litellm_model_cost,
-    get_model_pricing,
-    list_available_models,
-)
 from .openai_prices import (
     LAST_UPDATED as OPENAI_LAST_UPDATED,
 )
@@ -44,6 +44,26 @@ from .openai_prices import (
     get_openai_registry,
 )
 from .registry import CostEstimate, ModelPricing, PricingRegistry
+
+_LITELLM_EXPORTS = frozenset(
+    {
+        "LiteLLMModelPricing",
+        "estimate_cost",
+        "get_litellm_model_cost",
+        "get_model_pricing",
+        "list_available_models",
+    }
+)
+
+
+def __getattr__(name: str) -> Any:
+    """Import the LiteLLM-backed exports only when one is requested."""
+    if name in _LITELLM_EXPORTS:
+        value = getattr(import_module(".litellm_pricing", __name__), name)
+        globals()[name] = value
+        return value
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 __all__ = [
     # Prompt-cache TTL structure (read / 5m write / 1h write)

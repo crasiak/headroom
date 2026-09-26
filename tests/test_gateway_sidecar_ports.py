@@ -3,8 +3,8 @@
 - #1  HEADROOM_COMPRESS_ALLOW_REMOTE opt-in drops the loopback guard on
       /v1/compress so an authorized in-network gateway (Kong, LiteLLM) can reach it.
 - #4/#5  HEADROOM_MODEL_ALIAS_MAP reduces a gateway-aliased model name (e.g.
-      "claude-opus") to a priced litellm.model_cost key — one shared resolver for
-      the live (cost.py) and persisted (savings_tracker) price paths.
+      "claude-opus") to a priced key — one shared reduction for the live
+      (cost.py, LiteLLM SDK) and persisted (savings_tracker, pinned catalog) paths.
 - #6  an operator-configured context limit (HEADROOM_MODEL_LIMITS) wins over the
       128K default for an aliased name.
 """
@@ -78,15 +78,21 @@ def test_unset_env_is_unchanged(monkeypatch):
     assert isinstance(resolve_litellm_model("gpt-4o"), str)
 
 
-def test_savings_tracker_delegates_to_shared_resolver(monkeypatch):
+def test_savings_tracker_resolves_aliases_like_the_live_path(monkeypatch):
     pytest.importorskip("litellm")
-    from headroom.proxy.savings_tracker import _resolve_litellm_model
+    from headroom.pricing.litellm_pricing import resolve_litellm_model
+    from headroom.pricing.model_catalog import load_model_catalog
+    from headroom.proxy.savings_tracker import _resolve_catalog_model
 
     key = _first_priced_opus_key()
+    catalog = load_model_catalog()
+    if catalog is None or catalog.models.get(key, {}).get("input_cost_per_token") is None:
+        pytest.skip("installed litellm and the pinned catalog price this key differently")
     monkeypatch.setenv("HEADROOM_MODEL_ALIAS_MAP", json.dumps({"claude-opus": key}))
     _clear_pricing_cache()
-    # Persisted funnel prices the alias identically to the live path.
-    assert _resolve_litellm_model("claude-opus") == key
+    # Persisted funnel (pinned catalog) prices the alias identically to the
+    # live path (LiteLLM SDK).
+    assert _resolve_catalog_model("claude-opus") == resolve_litellm_model("claude-opus") == key
 
 
 # ----- #6 context limit: configured alias wins over the 128K default -----

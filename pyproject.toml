@@ -368,6 +368,8 @@ Changelog = "https://github.com/headroomlabs-ai/headroom/blob/main/CHANGELOG.md"
 # transitively; the floor pins below ensure uv resolves to patched versions.
 [tool.uv]
 constraint-dependencies = [
+    # CVE-2026-63374 / CVE-2026-64847 — TLS hostname and process-pool fixes
+    "anyio>=4.14.2",
     # GHSA-5239-wwwm-4pmq (Low) — transitive via rich; fix at 2.20.0
     "pygments>=2.20.0",
     # GHSA-4xgf-cpjx-pc3j (Medium) — transitive via mcp; fix at 2.14.2

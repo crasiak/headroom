@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
+import json
+import logging
+import os
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from typing import Any
+
+logger = logging.getLogger("headroom.pricing")
 
 # Vertex AI appends @YYYYMMDD version tags to model names at runtime
 # (e.g. "claude-haiku-4-5@20251001"). LiteLLM's database stores bare
@@ -152,3 +158,41 @@ def resolve_litellm_model_name(
         if is_known_model(candidate):
             return candidate
     return model
+
+
+# --- Gateway model-name resolution ---------------------------------------
+# When Headroom sits behind a gateway (Kong, LiteLLM, ...) that aliases model
+# names, the raw client name it sees (e.g. "claude-opus") is not a priced key
+# in litellm.model_cost, so dollar savings read $0. HEADROOM_MODEL_ALIAS_MAP is
+# an optional, gateway-agnostic, fail-soft static JSON map {client_name: target}
+# that reduces that name to a priced model_cost key (trying the target as-is and
+# with a bedrock/ or vertex_ai/ provider prefix stripped). Unset -> behavior is
+# identical to today's bare-prefix resolution; pricing never breaks.
+GATEWAY_PROVIDER_PREFIXES = ("bedrock/", "vertex_ai/")
+
+
+def static_alias_map() -> dict[str, str]:
+    raw = os.environ.get("HEADROOM_MODEL_ALIAS_MAP", "").strip()
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        logger.debug("invalid HEADROOM_MODEL_ALIAS_MAP JSON", exc_info=True)
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {str(k): str(v) for k, v in data.items() if k and v}
+
+
+def reduce_to_priced_key(target: str, model_cost: Mapping[str, Mapping[str, Any]]) -> str | None:
+    """Reduce a gateway target to a key of ``model_cost`` with an input price, or None."""
+    candidates = [target]
+    for prefix in GATEWAY_PROVIDER_PREFIXES:
+        if target.startswith(prefix):
+            candidates.append(target[len(prefix) :])
+    for candidate in candidates:
+        info = model_cost.get(candidate)
+        if info and info.get("input_cost_per_token") is not None:
+            return candidate
+    return None

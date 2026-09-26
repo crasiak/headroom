@@ -256,6 +256,66 @@ class TestAnthropicModelLimits:
         assert styled is plain
 
 
+class TestAnthropicCatalogContextLimits:
+    """Ids outside Headroom's Claude table take their window from the pinned catalog."""
+
+    @pytest.mark.parametrize(
+        ("model", "expected"),
+        [
+            ("claude-opus-4-1", 200_000),
+            ("anthropic/claude-3-7-sonnet-20250219", 200_000),
+            ("DeepSeek-V4-Flash", 1_000_000),
+            ("claude-opus-4-1[1m]", 1_000_000),
+            ("acme-internal-llama", 128_000),
+        ],
+    )
+    def test_pinned_catalog_limits(self, model, expected):
+        from headroom.providers.anthropic import AnthropicProvider
+
+        assert AnthropicProvider(warn=False).get_context_limit(model) == expected
+
+    def test_catalog_limit_is_cached_and_configured_limits_still_win(self, monkeypatch):
+        from headroom.providers import anthropic
+        from tests._model_catalog import fake_catalog
+
+        loads = []
+        catalog = fake_catalog({"acme-llama": {"max_input_tokens": 32_768}})
+
+        def load():
+            loads.append(1)
+            return catalog
+
+        monkeypatch.setattr(anthropic, "load_model_catalog", load)
+        provider = anthropic.AnthropicProvider(warn=False)
+
+        assert provider.get_context_limit("acme-llama") == 32_768
+        assert provider.get_context_limit("acme-llama") == 32_768
+        assert len(loads) == 1
+        configured = anthropic.AnthropicProvider(warn=False, context_limits={"acme-llama": 65_536})
+        assert configured.get_context_limit("acme-llama") == 65_536
+
+    @pytest.mark.parametrize(
+        ("catalog_models", "expected"),
+        [
+            ({"claude-opus-4-1": {"max_input_tokens": 500_000}}, 500_000),
+            ({"claude-opus-4-1": {"mode": "chat"}}, 200_000),
+            (None, 200_000),
+        ],
+    )
+    def test_unlisted_or_unavailable_catalog_falls_back_to_tier_inference(
+        self, monkeypatch, catalog_models, expected
+    ):
+        from headroom.providers import anthropic
+        from tests._model_catalog import fake_catalog
+
+        catalog = None if catalog_models is None else fake_catalog(catalog_models)
+        monkeypatch.setattr(anthropic, "load_model_catalog", lambda: catalog)
+
+        assert anthropic.AnthropicProvider(warn=False).get_context_limit("claude-opus-4-1") == (
+            expected
+        )
+
+
 class TestAnthropicCostEstimation:
     @pytest.fixture
     def anthropic_provider(self):

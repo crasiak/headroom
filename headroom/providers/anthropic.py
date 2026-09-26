@@ -15,7 +15,6 @@ Usage:
     provider = AnthropicProvider()  # Warning: approximate counting
 """
 
-import importlib.util
 import json
 import logging
 import os
@@ -24,7 +23,7 @@ import warnings
 from typing import Any, cast
 
 from headroom import paths as _paths
-from headroom.pricing.litellm_pricing import estimate_cost_from_tokens
+from headroom.pricing.model_catalog import load_model_catalog
 from headroom.tokenizers.base import (
     TokenCountCache,
     coerce_countable_text,
@@ -33,24 +32,19 @@ from headroom.tokenizers.base import (
 
 from .base import Provider, TokenCounter
 
-LITELLM_AVAILABLE = importlib.util.find_spec("litellm") is not None
 
+def estimate_cost_from_tokens(
+    model: str,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+    cached_tokens: int = 0,
+) -> float | None:
+    """Load pricing on demand, keeping provider construction lightweight."""
+    from headroom.pricing.litellm_pricing import estimate_cost_from_tokens as estimate
 
-def _get_litellm_clients() -> tuple[Any | None, Any | None]:
-    """Import LiteLLM only when pricing/context metadata is needed."""
-    if not LITELLM_AVAILABLE:
-        return None, None
-
-    try:
-        import litellm
-
-        litellm.suppress_debug_info = True
-        litellm.set_verbose = False
-        from litellm import get_model_info as litellm_get_model_info
-    except ImportError:
-        return None, None
-
-    return litellm, litellm_get_model_info
+    return estimate(
+        model, input_tokens=input_tokens, output_tokens=output_tokens, cached_tokens=cached_tokens
+    )
 
 
 logger = logging.getLogger(__name__)
@@ -686,7 +680,7 @@ class AnthropicProvider(Provider):
         1. Explicit context_limits passed to constructor
         2. HEADROOM_MODEL_LIMITS environment variable
         3. ~/.headroom/models.json config file
-        4. LiteLLM model info (if available)
+        4. Pinned model catalog (LiteLLM metadata, ``headroom.pricing.model_catalog``)
         5. Built-in ANTHROPIC_CONTEXT_LIMITS
         6. Pattern-based inference (opus/sonnet/haiku)
         7. Default fallback (200K for any Claude model)
@@ -711,22 +705,13 @@ class AnthropicProvider(Provider):
             if model in known_model or known_model in model:
                 return limit
 
-        # Try LiteLLM for context limit
-        _, litellm_get_model_info = _get_litellm_clients()
-        if litellm_get_model_info is not None:
-            try:
-                info = litellm_get_model_info(model)
-                if info:
-                    if "max_input_tokens" in info and info["max_input_tokens"] is not None:
-                        limit = int(info["max_input_tokens"])
-                        self._context_limits[model] = limit
-                        return limit
-                    if "max_tokens" in info and info["max_tokens"] is not None:
-                        limit = int(info["max_tokens"])
-                        self._context_limits[model] = limit
-                        return limit
-            except Exception as e:
-                logger.debug(f"LiteLLM get_model_info failed for {model}: {e}")
+        # Pinned LiteLLM metadata, never the SDK: this runs while the request
+        # is compressed, before the upstream call.
+        catalog = load_model_catalog()
+        catalog_limit = catalog.context_window(model) if catalog is not None else None
+        if catalog_limit is not None:
+            self._context_limits[model] = catalog_limit
+            return catalog_limit
 
         # Pattern-based inference for new models
         tier = _infer_model_tier(model)

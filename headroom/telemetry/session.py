@@ -62,6 +62,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from headroom.pricing import model_catalog
+
 logger = logging.getLogger(__name__)
 
 # Where session events go. The receiver is open source: deploy/beacon/worker.js.
@@ -145,9 +147,6 @@ def _safe_slug(value: Any) -> str:
     return text if _SLUG_RE.match(text) else "other"
 
 
-_model_cache: dict[str, str | None] = {}
-
-
 def _public_model(model: str) -> str | None:
     """Return the model id only if it appears in a public model registry.
 
@@ -157,32 +156,23 @@ def _public_model(model: str) -> str | None:
     ``ft:gpt-4o:acme-corp:internal-bot:abc123`` carries an org name, and a
     self-hosted model can be called anything at all.
 
-    litellm's cost map is exactly the "is this a public SKU" oracle, and
-    Headroom already consults it for pricing in ``proxy/savings_tracker.py``.
-    Unknown model, or litellm absent, means no
-    model field. Under-reporting is the correct failure direction here.
+    The registry is the immutable public set of the pinned model catalog
+    (LiteLLM's bundled cost map, see :mod:`headroom.pricing.model_catalog`),
+    read without importing LiteLLM: this runs while a response is finalized.
+    Pricing aliases and runtime registrations never extend it. Unknown model,
+    or an unavailable catalog, means no model field. Under-reporting is the
+    correct failure direction here. Three set lookups need no cache, so
+    client-supplied names cannot grow one.
     """
     if not model:
         return None
-    if model in _model_cache:
-        return _model_cache[model]
-
-    resolved: str | None = None
-    try:
-        import litellm
-
-        registry = litellm.model_cost
-        for candidate in (model, model.rsplit("/", 1)[-1], model.rsplit(".", 1)[-1]):
-            if candidate in registry:
-                resolved = candidate
-                break
-    except Exception:
-        resolved = None
-
-    # ponytail: unbounded dict, but it is keyed by distinct model ids seen in
-    # one process — a handful. Cap it if a router ever fans out over hundreds.
-    _model_cache[model] = resolved
-    return resolved
+    catalog = model_catalog.load_model_catalog()
+    if catalog is None:
+        return None
+    for candidate in (model, model.rsplit("/", 1)[-1], model.rsplit(".", 1)[-1]):
+        if candidate in catalog.public_models:
+            return candidate
+    return None
 
 
 # --------------------------------------------------------------------------
@@ -1192,7 +1182,7 @@ def demo() -> None:
     assert _public_model("acme-internal-llama") is None
     assert _public_model("") is None
     if _public_model("gpt-4o") is None:
-        print("  (litellm unavailable — model field degrades to absent)")
+        print("  (model catalog unavailable — model field degrades to absent)")
     else:
         assert _public_model("gpt-4o") == "gpt-4o"
 
