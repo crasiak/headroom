@@ -307,3 +307,73 @@ def test_compress_spreadsheet_public_import_survives_ort_pin() -> None:
     compress_import = src.index("from .compress import")
     assert pin < compress_import
     assert "compress_spreadsheet" in src[compress_import : compress_import + 120]
+
+
+def test_isolated_transport_construction_does_not_load_pricing(tmp_path: Path) -> None:
+    """Exercise the construction seam; server import alone misses provider imports."""
+    script = textwrap.dedent(
+        """
+        import json
+        import sys
+        from headroom.transport.protocol import AcquireRequest, ReceiptWriter
+        from headroom.transport.runtime import create_transport_app
+        from tests.test_transport_modes import mode_payload
+
+        for mode in (
+            "anthropic_oauth_passthrough", "openai_oauth_passthrough",
+            "openai_aperture_passthrough", "bedrock_aperture_passthrough",
+        ):
+            binding = AcquireRequest.from_dict(mode_payload(mode))
+            app = create_transport_app(binding, ReceiptWriter(binding, lambda _: None), port=49111)
+            assert app.state.proxy.config.isolated_transport
+        print(json.dumps({
+            "pricing_loaded": "headroom.pricing.litellm_pricing" in sys.modules,
+            "litellm_loaded": "litellm" in sys.modules,
+        }))
+        """
+    )
+    env = {**os.environ, "HEADROOM_CONFIG_DIR": str(tmp_path), "HEADROOM_STATELESS": "1"}
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=60,
+        env=env,
+        cwd=Path(__file__).resolve().parents[1],
+    )
+    assert json.loads(result.stdout.strip()) == {"pricing_loaded": False, "litellm_loaded": False}
+
+
+def test_provider_pricing_remains_available_on_demand() -> None:
+    """Fresh process verifies lazy import, argument fidelity and the patch seam."""
+    script = textwrap.dedent(
+        """
+        import sys
+        from unittest.mock import patch
+        from headroom.providers import anthropic, openai
+
+        assert "headroom.pricing.litellm_pricing" not in sys.modules
+        # First real call loads the unchanged pricing implementation.
+        cost = openai.OpenAIProvider().estimate_cost(100_000, 5_000, "gpt-4o")
+        assert abs(cost - 0.30) < 0.0001, cost
+        assert "headroom.pricing.litellm_pricing" in sys.modules
+        for module, provider, model in (
+            (anthropic, anthropic.AnthropicProvider(warn=False), "claude-sonnet-4-5"),
+            (openai, openai.OpenAIProvider(), "gpt-4o"),
+        ):
+            with patch("headroom.pricing.litellm_pricing.estimate_cost_from_tokens", return_value=12.5) as price:
+                assert provider.estimate_cost(17, 9, model, cached_tokens=5) == 12.5
+                price.assert_called_once_with(model, input_tokens=17, output_tokens=9, cached_tokens=5)
+            with patch.object(module, "estimate_cost_from_tokens", return_value=3.5):
+                assert provider.estimate_cost(17, 9, model) == 3.5
+        """
+    )
+    subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=60,
+        cwd=Path(__file__).resolve().parents[1],
+    )
