@@ -10,7 +10,6 @@ import stat
 import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
@@ -21,6 +20,7 @@ from fastapi.testclient import TestClient
 import headroom.proxy.savings_tracker as savings_tracker_module
 from headroom.proxy.savings_tracker import HEADROOM_SAVINGS_PATH_ENV_VAR, SavingsTracker
 from headroom.proxy.server import ProxyConfig, create_app
+from tests._model_catalog import fake_catalog
 
 
 def _record_request(
@@ -371,29 +371,21 @@ def test_savings_tracker_save_survives_directory_fsync_failure(tmp_path, monkeyp
     assert persisted["lifetime"]["tokens_saved"] == 10
 
 
-def test_litellm_resolution_and_savings_estimation_fallbacks(monkeypatch):
-    def fake_cost_per_token(*, model, prompt_tokens, completion_tokens):
-        if model in {"gpt-4o", "anthropic/claude-sonnet-4-6"}:
-            return {
-                "model": model,
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": completion_tokens,
+def test_catalog_resolution_and_savings_estimation_fallbacks(monkeypatch):
+    monkeypatch.setattr(
+        savings_tracker_module,
+        "load_model_catalog",
+        lambda: fake_catalog(
+            {
+                "anthropic/claude-sonnet-4-6": {"input_cost_per_token": 0.002},
+                "gpt-4o": {"input_cost_per_token": 0.001},
             }
-        raise RuntimeError("unknown model")
-
-    fake_litellm = SimpleNamespace(
-        cost_per_token=fake_cost_per_token,
-        model_cost={
-            "anthropic/claude-sonnet-4-6": {"input_cost_per_token": 0.002},
-            "gpt-4o": {"input_cost_per_token": 0.001},
-        },
+        ),
     )
-    monkeypatch.setattr(savings_tracker_module, "LITELLM_AVAILABLE", True)
-    monkeypatch.setattr(savings_tracker_module, "litellm", fake_litellm)
 
-    assert savings_tracker_module._resolve_litellm_model("gpt-4o") == "gpt-4o"
+    assert savings_tracker_module._resolve_catalog_model("gpt-4o") == "gpt-4o"
     assert (
-        savings_tracker_module._resolve_litellm_model("claude-sonnet-4-6")
+        savings_tracker_module._resolve_catalog_model("claude-sonnet-4-6")
         == "anthropic/claude-sonnet-4-6"
     )
     assert savings_tracker_module._estimate_compression_savings_usd(
@@ -407,7 +399,7 @@ def test_litellm_resolution_and_savings_estimation_fallbacks(monkeypatch):
         uncached_input_tokens=85,
     ) == pytest.approx(0.2)
 
-    fake_litellm.model_cost = {}
+    monkeypatch.setattr(savings_tracker_module, "load_model_catalog", lambda: fake_catalog({}))
     assert savings_tracker_module._estimate_compression_savings_usd("gpt-4o", 100) == pytest.approx(
         100 * savings_tracker_module.DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN
     )
@@ -415,12 +407,7 @@ def test_litellm_resolution_and_savings_estimation_fallbacks(monkeypatch):
         100 * savings_tracker_module.DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN
     )
 
-    monkeypatch.setattr(
-        fake_litellm,
-        "cost_per_token",
-        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("boom")),
-    )
-    assert savings_tracker_module._resolve_litellm_model("mystery-model") == "mystery-model"
+    assert savings_tracker_module._resolve_catalog_model("mystery-model") == "mystery-model"
     assert savings_tracker_module._estimate_compression_savings_usd(
         "mystery-model", 100
     ) == pytest.approx(100 * savings_tracker_module.DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN)
@@ -428,7 +415,7 @@ def test_litellm_resolution_and_savings_estimation_fallbacks(monkeypatch):
         100 * savings_tracker_module.DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN
     )
     # Explicitly force the unavailable path for the whole tracker.
-    monkeypatch.setattr(savings_tracker_module, "LITELLM_AVAILABLE", False)
+    monkeypatch.setattr(savings_tracker_module, "load_model_catalog", lambda: None)
     assert savings_tracker_module._estimate_compression_savings_usd("gpt-4o", 100) == pytest.approx(
         100 * savings_tracker_module.DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN
     )
@@ -437,7 +424,7 @@ def test_litellm_resolution_and_savings_estimation_fallbacks(monkeypatch):
     )
 
 
-def test_fallback_request_pricing_stays_nonzero_with_litellm_unavailable_and_preserves_historic_zeros(
+def test_fallback_request_pricing_stays_nonzero_with_catalog_unavailable_and_preserves_historic_zeros(
     tmp_path, monkeypatch
 ):
     # Legacy proxy_savings rows can legitimately store zero-dollar values.
@@ -487,8 +474,7 @@ def test_fallback_request_pricing_stays_nonzero_with_litellm_unavailable_and_pre
     assert initial_snapshot["projects"]["fallback-demo"]["compression_savings_usd"] == 0.0
     assert initial_snapshot["history"][-1]["compression_savings_usd"] == 0.0
 
-    monkeypatch.setattr(savings_tracker_module, "LITELLM_AVAILABLE", False)
-    monkeypatch.setattr(savings_tracker_module, "litellm", None)
+    monkeypatch.setattr(savings_tracker_module, "load_model_catalog", lambda: None)
     assert tracker.record_request(
         model="gpt-4o",
         input_tokens=100,
@@ -537,23 +523,19 @@ def test_input_cost_counts_cache_reads_when_uncached_input_is_zero(monkeypatch):
     # uncached portion). A fully prefix-cached request has input_tokens == 0 but
     # cache_read_tokens > 0 -- it still cost money and must not be priced at 0,
     # otherwise the day shows compression savings with zero recorded spend.
-    def fake_cost_per_token(*, model, prompt_tokens, completion_tokens):
-        if model == "anthropic/claude-sonnet-4-6":
-            return {"model": model}
-        raise RuntimeError("unknown model")
-
-    fake_litellm = SimpleNamespace(
-        cost_per_token=fake_cost_per_token,
-        model_cost={
-            "anthropic/claude-sonnet-4-6": {
-                "input_cost_per_token": 0.003,
-                "cache_read_input_token_cost": 0.0003,
-                "cache_creation_input_token_cost": 0.00375,
-            },
-        },
+    monkeypatch.setattr(
+        savings_tracker_module,
+        "load_model_catalog",
+        lambda: fake_catalog(
+            {
+                "anthropic/claude-sonnet-4-6": {
+                    "input_cost_per_token": 0.003,
+                    "cache_read_input_token_cost": 0.0003,
+                    "cache_creation_input_token_cost": 0.00375,
+                },
+            }
+        ),
     )
-    monkeypatch.setattr(savings_tracker_module, "LITELLM_AVAILABLE", True)
-    monkeypatch.setattr(savings_tracker_module, "litellm", fake_litellm)
 
     cost = savings_tracker_module._estimate_input_cost_usd(
         "claude-sonnet-4-6",
@@ -563,15 +545,14 @@ def test_input_cost_counts_cache_reads_when_uncached_input_is_zero(monkeypatch):
     assert cost == pytest.approx(0.3)
 
 
-def test_fallback_input_cost_uses_breakdown_sum_not_input_tokens_when_litellm_unavailable(
+def test_fallback_input_cost_uses_breakdown_sum_not_input_tokens_when_catalog_unavailable(
     monkeypatch,
 ):
     # Regression: when both `input_tokens` and a nonzero cache breakdown are
-    # present and LiteLLM is unavailable, the fallback must price only the
-    # breakdown sum — never input_tokens + breakdown_sum — to avoid
+    # present and the model catalog is unavailable, the fallback must price only
+    # the breakdown sum — never input_tokens + breakdown_sum — to avoid
     # double-counting the tokens that the breakdown already covers.
-    monkeypatch.setattr(savings_tracker_module, "LITELLM_AVAILABLE", False)
-    monkeypatch.setattr(savings_tracker_module, "litellm", None)
+    monkeypatch.setattr(savings_tracker_module, "load_model_catalog", lambda: None)
 
     input_tokens = 1000
     cache_read = 200
@@ -1624,12 +1605,11 @@ def test_active_display_session_without_cache_fields_reloads_safely(tmp_path, mo
 
 
 def test_cache_savings_edge_cases_zero_and_unpriced(tmp_path, monkeypatch):
-    # Pin a litellm whose price table doesn't know the model, so this stays a
-    # test of the unpriced-model path on every environment — on installs
-    # without litellm (e.g. Python 3.14) the blended-rate fallback would
-    # otherwise kick in and produce a nonzero estimate.
-    fake_litellm = SimpleNamespace(model_cost={})
-    monkeypatch.setattr(savings_tracker_module, "_get_litellm_module", lambda: fake_litellm)
+    # Pin a catalog whose price table doesn't know the model, so this stays a
+    # test of the unpriced-model path on every environment — with the catalog
+    # unavailable the blended-rate fallback would otherwise kick in and
+    # produce a nonzero estimate.
+    monkeypatch.setattr(savings_tracker_module, "load_model_catalog", lambda: fake_catalog({}))
     path = tmp_path / "proxy_savings.json"
     tracker = SavingsTracker(path=str(path))
 
@@ -1688,9 +1668,9 @@ def test_display_session_rollover_resets_cache_fields(tmp_path, monkeypatch):
     assert snapshot["lifetime"]["cache_read_tokens"] == 125
 
 
-def test_cache_savings_usd_uses_litellm_discount_delta(tmp_path, monkeypatch):
-    fake_litellm = SimpleNamespace(
-        model_cost={
+def test_cache_savings_usd_uses_catalog_discount_delta(tmp_path, monkeypatch):
+    catalog = fake_catalog(
+        {
             "priced-model": {
                 "input_cost_per_token": 3e-06,
                 "cache_read_input_token_cost": 3e-07,
@@ -1702,8 +1682,7 @@ def test_cache_savings_usd_uses_litellm_discount_delta(tmp_path, monkeypatch):
             },
         }
     )
-    monkeypatch.setattr(savings_tracker_module, "_get_litellm_module", lambda: fake_litellm)
-    monkeypatch.setattr(savings_tracker_module, "_resolve_litellm_model", lambda model: model)
+    monkeypatch.setattr(savings_tracker_module, "load_model_catalog", lambda: catalog)
 
     # Real discount delta: 1M reads x (3e-06 - 3e-07) = $2.70.
     assert savings_tracker_module._estimate_cache_savings_usd(
@@ -1725,15 +1704,14 @@ def test_cache_savings_usd_uses_litellm_discount_delta(tmp_path, monkeypatch):
     assert tracker.snapshot()["lifetime"]["cache_savings_usd"] == pytest.approx(2.7)
 
 
-def test_cache_savings_usd_falls_back_when_litellm_unavailable(tmp_path, monkeypatch):
-    # Regression: on any install without litellm (e.g. Python 3.14, where
-    # headroom-ai's own dependency spec excludes it), cache_savings_usd must
-    # use the same DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN estimate that
+def test_cache_savings_usd_falls_back_when_catalog_unavailable(tmp_path, monkeypatch):
+    # Regression: whenever pricing metadata is unavailable (originally: any
+    # install without litellm), cache_savings_usd must use the same
+    # DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN estimate that
     # _estimate_input_cost_usd already falls back to — not silently read as
     # $0 forever while cache_read_tokens and total_input_cost_usd keep
     # accumulating normally.
-    monkeypatch.setattr(savings_tracker_module, "LITELLM_AVAILABLE", False)
-    monkeypatch.setattr(savings_tracker_module, "litellm", None)
+    monkeypatch.setattr(savings_tracker_module, "load_model_catalog", lambda: None)
 
     fallback_rate = savings_tracker_module.DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN
     assert savings_tracker_module._estimate_cache_savings_usd(

@@ -7,7 +7,6 @@ survive proxy restarts and can be shared by multiple Headroom frontends.
 
 from __future__ import annotations
 
-import importlib.util
 import json
 import logging
 import math
@@ -23,6 +22,12 @@ from pathlib import Path
 from typing import Any
 
 from headroom import paths as _paths
+from headroom.pricing.litellm_model_resolution import (
+    reduce_to_priced_key,
+    resolve_litellm_model_name,
+    static_alias_map,
+)
+from headroom.pricing.model_catalog import load_model_catalog
 from headroom.proxy import project_name_policy
 from headroom.proxy.persistent_metrics import PersistentMetricsState
 
@@ -41,29 +46,8 @@ DEFAULT_MAX_HISTORY_AGE_DAYS = 365
 DEFAULT_MAX_RESPONSE_HISTORY_POINTS = 500
 DEFAULT_DISPLAY_SESSION_INACTIVITY_MINUTES = 60
 DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN = 3.0 / 1_000_000
-# Blended output price used only when litellm cannot price the model.
+# Blended output price used only when the model catalog cannot price the model.
 DEFAULT_FALLBACK_OUTPUT_COST_PER_TOKEN = 15.0 / 1_000_000
-
-LITELLM_AVAILABLE = importlib.util.find_spec("litellm") is not None
-litellm: Any | None = None
-
-
-def _get_litellm_module() -> Any | None:
-    """Import LiteLLM only when cost metadata is requested."""
-    global litellm
-
-    if not LITELLM_AVAILABLE:
-        return None
-    if litellm is not None:
-        return litellm
-
-    try:
-        import litellm as imported_litellm
-    except ImportError:
-        return None
-
-    litellm = imported_litellm
-    return litellm
 
 
 def get_default_savings_storage_path() -> str:
@@ -166,94 +150,77 @@ def _normalize_model(value: Any) -> str:
     return cleaned or MODEL_UNKNOWN
 
 
-# `_resolve_litellm_model` is called on every savings-tracking update (i.e.
+# `_resolve_catalog_model` is called on every savings-tracking update (i.e.
 # every request), and `model` is client-controlled — it comes straight off
-# the request body. For a model LiteLLM can't price (a custom / local /
-# gateway name), the uncached fallback below calls `litellm.cost_per_token`
-# purely to probe resolvability, which prints LiteLLM's noisy "Provider
-# List: https://docs.litellm.ai/docs/providers" banner on every failed probe
-# (#2851). Cache the resolution per model name so that probe runs at most
-# once per distinct model — bounded, not a plain dict: a request-facing
-# proxy must not let a caller grow an unbounded cache for free by sending a
-# fresh model string on every request. `maxsize` caps memory; LRU eviction
-# means a model that stops being sent eventually falls out and simply
-# re-probes if it's ever sent again — never a correctness issue, only
-# whether the probe (and its noisy failure banner) reruns.
+# the request body. Cache the resolution per model name — bounded, not a plain
+# dict: a request-facing proxy must not let a caller grow an unbounded cache
+# for free by sending a fresh model string on every request. `maxsize` caps
+# memory; LRU eviction means a model that stops being sent eventually falls
+# out and is simply resolved again if it's ever sent again.
 _MODEL_RESOLUTION_CACHE_MAXSIZE = 256
+
+# Bare-name provider prefixes tried last, after the shared candidate order.
+_PREFIX_FALLBACKS = (
+    ("claude-", "anthropic/"),
+    ("gpt-", "openai/"),
+    ("o1-", "openai/"),
+    ("o3-", "openai/"),
+    ("o4-", "openai/"),
+    ("gemini-", "google/"),
+)
 
 
 @lru_cache(maxsize=_MODEL_RESOLUTION_CACHE_MAXSIZE)
-def _resolve_litellm_model(model: str) -> str:
-    """Resolve model name to one LiteLLM recognizes.
+def _resolve_catalog_model(model: str) -> str:
+    """Resolve a client model name to a key of the pinned model catalog.
 
-    Delegates to the shared alias-map-aware resolver in
-    ``headroom.pricing.litellm_pricing`` so the persisted /stats-history funnel
-    (PROXY $ SAVED tile + Historical Checkpoints) prices gateway aliases like
-    "claude-opus" identically to the live /stats path. Uses the shared result
-    only when it maps to a priced model_cost key; otherwise falls through to the
-    bare-prefix logic below. Fail-soft: pricing never breaks bookkeeping.
+    Reads metadata only — never the LiteLLM SDK, which this runs too late in a
+    response to afford. Precedence matches the SDK-backed resolver it replaced
+    (and still used by ``proxy/cost.py``): a ``HEADROOM_MODEL_ALIAS_MAP`` target
+    that reduces to a priced key, then the shared candidate order of
+    ``litellm_model_resolution``, then the bare name, then one provider-prefix
+    guess. A candidate counts as known when the catalog has it and the pinned
+    SDK's cost probe accepted it (``ModelCatalog.is_resolvable``). Unresolvable
+    names come back unchanged and price at each caller's fallback.
 
     Bounded LRU cache, keyed by model name — see
-    ``_MODEL_RESOLUTION_CACHE_MAXSIZE`` above. Tests that mock the LiteLLM
-    module across calls with the same model name must call
-    ``_resolve_litellm_model.cache_clear()`` between cases, or results from
-    an earlier case leak in.
+    ``_MODEL_RESOLUTION_CACHE_MAXSIZE`` above. Tests that swap the catalog
+    across calls with the same model name must call
+    ``_resolve_catalog_model.cache_clear()`` between cases.
     """
-    litellm = _get_litellm_module()
-    if litellm is None:
+    catalog = load_model_catalog()
+    if catalog is None:
         return model
 
-    try:
-        from headroom.pricing.litellm_pricing import resolve_litellm_model
+    alias = static_alias_map()
+    if alias:
+        priced = reduce_to_priced_key(alias.get(model, model), catalog.models)
+        if priced is not None:
+            return priced
 
-        resolved = resolve_litellm_model(model)
-        info = litellm.model_cost.get(resolved)
-        if info and info.get("input_cost_per_token") is not None:
-            return resolved
-    except Exception:
-        pass
-
-    try:
-        litellm.cost_per_token(model=model, prompt_tokens=1, completion_tokens=0)
+    resolved = resolve_litellm_model_name(model, catalog.is_resolvable)
+    info = catalog.models.get(resolved)
+    if info and info.get("input_cost_per_token") is not None:
+        return resolved
+    if catalog.is_resolvable(model):
         return model
-    except Exception:
-        pass
-
-    prefixes = {
-        "claude-": "anthropic/",
-        "gpt-": "openai/",
-        "o1-": "openai/",
-        "o3-": "openai/",
-        "o4-": "openai/",
-        "gemini-": "google/",
-    }
-    for pattern, prefix in prefixes.items():
+    for pattern, prefix in _PREFIX_FALLBACKS:
         if model.startswith(pattern):
             candidate = f"{prefix}{model}"
-            try:
-                litellm.cost_per_token(
-                    model=candidate,
-                    prompt_tokens=1,
-                    completion_tokens=0,
-                )
-                return candidate
-            except Exception:
-                break
-
+            return candidate if catalog.is_resolvable(candidate) else model
     return model
 
 
 def _estimate_compression_savings_usd(model: str, tokens_saved: int) -> float:
     """Estimate compression savings in USD from saved input tokens."""
-    litellm = _get_litellm_module()
     if tokens_saved <= 0:
         return 0.0
-    if litellm is None:
+    catalog = load_model_catalog()
+    if catalog is None:
         return float(tokens_saved) * float(DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN)
 
     try:
-        resolved = _resolve_litellm_model(model)
-        info = litellm.model_cost.get(resolved, {})
+        info = catalog.models.get(_resolve_catalog_model(model), {})
         input_cost_per_token = info.get("input_cost_per_token")
         # Distinguish "price unknown" (missing key → fall back) from a model that
         # is legitimately free (input_cost_per_token == 0.0). `if not ...` treated
@@ -272,14 +239,13 @@ def _estimate_output_savings_usd(model: str, tokens_saved: int) -> float:
     Mirrors ``_estimate_compression_savings_usd`` but prices at the model's
     output rate, since the shaper reduces generated (output) tokens, not input.
     """
-    litellm = _get_litellm_module()
     if tokens_saved <= 0:
         return 0.0
-    if litellm is None:
+    catalog = load_model_catalog()
+    if catalog is None:
         return float(tokens_saved) * float(DEFAULT_FALLBACK_OUTPUT_COST_PER_TOKEN)
     try:
-        resolved = _resolve_litellm_model(model)
-        info = litellm.model_cost.get(resolved, {})
+        info = catalog.models.get(_resolve_catalog_model(model), {})
         output_cost_per_token = info.get("output_cost_per_token")
         # Distinguish "price unknown" (missing key -> fall back to the estimate)
         # from a model that is legitimately free (output_cost_per_token == 0.0).
@@ -298,25 +264,23 @@ def _estimate_cache_savings_usd(model: str, cache_read_tokens: int) -> float:
 
     Cache reads bill at the provider's discounted rate, so the saving per token
     is ``input_cost_per_token - cache_read_input_token_cost``. Unknown models
-    price as 0.0 (fail open); tokens still accumulate. An unavailable litellm
-    falls back to ``DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN``, matching
+    price as 0.0 (fail open); tokens still accumulate. An unavailable model
+    catalog falls back to ``DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN``, matching
     ``_estimate_input_cost_usd``/``_estimate_compression_savings_usd`` — otherwise
-    cache_savings_usd silently reads as $0 forever on any install without
-    litellm.
+    cache_savings_usd silently reads as $0 forever whenever prices are missing.
 
     Deliberately diverges from ``proxy/cost.py``'s session-scoped provider
     multipliers (``_CACHE_ECONOMICS``): this lifetime figure follows the
-    per-model litellm pricing the rest of this module already uses.
+    per-model catalog pricing the rest of this module already uses.
     """
-    litellm = _get_litellm_module()
     if cache_read_tokens <= 0:
         return 0.0
-    if litellm is None:
+    catalog = load_model_catalog()
+    if catalog is None:
         return float(cache_read_tokens) * float(DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN)
 
     try:
-        resolved = _resolve_litellm_model(model)
-        info = litellm.model_cost.get(resolved, {})
+        info = catalog.models.get(_resolve_catalog_model(model), {})
         input_cost_per_token = info.get("input_cost_per_token")
         if not input_cost_per_token:
             return 0.0
@@ -387,16 +351,15 @@ def _estimate_input_cost_usd(
     if chargeable_tokens <= 0:
         return 0.0
 
-    litellm = _get_litellm_module()
+    catalog = load_model_catalog()
     # Keep exact provider pricing authoritative when available.
-    # `litellm` can be present but lack an entry for the resolved model,
+    # The catalog can be present but lack an entry for the resolved model,
     # in which case we fall back to a blended rate instead of zeroing usage.
-    if litellm is None:
+    if catalog is None:
         return float(chargeable_tokens) * float(DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN)
 
     try:
-        resolved = _resolve_litellm_model(model)
-        info = litellm.model_cost.get(resolved, {})
+        info = catalog.models.get(_resolve_catalog_model(model), {})
         input_cost_per_token = info.get("input_cost_per_token")
         # A missing key means the model is unknown → fall back to a blended rate.
         # A present 0.0 means the model is free and must cost $0, not the fallback.

@@ -57,12 +57,16 @@ Use `HEADROOM_SAVINGS_PATH` to override the file location directly, or
 set `HEADROOM_WORKSPACE_DIR` to relocate the entire state root. See the
 [Filesystem Contract](filesystem-contract.md) for details.
 
-> **`compression_savings_usd` needs LiteLLM.** Dollar figures are priced
-> entirely from LiteLLM's cost tables. LiteLLM is a core dependency on every
-> supported Python (3.10 to 3.14); if it is missing from the environment, token
-> counts are unaffected but every USD field (and the dashboard's *Proxy $ Saved*
-> tile) reads `0`. `/stats` exposes a top-level `"litellm_available"` boolean so
-> clients can tell "genuinely $0" apart from "pricing unavailable".
+> **Where dollar figures come from.** Lifetime savings such as
+> `compression_savings_usd` are priced from a pinned copy of LiteLLM's model
+> price map that ships with Headroom (`headroom/pricing/data/`, regenerated only
+> when the LiteLLM pin changes), so they do not import LiteLLM; a model it does
+> not know is priced at a blended estimate. Session cost and budget figures are
+> priced by the LiteLLM SDK. LiteLLM is a core dependency on every supported
+> Python (3.10 to 3.14); if it is missing from the environment, those cost
+> figures are unavailable, and `/stats` exposes a top-level
+> `"litellm_available"` boolean so clients can tell "genuinely $0" apart from
+> "pricing unavailable".
 
 For Anthropic-style providers that return cache-write TTL buckets, `/stats`
 also surfaces observed cache TTL usage under `prefix_cache`:

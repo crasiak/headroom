@@ -122,6 +122,7 @@ from headroom.proxy.buffered_ccr_response import DEFAULT_BUFFERED_CCR_GRACE_SECO
 # =============================================================================
 from headroom.proxy.cost import (
     _CACHE_ECONOMICS,  # noqa: F401
+    LITELLM_AVAILABLE,
     CostTracker,  # noqa: F401
     _summarize_transforms,  # noqa: F401
     build_prefix_cache_stats,  # noqa: F401
@@ -169,7 +170,6 @@ from headroom.proxy.project_context import (
 from headroom.proxy.prometheus_metrics import PrometheusMetrics  # noqa: F401
 from headroom.proxy.rate_limiter import TokenBucketRateLimiter  # noqa: F401
 from headroom.proxy.request_logger import RequestLogger  # noqa: F401
-from headroom.proxy.savings_tracker import LITELLM_AVAILABLE
 from headroom.proxy.semantic_cache import SemanticCache  # noqa: F401
 from headroom.proxy.ssl_context import build_httpx_verify
 from headroom.proxy.tool_schema_savings_policy import tool_schema_saved_from_tags
@@ -1855,16 +1855,16 @@ class HeadroomProxy(
                 transform_statuses.append(transform_status)
 
         # LiteLLM's pricing tables. MEASURED 2.9-3.8s to import, and it was
-        # being imported lazily ON THE EVENT LOOP during the first request:
-        # emit_request_outcome -> record_request -> _estimate_compression_savings_usd
-        # calls it before its own `tokens_saved <= 0` early return, so even a
-        # request that saved nothing pays for it. Nothing about that is visible
-        # as a failure; it just makes one unlucky user wait ~3s.
+        # being imported lazily ON THE EVENT LOOP during the first request.
+        # Savings and telemetry now read the pinned model catalog instead, but
+        # the cost tracker still prices budget entries with the SDK in
+        # emit_request_outcome -> cost_tracker.record_tokens. Nothing about that
+        # is visible as a failure; it just makes one unlucky user wait ~3s.
         #
         # This function already runs under asyncio.to_thread, so importing here
         # cannot delay the port bind.
         try:
-            from .savings_tracker import _get_litellm_module
+            from .cost import _get_litellm_module
 
             eager_status.setdefault(
                 "litellm", "ready" if _get_litellm_module() is not None else "not installed"
@@ -4780,10 +4780,11 @@ def create_app(config: ProxyConfig | None = None) -> FastAPI:
             },
             "savings_history": m.savings_history[-100:],  # Last 100 data points
             "display_session": display_session,
-            # Whether LiteLLM is importable. Pricing (the "$ Saved" tile) is
-            # derived entirely from LiteLLM's cost tables, so when this is False
+            # Whether LiteLLM is importable. The cost tracker prices session
+            # cost and budget figures through it, so when this is False
             # (LiteLLM missing from the environment) clients can tell "pricing
-            # unavailable" apart from a genuine $0.00.
+            # unavailable" apart from a genuine $0.00. Lifetime savings are
+            # priced from the pinned model catalog and do not depend on it.
             "litellm_available": LITELLM_AVAILABLE,
             "persistent_savings": persistent_savings,
             "prefix_cache": prefix_cache_stats,

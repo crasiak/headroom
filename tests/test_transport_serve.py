@@ -7,6 +7,7 @@ import socket
 import subprocess
 import sys
 import threading
+from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -92,7 +93,13 @@ def _read_json_line(file, *, timeout: float = 40.0) -> dict[str, Any]:
 
 
 class _TransportProcess:
-    def __init__(self, tmp_path: Path) -> None:
+    def __init__(
+        self,
+        tmp_path: Path,
+        *,
+        launcher: Sequence[str] = ("-m", "headroom.cli"),
+        extra_env: Mapping[str, str | None] | None = None,
+    ) -> None:
         tmp_path.mkdir(parents=True, exist_ok=True)
         self.control_parent, control_child = socket.socketpair()
         readiness_read, readiness_write = os.pipe()
@@ -113,11 +120,15 @@ class _TransportProcess:
                 ),
             }
         )
+        for key, value in (extra_env or {}).items():
+            if value is None:
+                env.pop(key, None)
+            else:
+                env[key] = value
         self.process = subprocess.Popen(
             [
                 sys.executable,
-                "-m",
-                "headroom.cli",
+                *launcher,
                 "transport",
                 "serve",
                 "--control-fd",
