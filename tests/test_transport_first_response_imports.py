@@ -330,38 +330,50 @@ def _import_log(path: Path) -> tuple[list[dict[str, Any]], dict[str, Any] | None
     )
 
 
+def _launch(
+    tmp_path: Path, upstream: _FakeProvider, sink: _BeaconSink, mode: str, *, beacon: str
+) -> tuple[_TransportProcess, dict[str, Any], Path]:
+    """Serve ``mode`` from a sentinel-instrumented child bound to the fake upstream."""
+    import_log = tmp_path / "imports.jsonl"
+    import_log.touch()
+    transport = _TransportProcess(
+        tmp_path / "transport",
+        launcher=("-c", _SENTINEL_BOOT),
+        extra_env={
+            # Synthetic credentials only: nothing from the developer's shell.
+            **{name: None for name in os.environ if name.startswith(_CREDENTIAL_PREFIXES)},
+            "HEADROOM_TEST_IMPORT_LOG": str(import_log),
+            "HEADROOM_BEACON": beacon,
+            "HEADROOM_TELEMETRY_ENDPOINT": sink.url + "/v1/logs",
+            "DO_NOT_TRACK": "",
+            "HEADROOM_OFFLINE": "",
+        },
+    )
+    try:
+        payload = mode_payload(mode)
+        payload["upstream"] = {
+            "url": upstream.url,
+            "digest": canonical_digest(
+                {"schema": "headroom.transport.upstream.v1", "url": upstream.url}
+            ),
+        }
+        payload["binding_digest"] = AcquireRequest.binding_digest_for(payload)
+        transport.send(payload)
+        ready = _read_json_line(transport.readiness)
+        assert ready["status"] == "ready"
+    except BaseException:
+        transport.close()
+        raise
+    return transport, ready, import_log
+
+
 @pytest.mark.parametrize("beacon", ["on", "off"])
 @pytest.mark.parametrize("mode", MODES)
 def test_isolated_transport_finalizes_responses_without_litellm(tmp_path, mode, beacon) -> None:
-    import_log = tmp_path / "imports.jsonl"
-    import_log.touch()
     transport_root = tmp_path / "transport"
     with _FakeProvider() as upstream, _BeaconSink() as sink:
-        transport = _TransportProcess(
-            transport_root,
-            launcher=("-c", _SENTINEL_BOOT),
-            extra_env={
-                # Synthetic credentials only: nothing from the developer's shell.
-                **{name: None for name in os.environ if name.startswith(_CREDENTIAL_PREFIXES)},
-                "HEADROOM_TEST_IMPORT_LOG": str(import_log),
-                "HEADROOM_BEACON": beacon,
-                "HEADROOM_TELEMETRY_ENDPOINT": sink.url + "/v1/logs",
-                "DO_NOT_TRACK": "",
-                "HEADROOM_OFFLINE": "",
-            },
-        )
+        transport, ready, import_log = _launch(tmp_path, upstream, sink, mode, beacon=beacon)
         try:
-            payload = mode_payload(mode)
-            payload["upstream"] = {
-                "url": upstream.url,
-                "digest": canonical_digest(
-                    {"schema": "headroom.transport.upstream.v1", "url": upstream.url}
-                ),
-            }
-            payload["binding_digest"] = AcquireRequest.binding_digest_for(payload)
-            transport.send(payload)
-            ready = _read_json_line(transport.readiness)
-            assert ready["status"] == "ready"
             headers = {"authorization": "Bearer fake-oauth-account", "user-agent": "claude-cli/t"}
             endpoint = ready["endpoint"]
             receipts = []
@@ -476,22 +488,54 @@ def test_isolated_transport_finalizes_responses_without_litellm(tmp_path, mode, 
         assert models == [PUBLIC_MODEL]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "CRA-459 follow-up: a model id absent from Headroom's Claude context table "
-        "reaches litellm.get_model_info in AnthropicProvider.get_context_limit while "
-        "the request is being compressed. Moving context limits to the pinned catalog "
-        "is outside the approved telemetry/savings scope and needs a decision."
-    ),
-)
-def test_unknown_model_context_limit_lookup_does_not_import_litellm(tmp_path) -> None:
+@pytest.mark.parametrize("model", ["claude-opus-4-1", "glm-4.6"])
+def test_isolated_anthropic_request_outside_the_context_table_skips_litellm(
+    tmp_path, model
+) -> None:
+    """Real ids Headroom's Claude table misses are compressed on catalog metadata."""
+    mode = "anthropic_oauth_passthrough"
+    with _FakeProvider() as upstream, _BeaconSink() as sink:
+        transport, ready, import_log = _launch(tmp_path, upstream, sink, mode, beacon="off")
+        try:
+            upstream.scenario = "json"
+            path, body = _request(mode, saving=True, stream=False, model=model)
+            response = httpx.post(
+                ready["endpoint"] + path,
+                json=body,
+                headers={
+                    "authorization": "Bearer fake-oauth-account",
+                    "user-agent": "claude-cli/t",
+                },
+                timeout=30,
+            )
+            assert response.status_code == 200
+            receipt = _read_json_line(transport.receipts)
+            assert receipt["outcome"] == "succeeded"
+            assert receipt["saved_tokens"] > 0
+            transport.send(
+                {"schema": "headroom.transport.release.v1", "lease_id": ready["lease_id"]}
+            )
+            assert transport.process.wait(timeout=30) == 0
+        finally:
+            transport.close()
+
+    attempts, summary = _import_log(import_log)
+    assert summary is not None, "child did not reach its exit hook"
+    assert attempts == [], "LiteLLM import attempted:\n" + "".join(attempts[0]["stack"])
+    assert summary == {**summary, "litellm_loaded": False, "pricing_loaded": False}
+
+
+def test_context_limit_lookup_outside_the_claude_table_does_not_import_litellm(tmp_path) -> None:
     script = textwrap.dedent(
         """
         import json, sys
         from headroom.providers.anthropic import AnthropicProvider
-        limit = AnthropicProvider(warn=False).get_context_limit("acme-internal-llama")
-        print(json.dumps({"limit": limit, "litellm": "litellm" in sys.modules}))
+        provider = AnthropicProvider(warn=False)
+        limits = {
+            model: provider.get_context_limit(model)
+            for model in ("claude-opus-4-1", "DeepSeek-V4-Flash", "glm-4.6", "acme-internal-llama")
+        }
+        print(json.dumps({"limits": limits, "litellm": "litellm" in sys.modules}))
         """
     )
     result = subprocess.run(
@@ -503,4 +547,12 @@ def test_unknown_model_context_limit_lookup_does_not_import_litellm(tmp_path) ->
         cwd=Path(__file__).resolve().parents[1],
         env={**os.environ, "HEADROOM_CONFIG_DIR": str(tmp_path)},
     )
-    assert json.loads(result.stdout) == {"limit": 128000, "litellm": False}
+    assert json.loads(result.stdout) == {
+        "limits": {
+            "claude-opus-4-1": 200_000,
+            "DeepSeek-V4-Flash": 1_000_000,
+            "glm-4.6": 128_000,
+            "acme-internal-llama": 128_000,
+        },
+        "litellm": False,
+    }

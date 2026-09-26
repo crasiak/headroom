@@ -224,3 +224,120 @@ def test_catalog_matches_pinned_sdk_offline(alias_map) -> None:
         assert set(report["savings"][name]) == set(fields), name
         for field, (sdk_value, catalog_value) in fields.items():
             assert report["savings"][name][field] == pytest.approx([sdk_value, catalog_value])
+
+
+# Characterized differences between AnthropicProvider.get_context_limit before
+# CRA-459 (SDK get_model_info for ids outside its Claude table) and now (pinned
+# catalog), as (SDK-path limit, catalog-path limit). The SDK keeps these rules
+# in code, not in its map: provider matching (j2/jamba/azure prefixes), Azure
+# aliases (ada, gpt-35-turbo*), dynamic lookups (lemonade/*) and the Claude-family
+# generalization for namespaced ids without a tier word. Every other name must
+# match exactly.
+KNOWN_CONTEXT_DIVERGENCES: dict[str, tuple[int, int]] = {
+    # Azure alias table: the SDK rewrites these bare names to azure/ keys.
+    "ada": (8191, 128000),
+    "gpt-35-turbo": (4097, 128000),
+    "gpt-35-turbo-16k": (16385, 128000),
+    # Provider mismatch: the SDK rejects the stripped key's entry; the catalog
+    # reads its published window.
+    "azure/gpt-3.5-turbo-instruct-0914": (128000, 4097),
+    "azure/gpt-35-turbo-instruct": (128000, 4097),
+    "azure/gpt-35-turbo-instruct-0914": (128000, 4097),
+    "azure/mistral-large-2402": (128000, 32000),
+    "azure/mistral-large-latest": (128000, 32000),
+    "j2-light": (128000, 8192),
+    "j2-mid": (128000, 8192),
+    "j2-ultra": (128000, 8192),
+    "jamba-1.5": (128000, 256000),
+    "jamba-1.5-large": (128000, 256000),
+    "jamba-1.5-large@001": (128000, 256000),
+    "jamba-1.5-mini": (128000, 256000),
+    "jamba-1.5-mini@001": (128000, 256000),
+    "jamba-large-1.6": (128000, 256000),
+    "jamba-large-1.7": (128000, 256000),
+    "jamba-mini-1.6": (128000, 256000),
+    "jamba-mini-1.7": (128000, 256000),
+    # Dynamic provider lookup (local Lemonade server) returned no window.
+    "lemonade/Qwen3-4B-Instruct-2507-GGUF": (128000, 262144),
+    "lemonade/Qwen3-Coder-30B-A3B-Instruct-GGUF": (128000, 262144),
+    "lemonade/gpt-oss-120b-mxfp-GGUF": (128000, 131072),
+    "lemonade/gpt-oss-20b-mxfp4-GGUF": (128000, 131072),
+    # Claude-family generalization for a namespaced id with no tier word.
+    "gateway/team/claude-mythos-5": (200000, 128000),
+    "gateway/team/claude-mythos-5-1": (200000, 128000),
+}
+
+_CONTEXT_SCRIPT = textwrap.dedent(
+    """
+    import json, logging, socket, sys
+    _connect = socket.socket.connect
+    def _loopback_only(self, address):
+        if isinstance(address, tuple) and address[0] not in ("127.0.0.1", "::1"):
+            raise OSError("network blocked")
+        return _connect(self, address)
+    socket.socket.connect = _loopback_only
+    logging.disable(logging.CRITICAL)
+
+    import litellm
+    from headroom.pricing import model_catalog
+    from headroom.providers import anthropic
+
+    catalog = model_catalog.load_model_catalog()
+
+    class _SdkLookup:
+        # The step AnthropicProvider.get_context_limit took before CRA-459.
+        def context_window(self, name):
+            try:
+                info = litellm.get_model_info(name)
+                for field in ("max_input_tokens", "max_tokens"):
+                    if field in info and info[field] is not None:
+                        return int(info[field])
+            except Exception:
+                pass
+            return None
+
+    def limit(lookup, name):
+        anthropic.load_model_catalog = lambda: lookup
+        return anthropic.AnthropicProvider(warn=False).get_context_limit(name)
+
+    names = set(json.loads(sys.argv[1]))
+    for key in catalog.models:
+        names.update({key, key.rsplit("/", 1)[-1], key.rsplit(".", 1)[-1]})
+        if key.startswith("claude-"):
+            names.update({key + "@20251001", "gateway/team/" + key, key + "[1m]"})
+        if key.startswith(("anthropic.", "us.anthropic.", "meta.", "amazon.")):
+            names.add("bedrock/" + key)
+    sdk, diverged = _SdkLookup(), {}
+    for name in sorted(names):
+        expected, actual = limit(sdk, name), limit(catalog, name)
+        if expected != actual:
+            diverged[name] = [expected, actual]
+    print(json.dumps({"names": len(names), "diverged": diverged}))
+    """
+)
+
+
+@pytest.mark.skipif(not _pinned_sdk_installed(), reason="needs the catalog's pinned LiteLLM")
+def test_context_limits_match_pinned_sdk_get_model_info(tmp_path) -> None:
+    env = {
+        **os.environ,
+        "LITELLM_LOCAL_MODEL_COST_MAP": "True",
+        "HEADROOM_BEACON": "off",
+        "HEADROOM_CONFIG_DIR": str(tmp_path),
+    }
+    env.pop("HEADROOM_MODEL_LIMITS", None)
+    result = subprocess.run(
+        [sys.executable, "-c", _CONTEXT_SCRIPT, json.dumps(FIXTURES)],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=600,
+        cwd=ROOT,
+        env=env,
+    )
+    report = json.loads(result.stdout.strip().splitlines()[-1])
+
+    assert report["names"] > 6000
+    assert {name: tuple(pair) for name, pair in report["diverged"].items()} == (
+        KNOWN_CONTEXT_DIVERGENCES
+    )

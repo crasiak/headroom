@@ -383,3 +383,49 @@ def test_generator_output_is_deterministic_and_independent_of_key_order() -> Non
     parsed = json.loads(first)
     assert parsed["unresolvable"] == ["x"]
     assert parsed["schema_version"] == model_catalog.SCHEMA_VERSION
+
+
+CONTEXT_MODELS = {
+    "claude-opus-4-1": {"max_input_tokens": 200_000, "max_tokens": 32_000},
+    "deepseek-v4-flash": {"max_input_tokens": 1_000_000.0},
+    "output-only": {"max_tokens": 8_192},
+    "acme/listed-without-limits": {"mode": "chat"},
+    "listed-without-limits": {"max_input_tokens": 4_096},
+}
+
+
+@pytest.mark.parametrize(
+    ("name", "expected"),
+    [
+        ("claude-opus-4-1", 200_000),
+        # get_model_info matches keys case-insensitively.
+        ("DeepSeek-V4-Flash", 1_000_000),
+        # One leading provider segment is dropped, as the SDK's split model does.
+        ("anthropic/claude-opus-4-1", 200_000),
+        ("ANTHROPIC/Claude-Opus-4-1", 200_000),
+        ("output-only", 8_192),
+        # A listed name without limits is final; the stripped name is not tried.
+        ("acme/listed-without-limits", None),
+        ("gateway/team/claude-opus-4-1", None),
+        ("acme-internal-llama", None),
+        ("", None),
+    ],
+)
+def test_context_window_reads_limits_as_get_model_info_keys_them(name, expected) -> None:
+    from tests._model_catalog import fake_catalog
+
+    window = fake_catalog(CONTEXT_MODELS).context_window(name)
+
+    assert window == expected
+    assert window is None or type(window) is int
+
+
+def test_pinned_catalog_context_window_for_ids_outside_headroom_tables() -> None:
+    catalog = model_catalog.load_model_catalog()
+    assert catalog is not None
+
+    assert catalog.context_window("claude-opus-4-1") == 200_000
+    assert catalog.context_window("claude-3-7-sonnet-20250219") == 200_000
+    assert catalog.context_window("DeepSeek-V4-Flash") == 1_000_000
+    assert catalog.context_window("zai/glm-4.6") == 200_000
+    assert catalog.context_window("glm-4.6") is None
