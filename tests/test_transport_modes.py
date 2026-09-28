@@ -247,3 +247,40 @@ def test_actual_transport_new_modes_compress_against_fake_provider(tmp_path, mod
             assert list(tmp_path.iterdir()) == []
     finally:
         transport.close()
+
+
+@pytest.mark.parametrize("mode", ["openai_oauth_passthrough", "openai_aperture_passthrough"])
+def test_pi_may_use_the_openai_provider_modes(mode):
+    payload = mode_payload(mode)
+    payload["harness"] = "pi"
+    payload["binding_digest"] = AcquireRequest.binding_digest_for(payload)
+    assert AcquireRequest.from_dict(payload).harness == "pi"
+
+
+@pytest.mark.parametrize("mode", ["anthropic_oauth_passthrough", "bedrock_aperture_passthrough"])
+def test_pi_may_not_use_the_anthropic_provider_modes(mode):
+    payload = mode_payload(mode)
+    payload["harness"] = "pi"
+    payload["binding_digest"] = AcquireRequest.binding_digest_for(payload)
+    with pytest.raises(ProtocolError, match="harness"):
+        AcquireRequest.from_dict(payload)
+
+
+def _route_request(method: str, path: str) -> Request:
+    return Request({"type": "http", "method": method, "path": path, "query_string": b"", "headers": []})
+
+
+@pytest.mark.parametrize("path", ["/codex/responses", "/v1/codex/responses"])
+def test_chatgpt_mode_routes_pi_codex_responses_path(path):
+    from headroom.transport.forwarder import route
+
+    binding = AcquireRequest.from_dict(mode_payload("openai_oauth_passthrough"))
+    assert route(binding, _route_request("POST", path)) == ("/responses", "responses")
+
+
+def test_aperture_mode_does_not_route_the_chatgpt_codex_path():
+    from headroom.transport.forwarder import route
+
+    binding = AcquireRequest.from_dict(mode_payload("openai_aperture_passthrough"))
+    assert route(binding, _route_request("POST", "/codex/responses")) is None
+    assert route(binding, _route_request("POST", "/v1/responses")) == ("/responses", "responses")
