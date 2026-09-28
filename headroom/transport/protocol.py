@@ -562,8 +562,10 @@ class AcquireRequest:
             binding_digest=_expect_digest(obj["binding_digest"], "binding_digest"),
         )
         mode = request.account.provider_mode
-        expected_harness = "codex" if mode.startswith("openai_") else "claude-code"
-        if request.harness != expected_harness:
+        # Pi speaks the same OpenAI Responses wire protocol as Codex, against
+        # the same ChatGPT and Aperture upstreams.
+        expected_harnesses = {"codex", "pi"} if mode.startswith("openai_") else {"claude-code"}
+        if request.harness not in expected_harnesses:
             raise ProtocolError("transport provider mode does not match harness")
         if mode == "aws_bedrock_backend":
             raise ProtocolError("transport serve does not support the raw AWS backend")

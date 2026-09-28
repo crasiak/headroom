@@ -71,6 +71,14 @@ def route(binding: AcquireRequest, request: Request) -> tuple[str, str] | None:
             "/v1/responses/compact",
         }:
             return path.removeprefix("/v1"), "responses"
+        # Pi's ChatGPT provider always posts `<baseUrl>/codex/responses`; the
+        # ChatGPT upstream already ends in `/codex`, so it is the same route.
+        if (
+            binding.account.provider_mode == "openai_oauth_passthrough"
+            and request.method == "POST"
+            and path in {"/codex/responses", "/v1/codex/responses"}
+        ):
+            return "/responses", "responses"
         return None
     match = re.fullmatch(r"/model/(.+)/(invoke|invoke-with-response-stream|count-tokens)", path)
     if request.method == "POST" and match:
