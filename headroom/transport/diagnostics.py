@@ -65,6 +65,8 @@ def route_name(path: str, mode: str) -> str:
     if mode.startswith("openai_"):
         if path in {"/responses", "/v1/responses", "/responses/compact", "/v1/responses/compact"}:
             return "openai_responses"
+        if mode == "openai_oauth_passthrough" and path in {"/codex/responses", "/v1/codex/responses"}:
+            return "openai_responses"
         return "openai_models" if path in {"/models", "/v1/models"} else "unsupported"
     if path.startswith("/model/"):
         return "bedrock_metadata" if path.endswith("/count-tokens") else "bedrock_invoke"

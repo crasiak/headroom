@@ -284,3 +284,10 @@ def test_aperture_mode_does_not_route_the_chatgpt_codex_path():
     binding = AcquireRequest.from_dict(mode_payload("openai_aperture_passthrough"))
     assert route(binding, _route_request("POST", "/codex/responses")) is None
     assert route(binding, _route_request("POST", "/v1/responses")) == ("/responses", "responses")
+
+
+def test_diagnostics_label_pi_codex_path_as_responses():
+    from headroom.transport.diagnostics import route_name
+
+    assert route_name("/codex/responses", "openai_oauth_passthrough") == "openai_responses"
+    assert route_name("/codex/responses", "openai_aperture_passthrough") == "unsupported"
