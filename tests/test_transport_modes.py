@@ -267,7 +267,9 @@ def test_pi_may_not_use_the_anthropic_provider_modes(mode):
 
 
 def _route_request(method: str, path: str) -> Request:
-    return Request({"type": "http", "method": method, "path": path, "query_string": b"", "headers": []})
+    return Request(
+        {"type": "http", "method": method, "path": path, "query_string": b"", "headers": []}
+    )
 
 
 @pytest.mark.parametrize("path", ["/codex/responses", "/v1/codex/responses"])
