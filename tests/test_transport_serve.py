@@ -99,6 +99,7 @@ class _TransportProcess:
         *,
         launcher: Sequence[str] = ("-m", "headroom.cli"),
         extra_env: Mapping[str, str | None] | None = None,
+        listener: socket.socket | None = None,
     ) -> None:
         tmp_path.mkdir(parents=True, exist_ok=True)
         self.control_parent, control_child = socket.socketpair()
@@ -125,6 +126,10 @@ class _TransportProcess:
                 env.pop(key, None)
             else:
                 env[key] = value
+        pass_fds = [control_child.fileno(), readiness_write, receipt_write]
+        if listener is not None:
+            env["HEADROOM_TRANSPORT_LISTEN_FD"] = str(listener.fileno())
+            pass_fds.append(listener.fileno())
         self.process = subprocess.Popen(
             [
                 sys.executable,
@@ -138,7 +143,7 @@ class _TransportProcess:
                 "--receipt-fd",
                 str(receipt_write),
             ],
-            pass_fds=(control_child.fileno(), readiness_write, receipt_write),
+            pass_fds=pass_fds,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -455,3 +460,126 @@ def test_two_concurrent_worktrees_keep_ports_accounts_and_receipts_isolated(tmp_
     finally:
         first.close()
         second.close()
+
+
+def _loopback_listener() -> socket.socket:
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(socket.SOMAXCONN)
+    return listener
+
+
+def _small_request(endpoint: str) -> httpx.Response:
+    return httpx.post(
+        endpoint + "/v1/messages",
+        json={
+            "model": "claude-test",
+            "max_tokens": 16,
+            "stream": False,
+            "messages": [{"role": "user", "content": "small request"}],
+        },
+        headers={
+            "authorization": "Bearer fake-oauth-account-a",
+            "user-agent": "claude-cli/test",
+            "anthropic-version": "2023-06-01",
+        },
+        timeout=15,
+    )
+
+
+def test_transport_serves_an_inherited_listener(tmp_path) -> None:
+    listener = _loopback_listener()
+    port = listener.getsockname()[1]
+    transport = _TransportProcess(tmp_path, listener=listener)
+    try:
+        with _FakeAnthropicServer() as upstream:
+            transport.send(_acquire_payload(upstream_url=upstream.url))
+            ready = _read_json_line(transport.readiness)
+            assert ready["status"] == "ready"
+            assert ready["endpoint"] == f"http://127.0.0.1:{port}"
+            assert _small_request(ready["endpoint"]).status_code == 200
+            assert _read_json_line(transport.receipts)["cursor"] == 1
+            transport.send(
+                {"schema": "headroom.transport.release.v1", "lease_id": ready["lease_id"]}
+            )
+            assert transport.process.wait(timeout=15) == 0
+        # Releasing the lease closes only the transport's copy: the owner's
+        # listener still accepts, so a successor can serve the same endpoint.
+        probe = socket.create_connection(("127.0.0.1", port), timeout=2)
+        probe.close()
+    finally:
+        transport.close()
+        listener.close()
+
+
+def test_transport_handover_on_a_shared_listener_loses_no_requests(tmp_path) -> None:
+    listener = _loopback_listener()
+    first = _TransportProcess(tmp_path / "first", listener=listener)
+    second = _TransportProcess(tmp_path / "second", listener=listener)
+    try:
+        with _FakeAnthropicServer() as upstream:
+            payload = _acquire_payload(upstream_url=upstream.url)
+            first.send(payload)
+            first_ready = _read_json_line(first.readiness)
+            endpoint = first_ready["endpoint"]
+            assert _small_request(endpoint).status_code == 200
+
+            second.send(payload)
+            second_ready = _read_json_line(second.readiness)
+            assert second_ready["endpoint"] == endpoint
+            assert second_ready["lease_id"] != first_ready["lease_id"]
+
+            stop = threading.Event()
+            statuses: list[int] = []
+
+            def keep_sending() -> None:
+                while not stop.is_set():
+                    statuses.append(_small_request(endpoint).status_code)
+
+            sender = threading.Thread(target=keep_sending)
+            sender.start()
+            try:
+                first.send(
+                    {"schema": "headroom.transport.release.v1", "lease_id": first_ready["lease_id"]}
+                )
+                assert first.process.wait(timeout=15) == 0
+                after_release = len(statuses)
+                while len(statuses) < after_release + 5:
+                    assert sender.is_alive()
+                    threading.Event().wait(0.05)
+            finally:
+                stop.set()
+                sender.join(timeout=20)
+            assert statuses and set(statuses) == {200}
+
+            first_receipts = [json.loads(line) for line in first.receipts.read().splitlines()]
+            assert [r["cursor"] for r in first_receipts] == list(range(1, len(first_receipts) + 1))
+            second.send(
+                {"schema": "headroom.transport.release.v1", "lease_id": second_ready["lease_id"]}
+            )
+            assert second.process.wait(timeout=15) == 0
+            second_receipts = [json.loads(line) for line in second.receipts.read().splitlines()]
+            assert len(second_receipts) >= 5
+            assert len(first_receipts) + len(second_receipts) == len(upstream.requests)
+    finally:
+        first.close()
+        second.close()
+        listener.close()
+
+
+def test_transport_rejects_an_inherited_listener_it_must_not_serve(tmp_path) -> None:
+    public = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    public.bind(("0.0.0.0", 0))
+    public.listen(1)
+    unbound = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    for index, listener in enumerate((public, unbound)):
+        transport = _TransportProcess(tmp_path / str(index), listener=listener)
+        try:
+            transport.send(_acquire_payload())
+            record = _read_json_line(transport.readiness)
+            assert record["status"] == "error"
+            assert record["error"]["category"] == "startup_failed"
+            assert transport.process.wait(timeout=15) != 0
+        finally:
+            transport.close()
+            listener.close()

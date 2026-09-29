@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import json
 import logging
 import os
@@ -327,11 +328,49 @@ def _validate_release(value: Mapping[str, Any]) -> str:
     return lease_id
 
 
-def _open_listener() -> socket.socket:
+def _open_listener(listen_fd: int | None = None) -> socket.socket:
+    if listen_fd is not None:
+        return _inherited_listener(listen_fd)
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     listener.bind(("127.0.0.1", 0))
     listener.listen(socket.SOMAXCONN)
+    listener.setblocking(False)
+    return listener
+
+
+def _inherited_listener(listen_fd: int) -> socket.socket:
+    """Serve on a loopback listener the launching supervisor owns.
+
+    The supervisor keeps the socket for the whole session, so a successor
+    transport can take over the same endpoint before this one is released and
+    the native client never sees the swap. Only a listening IPv4 loopback TCP
+    socket is accepted: anything else would widen or break the endpoint.
+    """
+
+    listener = socket.socket(fileno=listen_fd)
+    try:
+        host, port = listener.getsockname()[:2]
+        if (
+            listener.family != socket.AF_INET
+            or listener.type != socket.SOCK_STREAM
+            or host != "127.0.0.1"
+            or not port
+        ):
+            raise ValueError("inherited listener must be a bound 127.0.0.1 TCP socket")
+        try:
+            listener.getpeername()
+        except OSError as exc:
+            if exc.errno != errno.ENOTCONN:
+                raise
+        else:
+            raise ValueError("inherited listener is a connected socket")
+        # SO_ACCEPTCONN is not readable on macOS; listen() is idempotent for a
+        # socket that already listens.
+        listener.listen(socket.SOMAXCONN)
+    except BaseException:
+        listener.close()
+        raise
     listener.setblocking(False)
     return listener
 
@@ -422,8 +461,13 @@ async def serve_transport(
     control_socket: socket.socket,
     readiness_stream: TextIO,
     receipt_stream: TextIO,
+    listen_fd: int | None = None,
 ) -> int:
-    """Serve one binding until exact release, parent death, or proxy failure."""
+    """Serve one binding until exact release, parent death, or proxy failure.
+
+    With ``listen_fd`` the transport serves the supervisor's listener instead of
+    opening its own, and closes only its copy on exit.
+    """
 
     channel = _ControlChannel(control_socket)
     readiness_written = False
@@ -441,7 +485,7 @@ async def serve_transport(
             readiness_written = True
             return 3
 
-        listener = _open_listener()
+        listener = _open_listener(listen_fd)
         port = int(listener.getsockname()[1])
         lease = TransportLease(f"lease-{uuid.uuid4()}")
 
@@ -515,16 +559,23 @@ async def serve_transport(
             listener.close()
 
 
-def serve_transport_fds(control_fd: int, readiness_fd: int, receipt_fd: int) -> int:
+def serve_transport_fds(
+    control_fd: int, readiness_fd: int, receipt_fd: int, listen_fd: int | None = None
+) -> int:
     """Own inherited descriptors and run the async transport lifecycle."""
 
-    if len({control_fd, readiness_fd, receipt_fd}) != 3:
-        raise ValueError("control, readiness, and receipt descriptors must be distinct")
+    descriptors = [control_fd, readiness_fd, receipt_fd]
+    if listen_fd is not None:
+        descriptors.append(listen_fd)
+    if len(set(descriptors)) != len(descriptors):
+        raise ValueError("control, readiness, receipt, and listener descriptors must be distinct")
     control_socket = socket.socket(fileno=control_fd)
     readiness_stream = os.fdopen(readiness_fd, "w", encoding="utf-8", buffering=1)
     receipt_stream = os.fdopen(receipt_fd, "w", encoding="utf-8", buffering=1)
     try:
-        return asyncio.run(serve_transport(control_socket, readiness_stream, receipt_stream))
+        return asyncio.run(
+            serve_transport(control_socket, readiness_stream, receipt_stream, listen_fd)
+        )
     finally:
         control_socket.close()
         readiness_stream.close()
