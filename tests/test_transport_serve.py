@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import http.client
 import json
 import os
 import select
@@ -7,6 +8,7 @@ import socket
 import subprocess
 import sys
 import threading
+import time
 from collections.abc import Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -469,8 +471,8 @@ def _loopback_listener() -> socket.socket:
     return listener
 
 
-def _small_request(endpoint: str) -> httpx.Response:
-    return httpx.post(
+def _small_request(endpoint: str, client: httpx.Client | None = None) -> httpx.Response:
+    return (client or httpx).post(
         endpoint + "/v1/messages",
         json={
             "model": "claude-test",
@@ -516,52 +518,86 @@ def test_transport_handover_on_a_shared_listener_loses_no_requests(tmp_path) -> 
     listener = _loopback_listener()
     first = _TransportProcess(tmp_path / "first", listener=listener)
     second = _TransportProcess(tmp_path / "second", listener=listener)
+    # Drain receipts and logs as a supervisor does: sustained traffic fills an
+    # unread pipe, and a blocked write stalls the transport's event loop.
+    receipt_lines: dict[str, list[str]] = {"first": [], "second": []}
+    readers = [
+        threading.Thread(
+            target=lambda name, stream: receipt_lines[name].extend(stream),
+            args=(name, transport.receipts),
+            daemon=True,
+        )
+        for name, transport in (("first", first), ("second", second))
+    ] + [
+        threading.Thread(target=lambda stream: stream.read(), args=(stream,), daemon=True)
+        for transport in (first, second)
+        for stream in (transport.process.stdout, transport.process.stderr)
+    ]
+    for reader in readers:
+        reader.start()
     try:
         with _FakeAnthropicServer() as upstream:
             payload = _acquire_payload(upstream_url=upstream.url)
             first.send(payload)
             first_ready = _read_json_line(first.readiness)
             endpoint = first_ready["endpoint"]
-            assert _small_request(endpoint).status_code == 200
-
-            second.send(payload)
-            second_ready = _read_json_line(second.readiness)
-            assert second_ready["endpoint"] == endpoint
-            assert second_ready["lease_id"] != first_ready["lease_id"]
 
             stop = threading.Event()
-            statuses: list[int] = []
+            statuses: list[int | str] = []
 
             def keep_sending() -> None:
-                while not stop.is_set():
-                    statuses.append(_small_request(endpoint).status_code)
+                # One client reuses its keep-alive connection, as a native
+                # harness does: a release must not close it under a request.
+                with httpx.Client(timeout=10) as client:
+                    while not stop.is_set():
+                        try:
+                            statuses.append(_small_request(endpoint, client).status_code)
+                        except httpx.HTTPError as exc:
+                            statuses.append(type(exc).__name__)
 
-            sender = threading.Thread(target=keep_sending)
+            # The client's connection belongs to the first transport before
+            # the successor exists, as in a real swap.
+            sender = threading.Thread(target=keep_sending, daemon=True)
             sender.start()
             try:
+                while len(statuses) < 20:
+                    threading.Event().wait(0.02)
+                second.send(payload)
+                second_ready = _read_json_line(second.readiness)
+                assert second_ready["endpoint"] == endpoint
+                assert second_ready["lease_id"] != first_ready["lease_id"]
                 first.send(
                     {"schema": "headroom.transport.release.v1", "lease_id": first_ready["lease_id"]}
                 )
-                assert first.process.wait(timeout=15) == 0
+                assert first.process.wait(timeout=30) == 0
                 after_release = len(statuses)
-                while len(statuses) < after_release + 5:
+                while len(statuses) < after_release + 20:
                     assert sender.is_alive()
-                    threading.Event().wait(0.05)
+                    threading.Event().wait(0.02)
             finally:
                 stop.set()
                 sender.join(timeout=20)
-            assert statuses and set(statuses) == {200}
+            assert statuses and set(statuses) == {200}, [s for s in statuses if s != 200]
 
-            first_receipts = [json.loads(line) for line in first.receipts.read().splitlines()]
-            assert [r["cursor"] for r in first_receipts] == list(range(1, len(first_receipts) + 1))
             second.send(
                 {"schema": "headroom.transport.release.v1", "lease_id": second_ready["lease_id"]}
             )
-            assert second.process.wait(timeout=15) == 0
-            second_receipts = [json.loads(line) for line in second.receipts.read().splitlines()]
-            assert len(second_receipts) >= 5
+            assert second.process.wait(timeout=30) == 0
+            for reader in readers:
+                reader.join(timeout=15)
+            first_receipts = [json.loads(line) for line in receipt_lines["first"]]
+            second_receipts = [json.loads(line) for line in receipt_lines["second"]]
+            for receipts in (first_receipts, second_receipts):
+                assert [r["cursor"] for r in receipts] == list(range(1, len(receipts) + 1))
             assert len(first_receipts) + len(second_receipts) == len(upstream.requests)
+            assert len(statuses) == len(upstream.requests)
     finally:
+        for transport in (first, second):
+            if transport.process.poll() is None:
+                transport.process.kill()
+                transport.process.wait(timeout=10)
+        for reader in readers:
+            reader.join(timeout=10)
         first.close()
         second.close()
         listener.close()
@@ -583,3 +619,77 @@ def test_transport_rejects_an_inherited_listener_it_must_not_serve(tmp_path) -> 
         finally:
             transport.close()
             listener.close()
+
+
+def test_released_transport_serves_a_reused_idle_connection_then_closes_it(tmp_path) -> None:
+    """A planned release must not close an idle keep-alive connection under a
+    client that is about to reuse it: the next request on it is served with
+    Connection: close, and the client's following connection reaches the
+    successor."""
+    listener = _loopback_listener()
+    first = _TransportProcess(tmp_path / "first", listener=listener)
+    second = _TransportProcess(tmp_path / "second", listener=listener)
+    drains = [
+        threading.Thread(target=lambda stream: stream.read(), args=(stream,), daemon=True)
+        for transport in (first, second)
+        for stream in (transport.receipts, transport.process.stdout, transport.process.stderr)
+    ]
+    for drain in drains:
+        drain.start()
+    headers = {
+        "authorization": "Bearer fake-oauth-account-a",
+        "user-agent": "claude-cli/test",
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+    }
+    body = json.dumps(
+        {
+            "model": "claude-test",
+            "max_tokens": 16,
+            "stream": False,
+            "messages": [{"role": "user", "content": "small request"}],
+        }
+    )
+    try:
+        with _FakeAnthropicServer() as upstream:
+            payload = _acquire_payload(upstream_url=upstream.url)
+            first.send(payload)
+            first_ready = _read_json_line(first.readiness)
+            port = listener.getsockname()[1]
+            reused = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+            reused.request("POST", "/v1/messages", body=body, headers=headers)
+            response = reused.getresponse()
+            response.read()
+            assert response.status == 200
+            assert response.getheader("connection", "").lower() != "close"
+
+            second.send(payload)
+            assert _read_json_line(second.readiness)["endpoint"] == first_ready["endpoint"]
+            first.send(
+                {"schema": "headroom.transport.release.v1", "lease_id": first_ready["lease_id"]}
+            )
+            time.sleep(0.5)  # well past uvicorn's shutdown tick
+
+            reused.request("POST", "/v1/messages", body=body, headers=headers)
+            response = reused.getresponse()
+            response.read()
+            assert response.status == 200
+            assert response.getheader("connection", "").lower() == "close"
+            reused.close()
+
+            fresh = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+            fresh.request("POST", "/v1/messages", body=body, headers=headers)
+            response = fresh.getresponse()
+            response.read()
+            fresh.close()
+            assert response.status == 200
+            assert first.process.wait(timeout=15) == 0
+            assert len(upstream.requests) == 3
+    finally:
+        for transport in (first, second):
+            if transport.process.poll() is None:
+                transport.process.kill()
+                transport.process.wait(timeout=10)
+        first.close()
+        second.close()
+        listener.close()

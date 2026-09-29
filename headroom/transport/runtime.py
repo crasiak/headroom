@@ -253,12 +253,69 @@ class _TransportBoundaryMiddleware:
         await send({"type": "http.response.body", "body": body})
 
 
+class _ConnectionDrain:
+    """Set once a lease is released: the transport is handing its endpoint on."""
+
+    def __init__(self) -> None:
+        self.active = False
+
+
+class _DrainMiddleware:
+    """Mark every response a released transport starts with Connection: close.
+
+    A client then opens its next connection on the shared listener, where only
+    the successor accepts, instead of reusing one this transport is about to
+    close.
+    """
+
+    def __init__(self, app: Any, *, drain: _ConnectionDrain) -> None:
+        self.app = app
+        self.drain = drain
+
+    async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+
+        async def marked_send(message: dict[str, Any]) -> None:
+            if self.drain.active and message.get("type") == "http.response.start":
+                headers = [
+                    (name, value)
+                    for name, value in message.get("headers", [])
+                    if name.lower() != b"connection"
+                ]
+                message = {**message, "headers": [*headers, (b"connection", b"close")]}
+            await send(message)
+
+        await self.app(scope, receive, marked_send)
+
+
+async def _drain_connections(server: uvicorn.Server, drain: _ConnectionDrain) -> None:
+    """Stop accepting and let open connections end on their own.
+
+    uvicorn's shutdown closes idle keep-alive connections at once, so a client
+    reusing one at that moment loses its request. Instead the released transport
+    keeps serving what arrives on its connections, each response closing its
+    connection, and idle ones end at the keep-alive timeout. The drain therefore
+    ends within one request or one keep-alive timeout; parent death still exits
+    at once.
+    """
+
+    drain.active = True
+    for listening in getattr(server, "servers", []):
+        listening.close()
+    connections = getattr(getattr(server, "server_state", None), "connections", None)
+    while connections and not server.should_exit:
+        await asyncio.sleep(0.05)
+
+
 def create_transport_app(
     request: AcquireRequest,
     receipt_writer: ReceiptWriter,
     *,
     port: int,
     diagnostics: Diagnostics | None = None,
+    drain: _ConnectionDrain | None = None,
 ) -> FastAPI:
     """Build a stateless, no-fallback proxy bound to one prepared request."""
 
@@ -297,6 +354,8 @@ def create_transport_app(
         proxy=app.state.proxy,
         diagnostics=diagnostics,
     )
+    if drain is not None:
+        app.add_middleware(_DrainMiddleware, drain=drain)
     return app
 
 
@@ -396,6 +455,7 @@ async def _monitor_control(
     lease: TransportLease,
     server: uvicorn.Server,
     diagnostics: Diagnostics | None = None,
+    drain: _ConnectionDrain | None = None,
 ) -> None:
     def diagnostic(reason: str) -> None:
         if diagnostics:
@@ -407,6 +467,8 @@ async def _monitor_control(
             if lease.release(_validate_release(release)):
                 diagnostic("lease_release")
                 logger.info("event=transport_shutdown reason=lease_release")
+                if drain is not None:
+                    await _drain_connections(server, drain)
                 server.should_exit = True
                 return
     except EOFError:
@@ -498,7 +560,8 @@ async def serve_transport(
             lease_id=lease.lease_id,
             runtime_set_digest=request.runtime_set_digest,
         )
-        app = create_transport_app(request, writer, port=port, diagnostics=diagnostics)
+        drain = _ConnectionDrain()
+        app = create_transport_app(request, writer, port=port, diagnostics=diagnostics, drain=drain)
         config = uvicorn.Config(
             app,
             host="127.0.0.1",
@@ -527,7 +590,7 @@ async def serve_transport(
         readiness_written = True
 
         monitor_tasks = [
-            asyncio.create_task(_monitor_control(channel, lease, server, diagnostics)),
+            asyncio.create_task(_monitor_control(channel, lease, server, diagnostics, drain)),
             asyncio.create_task(
                 _monitor_parent(request.parent_process, server, diagnostics=diagnostics)
             ),
