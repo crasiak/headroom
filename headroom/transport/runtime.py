@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import json
 import logging
 import os
@@ -252,12 +253,69 @@ class _TransportBoundaryMiddleware:
         await send({"type": "http.response.body", "body": body})
 
 
+class _ConnectionDrain:
+    """Set once a lease is released: the transport is handing its endpoint on."""
+
+    def __init__(self) -> None:
+        self.active = False
+
+
+class _DrainMiddleware:
+    """Mark every response a released transport starts with Connection: close.
+
+    A client then opens its next connection on the shared listener, where only
+    the successor accepts, instead of reusing one this transport is about to
+    close.
+    """
+
+    def __init__(self, app: Any, *, drain: _ConnectionDrain) -> None:
+        self.app = app
+        self.drain = drain
+
+    async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+
+        async def marked_send(message: dict[str, Any]) -> None:
+            if self.drain.active and message.get("type") == "http.response.start":
+                headers = [
+                    (name, value)
+                    for name, value in message.get("headers", [])
+                    if name.lower() != b"connection"
+                ]
+                message = {**message, "headers": [*headers, (b"connection", b"close")]}
+            await send(message)
+
+        await self.app(scope, receive, marked_send)
+
+
+async def _drain_connections(server: uvicorn.Server, drain: _ConnectionDrain) -> None:
+    """Stop accepting and let open connections end on their own.
+
+    uvicorn's shutdown closes idle keep-alive connections at once, so a client
+    reusing one at that moment loses its request. Instead the released transport
+    keeps serving what arrives on its connections, each response closing its
+    connection, and idle ones end at the keep-alive timeout. The drain therefore
+    ends within one request or one keep-alive timeout; parent death still exits
+    at once.
+    """
+
+    drain.active = True
+    for listening in getattr(server, "servers", []):
+        listening.close()
+    connections = getattr(getattr(server, "server_state", None), "connections", None)
+    while connections and not server.should_exit:
+        await asyncio.sleep(0.05)
+
+
 def create_transport_app(
     request: AcquireRequest,
     receipt_writer: ReceiptWriter,
     *,
     port: int,
     diagnostics: Diagnostics | None = None,
+    drain: _ConnectionDrain | None = None,
 ) -> FastAPI:
     """Build a stateless, no-fallback proxy bound to one prepared request."""
 
@@ -296,6 +354,8 @@ def create_transport_app(
         proxy=app.state.proxy,
         diagnostics=diagnostics,
     )
+    if drain is not None:
+        app.add_middleware(_DrainMiddleware, drain=drain)
     return app
 
 
@@ -327,11 +387,49 @@ def _validate_release(value: Mapping[str, Any]) -> str:
     return lease_id
 
 
-def _open_listener() -> socket.socket:
+def _open_listener(listen_fd: int | None = None) -> socket.socket:
+    if listen_fd is not None:
+        return _inherited_listener(listen_fd)
     listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     listener.bind(("127.0.0.1", 0))
     listener.listen(socket.SOMAXCONN)
+    listener.setblocking(False)
+    return listener
+
+
+def _inherited_listener(listen_fd: int) -> socket.socket:
+    """Serve on a loopback listener the launching supervisor owns.
+
+    The supervisor keeps the socket for the whole session, so a successor
+    transport can take over the same endpoint before this one is released and
+    the native client never sees the swap. Only a listening IPv4 loopback TCP
+    socket is accepted: anything else would widen or break the endpoint.
+    """
+
+    listener = socket.socket(fileno=listen_fd)
+    try:
+        host, port = listener.getsockname()[:2]
+        if (
+            listener.family != socket.AF_INET
+            or listener.type != socket.SOCK_STREAM
+            or host != "127.0.0.1"
+            or not port
+        ):
+            raise ValueError("inherited listener must be a bound 127.0.0.1 TCP socket")
+        try:
+            listener.getpeername()
+        except OSError as exc:
+            if exc.errno != errno.ENOTCONN:
+                raise
+        else:
+            raise ValueError("inherited listener is a connected socket")
+        # SO_ACCEPTCONN is not readable on macOS; listen() is idempotent for a
+        # socket that already listens.
+        listener.listen(socket.SOMAXCONN)
+    except BaseException:
+        listener.close()
+        raise
     listener.setblocking(False)
     return listener
 
@@ -357,6 +455,7 @@ async def _monitor_control(
     lease: TransportLease,
     server: uvicorn.Server,
     diagnostics: Diagnostics | None = None,
+    drain: _ConnectionDrain | None = None,
 ) -> None:
     def diagnostic(reason: str) -> None:
         if diagnostics:
@@ -368,6 +467,8 @@ async def _monitor_control(
             if lease.release(_validate_release(release)):
                 diagnostic("lease_release")
                 logger.info("event=transport_shutdown reason=lease_release")
+                if drain is not None:
+                    await _drain_connections(server, drain)
                 server.should_exit = True
                 return
     except EOFError:
@@ -422,8 +523,13 @@ async def serve_transport(
     control_socket: socket.socket,
     readiness_stream: TextIO,
     receipt_stream: TextIO,
+    listen_fd: int | None = None,
 ) -> int:
-    """Serve one binding until exact release, parent death, or proxy failure."""
+    """Serve one binding until exact release, parent death, or proxy failure.
+
+    With ``listen_fd`` the transport serves the supervisor's listener instead of
+    opening its own, and closes only its copy on exit.
+    """
 
     channel = _ControlChannel(control_socket)
     readiness_written = False
@@ -441,7 +547,7 @@ async def serve_transport(
             readiness_written = True
             return 3
 
-        listener = _open_listener()
+        listener = _open_listener(listen_fd)
         port = int(listener.getsockname()[1])
         lease = TransportLease(f"lease-{uuid.uuid4()}")
 
@@ -454,7 +560,8 @@ async def serve_transport(
             lease_id=lease.lease_id,
             runtime_set_digest=request.runtime_set_digest,
         )
-        app = create_transport_app(request, writer, port=port, diagnostics=diagnostics)
+        drain = _ConnectionDrain()
+        app = create_transport_app(request, writer, port=port, diagnostics=diagnostics, drain=drain)
         config = uvicorn.Config(
             app,
             host="127.0.0.1",
@@ -483,7 +590,7 @@ async def serve_transport(
         readiness_written = True
 
         monitor_tasks = [
-            asyncio.create_task(_monitor_control(channel, lease, server, diagnostics)),
+            asyncio.create_task(_monitor_control(channel, lease, server, diagnostics, drain)),
             asyncio.create_task(
                 _monitor_parent(request.parent_process, server, diagnostics=diagnostics)
             ),
@@ -515,16 +622,23 @@ async def serve_transport(
             listener.close()
 
 
-def serve_transport_fds(control_fd: int, readiness_fd: int, receipt_fd: int) -> int:
+def serve_transport_fds(
+    control_fd: int, readiness_fd: int, receipt_fd: int, listen_fd: int | None = None
+) -> int:
     """Own inherited descriptors and run the async transport lifecycle."""
 
-    if len({control_fd, readiness_fd, receipt_fd}) != 3:
-        raise ValueError("control, readiness, and receipt descriptors must be distinct")
+    descriptors = [control_fd, readiness_fd, receipt_fd]
+    if listen_fd is not None:
+        descriptors.append(listen_fd)
+    if len(set(descriptors)) != len(descriptors):
+        raise ValueError("control, readiness, receipt, and listener descriptors must be distinct")
     control_socket = socket.socket(fileno=control_fd)
     readiness_stream = os.fdopen(readiness_fd, "w", encoding="utf-8", buffering=1)
     receipt_stream = os.fdopen(receipt_fd, "w", encoding="utf-8", buffering=1)
     try:
-        return asyncio.run(serve_transport(control_socket, readiness_stream, receipt_stream))
+        return asyncio.run(
+            serve_transport(control_socket, readiness_stream, receipt_stream, listen_fd)
+        )
     finally:
         control_socket.close()
         readiness_stream.close()
