@@ -32,6 +32,15 @@ POLICY_SCHEMA = "headroom.transport.policy.v1"
 UPSTREAM_SCHEMA = "headroom.transport.upstream.v1"
 READY_SCHEMA = "headroom.transport.ready.v1"
 RECEIPT_SCHEMA = "headroom.transport.receipt.v1"
+ACTIVATE_SCHEMA = "headroom.transport.activate.v1"
+
+# The optional acquire field that opts a lease into activation: the transport
+# prepares its listener and writes readiness, but accepts no connection until
+# the supervisor, having validated that readiness, sends activate.v1 for the
+# lease. Supervisors that predate activation never send the field, and the
+# transport then serves from readiness exactly as before.
+ACTIVATION_FIELD = "activation"
+ACTIVATION_REQUIRED = "required"
 
 PROVIDER_MODES = frozenset(
     {
@@ -510,6 +519,9 @@ class AcquireRequest:
     upstream: UpstreamBinding
     parent_process: ProcessIdentity
     binding_digest: str
+    # Lease lifecycle, not binding: it is outside binding_digest and the
+    # readiness record, so a supervisor decides it per lease at acquire.
+    activation_required: bool = False
 
     _FIELDS = frozenset(
         {
@@ -535,6 +547,12 @@ class AcquireRequest:
     @classmethod
     def from_dict(cls, value: Any) -> AcquireRequest:
         obj = _expect_object(value, "acquire")
+        activation_required = False
+        if ACTIVATION_FIELD in obj:
+            if obj[ACTIVATION_FIELD] != ACTIVATION_REQUIRED:
+                raise ProtocolError(f"acquire.activation must be {ACTIVATION_REQUIRED!r}")
+            activation_required = True
+            obj = {key: item for key, item in obj.items() if key != ACTIVATION_FIELD}
         _expect_fields(obj, path="acquire", required=cls._FIELDS)
         if obj["schema"] != ACQUIRE_SCHEMA:
             raise ProtocolError(f"acquire.schema must be {ACQUIRE_SCHEMA!r}")
@@ -560,6 +578,7 @@ class AcquireRequest:
             upstream=upstream,
             parent_process=ProcessIdentity.from_dict(obj["parent_process"], "parent_process"),
             binding_digest=_expect_digest(obj["binding_digest"], "binding_digest"),
+            activation_required=activation_required,
         )
         mode = request.account.provider_mode
         # Pi speaks the same OpenAI Responses wire protocol as Codex, against

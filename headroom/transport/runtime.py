@@ -9,7 +9,7 @@ import logging
 import os
 import socket
 import uuid
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from contextlib import suppress
 from typing import Any, TextIO, cast
 
@@ -21,6 +21,7 @@ from headroom.proxy.server import create_app
 
 from .diagnostics import Diagnostics, ParentEpisode, current_request, route_name, trace_request
 from .protocol import (
+    ACTIVATE_SCHEMA,
     READY_SCHEMA,
     AcquireRequest,
     ProcessIdentity,
@@ -309,6 +310,39 @@ async def _drain_connections(server: uvicorn.Server, drain: _ConnectionDrain) ->
         await asyncio.sleep(0.05)
 
 
+class _ActivationGatedServer(uvicorn.Server):
+    """A uvicorn server that prepares its listeners without accepting on them.
+
+    uvicorn creates each listener's asyncio server serving at once. Here they
+    are created with ``start_serving=False``: the app's lifespan has started
+    and the listener is registered, but the transport accepts no connection,
+    so not one request byte is read, until :meth:`activate`. Connections that
+    arrive meanwhile wait in the kernel's accept queue, which a predecessor
+    sharing the listener keeps draining.
+    """
+
+    async def startup(self, sockets: list[socket.socket] | None = None) -> None:
+        loop = asyncio.get_running_loop()
+        create_server = loop.create_server
+
+        async def prepare(*args: Any, **kwargs: Any) -> asyncio.base_events.Server:
+            return await create_server(*args, **{**kwargs, "start_serving": False})
+
+        loop.create_server = prepare  # type: ignore[method-assign]
+        try:
+            await super().startup(sockets=sockets)
+        finally:
+            del loop.create_server
+        prepared = getattr(self, "servers", [])
+        if not self.should_exit and (not prepared or any(s.is_serving() for s in prepared)):
+            # A uvicorn that bypassed the gate would serve before activation.
+            raise RuntimeError("transport listener was not prepared without serving")
+
+    async def activate(self) -> None:
+        for prepared in self.servers:
+            await prepared.start_serving()
+
+
 def create_transport_app(
     request: AcquireRequest,
     receipt_writer: ReceiptWriter,
@@ -387,6 +421,15 @@ def _validate_release(value: Mapping[str, Any]) -> str:
     return lease_id
 
 
+def _validate_activate(value: Mapping[str, Any], lease: TransportLease) -> None:
+    if set(value) != {"schema", "lease_id"} or value.get("schema") != ACTIVATE_SCHEMA:
+        raise ProtocolError(
+            "control channel accepts only activate.v1 or release.v1 before activation"
+        )
+    if value.get("lease_id") != lease.lease_id:
+        raise ProtocolError("activate.lease_id does not name this lease")
+
+
 def _open_listener(listen_fd: int | None = None) -> socket.socket:
     if listen_fd is not None:
         return _inherited_listener(listen_fd)
@@ -456,12 +499,28 @@ async def _monitor_control(
     server: uvicorn.Server,
     diagnostics: Diagnostics | None = None,
     drain: _ConnectionDrain | None = None,
+    activate: Callable[[], Awaitable[None]] | None = None,
 ) -> None:
     def diagnostic(reason: str) -> None:
         if diagnostics:
             diagnostics.emit("transport_shutdown", reason=reason)
 
     try:
+        if activate is not None:
+            # Nothing is served until the supervisor activates this lease. A
+            # release before that ends the lease without serving at all.
+            record = await channel.read_record()
+            if record.get("schema") == RELEASE_SCHEMA:
+                if lease.release(_validate_release(record)):
+                    diagnostic("lease_release_before_activation")
+                    logger.info("event=transport_shutdown reason=lease_release_before_activation")
+                server.should_exit = True
+                return
+            _validate_activate(record, lease)
+            await activate()
+            if diagnostics:
+                diagnostics.emit("transport_activated")
+            logger.info("event=transport_activated")
         while True:
             release = await channel.read_record()
             if lease.release(_validate_release(release)):
@@ -529,6 +588,13 @@ async def serve_transport(
 
     With ``listen_fd`` the transport serves the supervisor's listener instead of
     opening its own, and closes only its copy on exit.
+
+    An acquire record carrying ``"activation": "required"`` opts the lease into
+    activation: the transport starts, prepares its listener without accepting,
+    writes readiness, and serves nothing until the control channel delivers
+    ``activate.v1`` naming this lease. A mismatched record fails the lease, and
+    a release or control EOF before activation ends it without serving. An
+    acquire without the field is served from readiness, as before.
     """
 
     channel = _ControlChannel(control_socket)
@@ -570,7 +636,13 @@ async def serve_transport(
             access_log=False,
             lifespan="on",
         )
-        server = uvicorn.Server(config)
+        # With activation the listener is prepared but accepts nothing until
+        # the supervisor has validated readiness and sent activate.v1.
+        server = (
+            _ActivationGatedServer(config)
+            if request.activation_required
+            else uvicorn.Server(config)
+        )
         serve_task = asyncio.create_task(server.serve(sockets=[listener]))
         await _wait_until_started(server, serve_task)
 
@@ -590,7 +662,16 @@ async def serve_transport(
         readiness_written = True
 
         monitor_tasks = [
-            asyncio.create_task(_monitor_control(channel, lease, server, diagnostics, drain)),
+            asyncio.create_task(
+                _monitor_control(
+                    channel,
+                    lease,
+                    server,
+                    diagnostics,
+                    drain,
+                    server.activate if isinstance(server, _ActivationGatedServer) else None,
+                )
+            ),
             asyncio.create_task(
                 _monitor_parent(request.parent_process, server, diagnostics=diagnostics)
             ),
