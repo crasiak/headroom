@@ -96,12 +96,16 @@ class _TransportBoundaryMiddleware:
         binding: AcquireRequest,
         proxy: Any,
         diagnostics: Diagnostics | None = None,
+        forward_messages: bool = False,
     ) -> None:
         self.app = app
         self.receipt_writer = receipt_writer
         self.binding = binding
         self.proxy = proxy
         self.diagnostics = diagnostics or Diagnostics(run_id=binding.run_id)
+        # A pooled lease forwards Claude's /v1/messages through its own binding
+        # too: the proxy app's handler reads a process-wide upstream.
+        self.forward_messages = forward_messages
 
     async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
         if scope.get("type") != "http" or scope.get("path") in self._HEALTH_PATHS:
@@ -215,7 +219,8 @@ class _TransportBoundaryMiddleware:
             )
             return
         if (
-            mode != "anthropic_oauth_passthrough"
+            self.forward_messages
+            or mode != "anthropic_oauth_passthrough"
             or scope.get("path") == "/v1/messages/count_tokens"
         ):
             from starlette.requests import Request
@@ -353,14 +358,41 @@ def create_transport_app(
 ) -> FastAPI:
     """Build a stateless, no-fallback proxy bound to one prepared request."""
 
-    config = ProxyConfig(
-        host="127.0.0.1",
+    config = transport_proxy_config(
         port=port,
-        anthropic_api_url=request.upstream.url,
-        mode="token",
-        optimize=True,
+        upstream_url=request.upstream.url,
         lossless=request.compression.lossless,
         compression_required=request.compression.required,
+    )
+    app = create_app(config)
+    diagnostics = diagnostics or Diagnostics(run_id=request.run_id)
+    app.state.transport_diagnostics = diagnostics
+    app.state.proxy.transport_receipt_writer = receipt_writer
+    app.add_middleware(
+        _TransportBoundaryMiddleware,
+        receipt_writer=receipt_writer,
+        binding=request,
+        proxy=app.state.proxy,
+        diagnostics=diagnostics,
+    )
+    if drain is not None:
+        app.add_middleware(_DrainMiddleware, drain=drain)
+    return app
+
+
+def transport_proxy_config(
+    *, port: int, upstream_url: str, lossless: bool, compression_required: bool
+) -> ProxyConfig:
+    """The stateless, no-fallback proxy configuration every transport runs."""
+
+    return ProxyConfig(
+        host="127.0.0.1",
+        port=port,
+        anthropic_api_url=upstream_url,
+        mode="token",
+        optimize=True,
+        lossless=lossless,
+        compression_required=compression_required,
         cache_enabled=False,
         rate_limit_enabled=False,
         retry_enabled=False,
@@ -377,20 +409,6 @@ def create_transport_app(
         stateless=True,
         isolated_transport=True,
     )
-    app = create_app(config)
-    diagnostics = diagnostics or Diagnostics(run_id=request.run_id)
-    app.state.transport_diagnostics = diagnostics
-    app.state.proxy.transport_receipt_writer = receipt_writer
-    app.add_middleware(
-        _TransportBoundaryMiddleware,
-        receipt_writer=receipt_writer,
-        binding=request,
-        proxy=app.state.proxy,
-        diagnostics=diagnostics,
-    )
-    if drain is not None:
-        app.add_middleware(_DrainMiddleware, drain=drain)
-    return app
 
 
 def _write_record(stream: TextIO, value: Mapping[str, Any]) -> None:

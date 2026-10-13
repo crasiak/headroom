@@ -16,10 +16,16 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, StreamingResponse
 from starlette.types import Message, Receive, Scope, Send
 
+from headroom.cache.prefix_tracker import _strip_cache_control, normalize_message_cache_control
 from headroom.proxy.helpers import COMPRESSION_TIMEOUT_SECONDS, read_request_json_with_bytes
 from headroom.proxy.outcome import RequestOutcome
 
 from .protocol import AcquireRequest, ReceiptWriter
+
+# The route kind of Claude's /v1/messages. A single-lease transport serves it
+# through the proxy app; a pooled lease, whose upstream must come from its own
+# binding rather than the app's process-wide upstream, forwards it here.
+ANTHROPIC_MESSAGES = "anthropic_messages"
 
 
 class _FinalizingResponse(StreamingResponse):
@@ -61,6 +67,12 @@ def route(binding: AcquireRequest, request: Request) -> tuple[str, str] | None:
         and path == "/v1/messages/count_tokens"
     ):
         return path, "metadata"
+    if (
+        binding.account.provider_mode == "anthropic_oauth_passthrough"
+        and request.method == "POST"
+        and path == "/v1/messages"
+    ):
+        return path, ANTHROPIC_MESSAGES
     if binding.account.provider_mode.startswith("openai_"):
         if request.method == "GET" and path in {"/models", "/v1/models"}:
             return "/models", "metadata"
@@ -100,6 +112,7 @@ async def forward(
         return JSONResponse({"error": "unsupported_transport_route"}, status_code=404)
     suffix, model = selected
     metadata = model == "metadata"
+    anthropic_messages = model == ANTHROPIC_MESSAGES
     started = time.monotonic()
     request_id = await proxy._next_request_id()
     try:
@@ -143,6 +156,12 @@ async def forward(
             ]
             pipeline = proxy.openai_pipeline
         else:
+            if binding.account.provider_mode == "anthropic_oauth_passthrough":
+                # Claude's /v1/messages names its model in the body.
+                requested_model = body.get("model")
+                if not isinstance(requested_model, str) or not requested_model:
+                    raise ValueError("missing model")
+                model = requested_model
             requested_messages = body.get("messages")
             if not isinstance(requested_messages, list) or not requested_messages:
                 raise ValueError("missing messages")
@@ -158,9 +177,17 @@ async def forward(
     outbound = original
     try:
         if messages:
+            # Claude moves its cache breakpoint to the newest block every turn,
+            # and the router never compresses a block that carries one. Left in
+            # place, each block would go uncompressed on its first turn and
+            # compressed on the next, rewriting the cached prefix every turn.
+            # Compress the content without breakpoints and put the client's
+            # breakpoints back afterwards, so each block is forwarded the same
+            # way on every turn.
+            compression_input = _strip_cache_control(messages) if anthropic_messages else messages
             result = await proxy._run_compression_in_executor(
                 lambda: pipeline.apply(
-                    messages=copy.deepcopy(messages),
+                    messages=copy.deepcopy(compression_input),
                     model=model,
                     model_limit=200_000,
                     request_id=request_id,
@@ -171,7 +198,7 @@ async def forward(
             before, after = result.tokens_before, result.tokens_after
             if before < 0 or after < 0:
                 raise ValueError("invalid compression accounting")
-            if after <= before and result.messages != messages:
+            if after <= before and result.messages != compression_input:
                 changed = copy.deepcopy(body)
                 if binding.account.provider_mode.startswith("openai_"):
                     if len(result.messages) != len(slots):
@@ -180,6 +207,10 @@ async def forward(
                         if not isinstance(message.get("content"), str):
                             raise ValueError("compression changed output shape")
                         changed["input"][index]["output"] = message["content"]
+                elif anthropic_messages:
+                    changed["messages"] = normalize_message_cache_control(
+                        result.messages, None, client_messages=messages
+                    )
                 else:
                     changed["messages"] = result.messages
                 outbound = json.dumps(changed, ensure_ascii=False, separators=(",", ":")).encode()
