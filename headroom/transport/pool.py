@@ -66,6 +66,7 @@ from .protocol import (
     canonical_digest,
     current_process_identity,
 )
+from .replay import LeaseReplayState
 from .runtime import (
     TransportLease,
     _ActivationGatedServer,
@@ -543,6 +544,8 @@ class _PoolLease:
         monitor_tasks: list[asyncio.Task[None]] = []
         readiness_written = False
         lease_id: str | None = None
+        replay: LeaseReplayState | None = None
+        diagnostics: Diagnostics | None = None
         try:
             readiness = await _PipeWriter.open(self.fds.readiness)
             receipts = await _PipeWriter.open(self.fds.receipt)
@@ -605,6 +608,7 @@ class _PoolLease:
                 runtime_set_digest=request.runtime_set_digest,
             )
             client = pool.new_http_client()
+            replay = LeaseReplayState(pool.engine.config)
             proxy = _LeaseProxy(pool.engine, client, pool.lease_compression_concurrency)
             drain = _ConnectionDrain()
             context = LeaseContext(lease.lease_id, request, writer)
@@ -615,6 +619,7 @@ class _PoolLease:
                 proxy=proxy,
                 diagnostics=diagnostics,
                 forward_messages=True,
+                replay=replay,
             )
             app = ServerErrorMiddleware(
                 cast(
@@ -695,6 +700,11 @@ class _PoolLease:
             for task in monitor_tasks:
                 with suppress(asyncio.CancelledError, Exception):
                     await task
+            if replay is not None:
+                # The lease's conversations end with it; nothing carries over.
+                held = replay.clear()
+                if diagnostics is not None:
+                    diagnostics.emit("replay_state_released", **held)
             if client is not None:
                 with suppress(Exception):
                     await client.aclose()

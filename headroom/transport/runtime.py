@@ -97,6 +97,7 @@ class _TransportBoundaryMiddleware:
         proxy: Any,
         diagnostics: Diagnostics | None = None,
         forward_messages: bool = False,
+        replay: Any = None,
     ) -> None:
         self.app = app
         self.receipt_writer = receipt_writer
@@ -106,6 +107,8 @@ class _TransportBoundaryMiddleware:
         # A pooled lease forwards Claude's /v1/messages through its own binding
         # too: the proxy app's handler reads a process-wide upstream.
         self.forward_messages = forward_messages
+        # A pooled lease's own conversation state for Claude's prefix replay.
+        self.replay = replay
 
     async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
         if scope.get("type") != "http" or scope.get("path") in self._HEALTH_PATHS:
@@ -228,7 +231,11 @@ class _TransportBoundaryMiddleware:
             from .forwarder import forward
 
             response = await forward(
-                self.binding, self.receipt_writer, self.proxy, Request(scope, receive)
+                self.binding,
+                self.receipt_writer,
+                self.proxy,
+                Request(scope, receive),
+                replay=self.replay,
             )
             await response(scope, receive, send)
             return

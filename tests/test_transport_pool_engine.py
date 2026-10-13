@@ -233,3 +233,59 @@ def test_pool_scope_covers_exactly_the_sharing_key() -> None:
         "profile_revision",
         "lock_hash",
     }
+
+
+def _replay_turn(state, system: str, messages: list[dict]):
+    from headroom.transport.replay import LeaseReplayState
+
+    assert isinstance(state, LeaseReplayState)
+    request = SimpleNamespace(headers={})
+    body = {"model": "claude-test", "system": system, "messages": messages}
+    turn = state.begin(request, "claude-test", body, messages)
+    state.record_response(
+        turn,
+        forwarded=messages,
+        original=messages,
+        response={"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
+    )
+    return turn
+
+
+def test_replay_state_is_bounded_owned_and_cleared() -> None:
+    from headroom.proxy.models import ProxyConfig
+    from headroom.transport.replay import LeaseReplayState
+
+    first = LeaseReplayState(ProxyConfig(), max_sessions=2)
+    second = LeaseReplayState(ProxyConfig(), max_sessions=2)
+    messages = [{"role": "user", "content": "hello"}]
+    turn = _replay_turn(first, "one", messages)
+    # The same conversation on another lease starts cold: nothing is shared.
+    other = _replay_turn(second, "one", messages)
+    assert other.session_id == turn.session_id
+    assert other.tracker is not turn.tracker
+    assert other.compression_cache is not turn.compression_cache
+    assert (
+        second.begin(
+            SimpleNamespace(headers={}),
+            "claude-test",
+            {"system": "one"},
+            [
+                *messages,
+                {"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
+                {"role": "user", "content": "again"},
+            ],
+        ).previous_forwarded[: len(messages)]
+        == messages
+    )
+
+    # Least recently used session ids go first, trackers included.
+    _replay_turn(first, "two", messages)
+    _replay_turn(first, "three", messages)
+    assert first.stats() == {"sessions": 2, "trackers": 2}
+    assert turn.session_id not in first.compression_caches
+    assert all(not key.startswith(turn.session_id) for key in first.trackers._trackers)
+
+    assert first.clear() == {"sessions": 2, "trackers": 2}
+    assert first.stats() == {"sessions": 0, "trackers": 0}
+    assert first.trackers._lineages == {}
+    assert second.stats() == {"sessions": 1, "trackers": 1}

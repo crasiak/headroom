@@ -2,25 +2,20 @@
 
 A single-lease transport serves Claude's /v1/messages with the proxy app's
 handler; a pooled lease forwards it through its own binding (the app's handler
-reads a process-wide upstream). This compares what one recording upstream
-receives from each path for the same requests.
+reads a process-wide upstream) with its own copy of the handler's per-session
+prefix replay. This compares what one recording upstream receives from each
+path for the same requests.
 
 Same on both paths: method, path, every forwarded request header except
-accept-encoding, the client's body bytes when nothing compresses, the
-compressed message content, and the client's breakpoint positions.
+accept-encoding, the client response bytes, and the forwarded body bytes on
+every turn of a five-turn conversation, including the turn where the router
+would otherwise reclassify an older tool result.
 
 Known differences, asserted below so a change to either is noticed:
 - The forwarder keeps the request's query string (Claude sends ``?beta=true``);
   the app's handler drops it.
 - The forwarder asks the upstream for ``accept-encoding: identity`` and relays
   the response bytes untouched; the app's handler forwards the client's value.
-- The app's handler adds a ``cache_control`` breakpoint to a block it
-  compressed; the forwarder forwards the client's breakpoints only.
-- Across turns, the app's handler replays the previous turn's forwarded prefix
-  byte for byte. The forwarder recompresses each request; it is prefix-stable
-  for the usual pattern (asserted here), but the router can classify an older
-  tool result differently once the conversation grows, which then changes that
-  block's bytes (and so the prompt cache) on that turn.
 - Request bodies without ``model`` or ``messages`` are refused locally (400,
   ``invalid_request_body`` receipt) instead of being passed through.
 """
@@ -33,7 +28,7 @@ from typing import Any
 
 import httpx
 
-from tests.test_transport_pool import RecordingUpstream, _pool, _ready_lease
+from tests.test_transport_pool import Lease, RecordingUpstream, _pool, _ready_lease
 from tests.test_transport_protocol import _acquire_payload
 from tests.test_transport_serve import _read_json_line, _TransportProcess
 
@@ -46,35 +41,51 @@ HEADERS = {
     "accept": "application/json",
     "content-type": "application/json",
 }
+# The turn at which the router, recompressing statelessly, would send the
+# turn-1 JSON tool result (message 4) uncompressed again.
+DRIFT_TURN = 3
+DRIFTING_MESSAGE = 4
 
 
-def _tool_output(index: int) -> str:
+def _search_output(index: int) -> str:
     return "".join(
-        f"/src/mod{index}.py:{line}: repeated matching value\n" for line in range(1, 300)
+        f"/src/mod{index}.py:{line}: repeated matching value {index}\n" for line in range(1, 300)
+    )
+
+
+def _json_output(index: int) -> str:
+    return json.dumps(
+        [
+            {
+                "id": k,
+                "name": f"item{k}-{index}",
+                "status": "ok",
+                "tags": ["a", "b"],
+                "score": k % 7,
+            }
+            for k in range(200)
+        ]
     )
 
 
 def _conversation(turns: int) -> list[dict[str, Any]]:
     """Claude's pattern: each turn appends a tool result and moves the breakpoint to it."""
 
-    messages: list[dict[str, Any]] = [{"role": "user", "content": "inspect the results"}]
+    messages: list[dict[str, Any]] = [{"role": "user", "content": "start"}]
     requests = []
     for index in range(turns):
+        output = _search_output(index) if index % 2 == 0 else _json_output(index)
         messages = [
             *messages,
             {
                 "role": "assistant",
-                "content": [{"type": "tool_use", "id": f"t{index}", "name": "Grep", "input": {}}],
+                "content": [
+                    {"type": "tool_use", "id": f"t{index}", "name": "Grep", "input": {"q": index}}
+                ],
             },
             {
                 "role": "user",
-                "content": [
-                    {
-                        "type": "tool_result",
-                        "tool_use_id": f"t{index}",
-                        "content": _tool_output(index),
-                    }
-                ],
+                "content": [{"type": "tool_result", "tool_use_id": f"t{index}", "content": output}],
             },
         ]
         current = json.loads(json.dumps(messages))
@@ -97,46 +108,39 @@ SMALL = {
         }
     ],
 }
+STREAMED = {**_conversation(2)[1], "system": "streamed conversation", "stream": True}
 CASES: list[tuple[str, dict[str, Any], str]] = [
     ("small", SMALL, "?beta=true"),
-    ("stream", {**_conversation(1)[0], "stream": True}, ""),
-    *[(f"turn-{index}", body, "") for index, body in enumerate(_conversation(3))],
+    ("stream", STREAMED, ""),
+    *[(f"turn-{index}", body, "") for index, body in enumerate(_conversation(5))],
 ]
+
+
+def _send(endpoint: str, body: dict[str, Any], query: str = "") -> httpx.Response:
+    response = httpx.post(
+        endpoint + "/v1/messages" + query,
+        content=json.dumps(body).encode(),
+        headers=HEADERS,
+        timeout=60,
+    )
+    assert response.status_code == 200, response.text
+    return response
 
 
 def _drive(endpoint: str, upstream: RecordingUpstream) -> dict[str, dict[str, Any]]:
     observed = {}
     for name, body, query in CASES:
         before = len(upstream.requests)
-        response = httpx.post(
-            endpoint + "/v1/messages" + query,
-            content=json.dumps(body).encode(),
-            headers=HEADERS,
-            timeout=60,
-        )
-        assert response.status_code == 200, (name, response.text)
+        response = _send(endpoint, body, query)
         assert len(upstream.requests) == before + 1
         observed[name] = {"upstream": upstream.requests[before], "client": response.content}
     return observed
 
 
-def _without_breakpoints(value: Any) -> Any:
-    if isinstance(value, dict):
-        return {
-            key: _without_breakpoints(item) for key, item in value.items() if key != "cache_control"
-        }
-    if isinstance(value, list):
-        return [_without_breakpoints(item) for item in value]
-    return value
-
-
-def _breakpoints(messages: list[dict[str, Any]]) -> list[int]:
-    return [
-        index
-        for index, message in enumerate(messages)
-        if isinstance(message["content"], list)
-        and any("cache_control" in block for block in message["content"])
-    ]
+def _forwarded(upstream: RecordingUpstream, lease: Lease, body: dict[str, Any]) -> dict:
+    before = len(upstream.requests)
+    _send(lease.endpoint, body)
+    return upstream.requests[before]["body"]
 
 
 def test_claude_messages_through_the_forwarder_match_the_app_handler(tmp_path) -> None:
@@ -163,21 +167,69 @@ def test_claude_messages_through_the_forwarder_match_the_app_handler(tmp_path) -
         forwarded_headers = dict(forwarder["headers"])
         assert forwarded_headers.pop("accept-encoding") == "identity"
         app_headers.pop("accept-encoding")
-        app_headers.pop("content-length")
-        forwarded_headers.pop("content-length")
         assert forwarded_headers == app_headers, name
         assert served[name]["client"] == pooled[name]["client"], name
-        # Same compressed content, same client breakpoint positions.
-        assert _without_breakpoints(forwarder["body"]) == _without_breakpoints(app["body"]), name
-        assert _breakpoints(forwarder["body"]["messages"]) == _breakpoints(
-            app["body"]["messages"]
-        ), name
+        # Byte for byte the body the app's handler forwards, on every turn.
+        assert forwarder["raw"] == app["raw"], name
 
-    # Nothing compressible: the forwarder relays the client's bytes untouched.
-    assert pooled["small"]["upstream"]["raw"] == json.dumps(SMALL).encode()
-    assert served["small"]["upstream"]["body"] == SMALL
-    # Compressed, and every earlier block forwarded identically on the next turn.
-    turns = [pooled[f"turn-{index}"]["upstream"]["body"]["messages"] for index in range(3)]
+    # Compressed, and every earlier message forwarded identically next turn.
+    turns = [pooled[f"turn-{index}"]["upstream"]["body"]["messages"] for index in range(5)]
     assert len(json.dumps(turns[0])) < len(json.dumps(_conversation(1)[0]["messages"]))
     for previous, current in zip(turns, turns[1:]):
-        assert _without_breakpoints(current[: len(previous)]) == _without_breakpoints(previous)
+        assert _strip_breakpoints(current[: len(previous)]) == _strip_breakpoints(previous)
+
+
+def _strip_breakpoints(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: _strip_breakpoints(item) for key, item in value.items() if key != "cache_control"
+        }
+    if isinstance(value, list):
+        return [_strip_breakpoints(item) for item in value]
+    return value
+
+
+def test_replay_state_is_per_lease_and_released_with_it(tmp_path) -> None:
+    conversation = _conversation(DRIFT_TURN + 1)
+    drifting_client = conversation[DRIFT_TURN]["messages"][DRIFTING_MESSAGE]
+    with RecordingUpstream() as upstream, _pool(tmp_path) as pool:
+        first = _ready_lease(pool, upstream, "first")
+        second = _ready_lease(pool, upstream, "second")
+        first.activate()
+        second.activate()
+
+        replayed = [_forwarded(upstream, first, body) for body in conversation]
+        # The first lease's own history keeps the message as it forwarded it.
+        assert (
+            replayed[DRIFT_TURN]["messages"][DRIFTING_MESSAGE]
+            == replayed[DRIFT_TURN - 1]["messages"][DRIFTING_MESSAGE]
+        )
+        assert replayed[DRIFT_TURN - 1]["messages"][DRIFTING_MESSAGE] != drifting_client
+
+        # The same conversation (same session id) arriving cold on another
+        # lease gets nothing from the first lease's state: no replay, so the
+        # router's cold classification stands.
+        cold = _forwarded(upstream, second, conversation[DRIFT_TURN])
+        assert _strip_breakpoints(cold["messages"][DRIFTING_MESSAGE]) == _strip_breakpoints(
+            drifting_client
+        )
+        assert cold != replayed[DRIFT_TURN]
+
+        first.release()
+        assert first.ended()
+        released = [
+            event
+            for event in first.diagnostics.remaining()
+            if event["event"] == "replay_state_released"
+        ]
+        assert len(released) == 1
+        assert released[0]["sessions"] == 1
+        assert released[0]["trackers"] >= 1
+
+        second.control.close()
+        assert second.ended()
+        assert [
+            event["sessions"]
+            for event in second.diagnostics.remaining()
+            if event["event"] == "replay_state_released"
+        ] == [1]
