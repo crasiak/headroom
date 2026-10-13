@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import socket
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -145,35 +146,45 @@ async def test_engine_receipts_resolve_to_the_requests_own_lease() -> None:
 async def test_a_lease_holds_at_most_its_share_of_the_compression_executor() -> None:
     running = {"a": 0, "b": 0}
     peak = {"a": 0, "b": 0}
-    release = asyncio.Event()
+    lock = threading.Lock()
+    release = threading.Event()
+
+    def job(label: str):
+        def work() -> str:
+            with lock:
+                running[label] += 1
+                peak[label] = max(peak[label], running[label])
+            release.wait(10)
+            with lock:
+                running[label] -= 1
+            return label
+
+        return work
 
     async def run(fn, *, timeout):
-        label = fn()
-        running[label] += 1
-        peak[label] = max(peak[label], running[label])
-        try:
-            await release.wait()
-        finally:
-            running[label] -= 1
-        return label
+        return await asyncio.to_thread(fn)
 
     engine = SimpleNamespace(_run_compression_in_executor=run)
     first = _LeaseProxy(engine, client=None, concurrency=2)  # type: ignore[arg-type]
     second = _LeaseProxy(engine, client=None, concurrency=2)  # type: ignore[arg-type]
-    flood = [
-        asyncio.create_task(first._run_compression_in_executor(lambda: "a", timeout=5))
-        for _ in range(6)
-    ]
-    await asyncio.sleep(0.05)
-    assert running == {"a": 2, "b": 0}
-    # The other lease is not queued behind the flood.
-    other = asyncio.create_task(second._run_compression_in_executor(lambda: "b", timeout=5))
-    await asyncio.sleep(0.05)
-    assert running == {"a": 2, "b": 1}
-    release.set()
-    assert await other == "b"
-    assert await asyncio.gather(*flood) == ["a"] * 6
-    assert peak == {"a": 2, "b": 1}
+    try:
+        flood = [
+            asyncio.create_task(first._run_compression_in_executor(job("a"), timeout=5))
+            for _ in range(6)
+        ]
+        await _until(lambda: running["a"] == 2)
+        await asyncio.sleep(0.05)
+        assert running == {"a": 2, "b": 0}
+        # The other lease is not queued behind the flood.
+        other = asyncio.create_task(second._run_compression_in_executor(job("b"), timeout=5))
+        await _until(lambda: running["b"] == 1)
+        assert running == {"a": 2, "b": 1}
+        release.set()
+        assert await other == "b"
+        assert await asyncio.gather(*flood) == ["a"] * 6
+        assert peak == {"a": 2, "b": 1}
+    finally:
+        release.set()
 
 
 async def test_waiting_for_a_compression_share_counts_against_the_timeout() -> None:
@@ -289,3 +300,90 @@ def test_replay_state_is_bounded_owned_and_cleared() -> None:
     assert first.stats() == {"sessions": 0, "trackers": 0}
     assert first.trackers._lineages == {}
     assert second.stats() == {"sessions": 1, "trackers": 1}
+
+
+class _Blocker:
+    """A compression job that runs until the test lets it go."""
+
+    def __init__(self) -> None:
+        self.gate = threading.Event()
+        self.lock = threading.Lock()
+        self.running = 0
+        self.peak = 0
+
+    def __call__(self) -> str:
+        with self.lock:
+            self.running += 1
+            self.peak = max(self.peak, self.running)
+        try:
+            self.gate.wait(10)
+            return "late"
+        finally:
+            with self.lock:
+                self.running -= 1
+
+
+async def _until(predicate, timeout: float = 5.0) -> None:
+    deadline = asyncio.get_running_loop().time() + timeout
+    while not predicate():
+        assert asyncio.get_running_loop().time() < deadline, "condition not reached"
+        await asyncio.sleep(0.01)
+
+
+async def test_one_leases_stuck_compression_quarantines_only_that_lease(pool) -> None:
+    from headroom.proxy.server import CompressionQuarantinedError
+
+    pool.build_engine()
+    stuck_lease = _LeaseProxy(pool.engine, client=None, concurrency=2)  # type: ignore[arg-type]
+    other_lease = _LeaseProxy(pool.engine, client=None, concurrency=2)  # type: ignore[arg-type]
+    blocker = _Blocker()
+    try:
+        with pytest.raises(asyncio.TimeoutError):
+            await stuck_lease._run_compression_in_executor(blocker, timeout=0.1)
+        assert stuck_lease.compression_snapshot() == {"jobs": 1, "leaked": 1}
+        # The engine still accounts for the debt, engine-wide.
+        assert pool.engine._compression_timed_out_in_flight == 1
+
+        # The stuck lease is quarantined; the other lease compresses normally.
+        with pytest.raises(CompressionQuarantinedError, match="lease compression quarantined"):
+            await stuck_lease._run_compression_in_executor(lambda: "x", timeout=5)
+        assert await other_lease._run_compression_in_executor(lambda: "ok", timeout=5) == "ok"
+        assert pool.engine._compression_quarantine_activations == 0
+
+        # Quarantined until the worker actually finishes, then it recovers.
+        await asyncio.sleep(0.2)
+        with pytest.raises(CompressionQuarantinedError):
+            await stuck_lease._run_compression_in_executor(lambda: "x", timeout=5)
+        blocker.gate.set()
+        await _until(lambda: stuck_lease.compression_snapshot()["jobs"] == 0)
+        assert await stuck_lease._run_compression_in_executor(lambda: "back", timeout=5) == "back"
+        assert stuck_lease.compression_snapshot() == {"jobs": 0, "leaked": 0}
+        await _until(lambda: pool.engine._compression_leaked_threads == 1)
+    finally:
+        blocker.gate.set()
+
+
+async def test_a_timing_out_lease_never_holds_more_than_its_share_of_threads(pool) -> None:
+    pool.build_engine()
+    # No quarantine window: the slot rule alone must bound the lease.
+    pool.engine._compression_quarantine_max_seconds = 0.0
+    lease = _LeaseProxy(pool.engine, client=None, concurrency=2)  # type: ignore[arg-type]
+    blocker = _Blocker()
+    try:
+        for _ in range(6):
+            with pytest.raises(asyncio.TimeoutError):
+                await lease._run_compression_in_executor(blocker, timeout=0.1)
+        assert blocker.running == 2
+        assert blocker.peak == 2
+        assert lease.compression_snapshot() == {"jobs": 2, "leaked": 2}
+
+        blocker.gate.set()
+        await _until(lambda: lease.compression_snapshot()["jobs"] == 0)
+        # Both slots came back when the workers finished.
+        results = await asyncio.gather(
+            lease._run_compression_in_executor(lambda: 1, timeout=5),
+            lease._run_compression_in_executor(lambda: 2, timeout=5),
+        )
+        assert results == [1, 2]
+    finally:
+        blocker.gate.set()

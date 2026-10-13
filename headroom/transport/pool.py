@@ -41,6 +41,8 @@ import os
 import signal
 import socket
 import stat
+import threading
+import time
 import uuid
 from collections.abc import Callable, Mapping
 from contextlib import suppress
@@ -452,27 +454,132 @@ class _PipeWriter:
             await self.protocol.closed
 
 
+class _AbandonedCompression(Exception):
+    """A compression job whose waiter gave up before its worker started."""
+
+
+@dataclass
+class _CompressionJob:
+    started: bool = False
+    finished: bool = False
+    abandoned: bool = False
+    timed_out: bool = False
+
+
 class _LeaseProxy:
-    """The engine as one lease sees it: its own HTTP client and compression share."""
+    """The engine as one lease sees it: its own HTTP client and compression share.
+
+    A lease runs at most ``concurrency`` compression jobs on the shared
+    executor. A job's slot is held until its worker thread finishes, not until
+    its waiter gives up: Python cannot stop a running worker, so releasing the
+    slot on timeout would let a lease that keeps timing out occupy ever more
+    executor threads.
+
+    Timeout debt quarantines the lease, not the engine (whose engine-wide hold
+    a pool turns off): while one of this lease's timed-out workers is still
+    running, this lease's new compressions raise ``CompressionQuarantinedError``
+    and take the forwarder's compression-failure policy, and other leases keep
+    compressing. As on the engine, a fresh timeout arms the quarantine for at
+    most the engine's quarantine cap, so a worker that never returns cannot
+    quarantine the lease for good; its slot stays held regardless.
+    """
 
     def __init__(self, engine: Any, client: httpx.AsyncClient, concurrency: int) -> None:
         self._engine = engine
         self.http_client = client
         self.http_client_h1 = client
         self._compression_slots = asyncio.Semaphore(concurrency)
+        self._compression_lock = threading.Lock()
+        # Jobs holding a slot (queued or running) and, of those, timed-out
+        # jobs whose worker is still running.
+        self.compression_jobs = 0
+        self.compression_leaked = 0
+        self._quarantine_deadline = 0.0
+
+    def compression_snapshot(self) -> dict[str, int]:
+        with self._compression_lock:
+            return {"jobs": self.compression_jobs, "leaked": self.compression_leaked}
+
+    def _quarantined(self) -> int:
+        with self._compression_lock:
+            if self.compression_leaked and time.monotonic() < self._quarantine_deadline:
+                return self.compression_leaked
+            return 0
 
     async def _run_compression_in_executor(self, fn: Callable[[], Any], *, timeout: float) -> Any:
-        # Fairness: one lease holds at most its share of the shared executor;
-        # the wait for a share counts against the same compression budget.
+        from headroom.proxy.server import CompressionQuarantinedError
+
+        leaked = self._quarantined()
+        if leaked:
+            raise CompressionQuarantinedError(
+                f"lease compression quarantined: {leaked} timed-out worker(s) still running"
+            )
+        # The wait for a share counts against the same compression budget.
         loop = asyncio.get_running_loop()
         deadline = loop.time() + timeout
         await asyncio.wait_for(self._compression_slots.acquire(), timeout)
-        try:
-            return await self._engine._run_compression_in_executor(
-                fn, timeout=max(0.0, deadline - loop.time())
-            )
-        finally:
+        job = _CompressionJob()
+        with self._compression_lock:
+            self.compression_jobs += 1
+
+        def release_slot() -> None:
             self._compression_slots.release()
+
+        def worker_finished() -> None:
+            with self._compression_lock:
+                job.finished = True
+                self.compression_jobs -= 1
+                if job.timed_out:
+                    self.compression_leaked -= 1
+            try:
+                loop.call_soon_threadsafe(release_slot)
+            except RuntimeError:
+                # The pool's loop is gone; so is the lease and its semaphore.
+                pass
+
+        def tracked() -> Any:
+            with self._compression_lock:
+                if job.abandoned:
+                    raise _AbandonedCompression
+                job.started = True
+            try:
+                return fn()
+            finally:
+                worker_finished()
+
+        try:
+            result = await self._engine._run_compression_in_executor(
+                tracked, timeout=max(0.0, deadline - loop.time())
+            )
+        except BaseException as error:
+            with self._compression_lock:
+                if not job.started:
+                    # Never reached a worker (cancelled in the executor queue,
+                    # or refused): nothing runs for it, so its slot is free now.
+                    job.abandoned = True
+                    self.compression_jobs -= 1
+                    free_now = True
+                else:
+                    free_now = False
+                    if not job.finished and isinstance(error, asyncio.TimeoutError):
+                        # Still running past its deadline: timeout debt.
+                        job.timed_out = True
+                        self.compression_leaked += 1
+                        self._quarantine_deadline = (
+                            time.monotonic() + self._engine._compression_quarantine_max_seconds
+                        )
+            if free_now:
+                release_slot()
+            raise
+        with self._compression_lock:
+            # An engine that answered without running the job holds no worker.
+            free_now = not job.started
+            if free_now:
+                job.abandoned = True
+                self.compression_jobs -= 1
+        if free_now:
+            release_slot()
+        return result
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._engine, name)
@@ -546,6 +653,7 @@ class _PoolLease:
         lease_id: str | None = None
         replay: LeaseReplayState | None = None
         diagnostics: Diagnostics | None = None
+        proxy: _LeaseProxy | None = None
         try:
             readiness = await _PipeWriter.open(self.fds.readiness)
             receipts = await _PipeWriter.open(self.fds.receipt)
@@ -700,6 +808,18 @@ class _PoolLease:
             for task in monitor_tasks:
                 with suppress(asyncio.CancelledError, Exception):
                     await task
+            if proxy is not None and diagnostics is not None:
+                # Workers cannot be stopped; the lease ends without waiting for
+                # them, and their slots die with this lease's semaphore.
+                stuck = proxy.compression_snapshot()
+                if stuck["jobs"]:
+                    diagnostics.emit("compression_work_abandoned", **stuck)
+                    logger.warning(
+                        "event=pool_lease_compression_abandoned admission_id=%s jobs=%d leaked=%d",
+                        self.admission_id,
+                        stuck["jobs"],
+                        stuck["leaked"],
+                    )
             if replay is not None:
                 # The lease's conversations end with it; nothing carries over.
                 held = replay.clear()
@@ -800,6 +920,15 @@ class TransportPool:
             if not hasattr(pipeline, "_breaker_threshold"):
                 raise RuntimeError("pool engine cannot isolate the pipeline breaker")
             pipeline._breaker_threshold = 0
+        # Timeout debt quarantines the lease that owns it (_LeaseProxy), not
+        # the engine: one lease's stuck worker must not stop compression for
+        # every lease. There is no engine-wide backstop: a job that cannot get
+        # an executor thread times out in the executor queue and is cancelled
+        # before it starts, which adds no debt, and each lease holds at most
+        # its own share of threads.
+        if not hasattr(self.engine, "_compression_engine_quarantine"):
+            raise RuntimeError("pool engine cannot scope the compression quarantine")
+        self.engine._compression_engine_quarantine = False
         self._client_options = _provider_httpx_client_options(config, build_httpx_verify())
 
     def new_http_client(self) -> httpx.AsyncClient:

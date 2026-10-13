@@ -1252,6 +1252,11 @@ class HeadroomProxy(
             "HEADROOM_COMPRESSION_QUARANTINE_MAX_SECONDS", 60.0
         )
         self._compression_quarantine_releases: int = 0
+        # Whether timeout debt holds compression for the whole engine. A
+        # transport pool turns this off and quarantines per lease instead, so
+        # one lease's stuck worker cannot stop compression for every other
+        # lease; the debt and leaked-thread counters still track the engine.
+        self._compression_engine_quarantine: bool = True
         self._compression_metrics_lock = threading.Lock()
 
         # Backend for Anthropic API (direct, LiteLLM, or any-llm)
@@ -1512,12 +1517,17 @@ class HeadroomProxy(
         now = time.monotonic()
         with self._compression_metrics_lock:
             timed_out_in_flight = self._compression_timed_out_in_flight
-            quarantined = timed_out_in_flight > 0 and now < self._compression_quarantine_deadline
+            quarantined = (
+                self._compression_engine_quarantine
+                and timed_out_in_flight > 0
+                and now < self._compression_quarantine_deadline
+            )
             # Debt outlived the cap: presume the worker leaked/hung and stop
             # blocking on it. Count the release once per lapse (while debt stands
             # and the deadline has passed) so operators can see it happened.
             released = (
-                timed_out_in_flight > 0
+                self._compression_engine_quarantine
+                and timed_out_in_flight > 0
                 and not quarantined
                 and self._compression_quarantine_deadline > 0.0
             )
@@ -1571,7 +1581,9 @@ class HeadroomProxy(
                 or state["timeout_debt_recorded"]
             ):
                 return False
-            was_clear = self._compression_timed_out_in_flight == 0
+            was_clear = (
+                self._compression_timed_out_in_flight == 0 and self._compression_engine_quarantine
+            )
             self._compression_timed_out_in_flight += 1
             self._compression_timed_out_in_flight_max = max(
                 self._compression_timed_out_in_flight_max,

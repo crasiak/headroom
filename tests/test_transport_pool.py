@@ -282,7 +282,7 @@ class Lease:
 
 
 class Pool:
-    def __init__(self, tmp_path: Path, *args: str) -> None:
+    def __init__(self, tmp_path: Path, *args: str, extra_env: dict[str, str] | None = None) -> None:
         tmp_path.mkdir(parents=True, exist_ok=True)
         self.admission, child = socket.socketpair()
         source_root = Path(__file__).resolve().parents[1]
@@ -300,6 +300,7 @@ class Pool:
                 "PYTHONPATH": os.pathsep.join(
                     value for value in (str(source_root), env.get("PYTHONPATH", "")) if value
                 ),
+                **(extra_env or {}),
             }
         )
         self.process = subprocess.Popen(
@@ -370,8 +371,8 @@ class Pool:
 
 
 @contextmanager
-def _pool(tmp_path: Path, *args: str) -> Iterator[Pool]:
-    pool = Pool(tmp_path, *args)
+def _pool(tmp_path: Path, *args: str, extra_env: dict[str, str] | None = None) -> Iterator[Pool]:
+    pool = Pool(tmp_path, *args, extra_env=extra_env)
     try:
         assert pool.hello["schema"] == POOL_SCHEMA
         assert pool.hello["status"] == "ready", pool.hello
@@ -951,3 +952,50 @@ def test_sigterm_ends_every_lease_and_the_pool(tmp_path) -> None:
         assert pool.process.wait(timeout=20) == 0
         for lease in (active, unacquired):
             assert lease.receipts.at_eof()
+
+
+def test_releasing_a_lease_with_stuck_compression_does_not_wait_for_it(tmp_path) -> None:
+    # A compression budget far below what this request takes: the worker keeps
+    # running (about a second) after the request has failed.
+    output = "".join(f"/src/m.py:{i}: repeated matching value {i % 97}\n" for i in range(80000))
+    body = {
+        "model": "claude-test",
+        "max_tokens": 16,
+        "messages": [
+            {"role": "user", "content": "x"},
+            {
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "t", "name": "Grep", "input": {}}],
+            },
+            {
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "t", "content": output}],
+            },
+        ],
+    }
+    with (
+        RecordingUpstream() as upstream,
+        _pool(tmp_path, extra_env={"HEADROOM_COMPRESSION_TIMEOUT_SECONDS": "0.05"}) as pool,
+    ):
+        lease = _ready_lease(pool, upstream, "stuck")
+        lease.activate()
+        response = httpx.post(
+            lease.endpoint + "/v1/messages", json=body, headers=HEADERS, timeout=30
+        )
+        assert response.status_code == 503
+        assert lease.receipts.read()["error_reason"] == "compression_failed"
+        released_at = time.monotonic()
+        lease.release()
+        assert lease.ended(timeout=10)
+        events = lease.diagnostics.remaining()
+        abandoned = [event for event in events if event["event"] == "compression_work_abandoned"]
+        assert abandoned and abandoned[0]["jobs"] == 1 and abandoned[0]["leaked"] == 1, events
+        assert time.monotonic() - released_at < 10
+        assert upstream.requests == []
+
+        # The pool and a new lease are unaffected: fresh slots, no quarantine.
+        fresh = _ready_lease(pool, upstream, "fresh")
+        assert fresh.ready["lease_id"] != lease.ready["lease_id"]
+        fresh.activate()
+        assert _post(fresh, "fresh").status_code in (200, 503)
+        assert pool.process.poll() is None
