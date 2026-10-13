@@ -337,7 +337,16 @@ jobs:
           python -m pip install --upgrade pip
           pip install torch --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple
           WHEEL="$(ls dist/*.whl)"
-          pip install "${WHEEL}[dev]" pytest-split
+          # Test against the litellm version uv.lock pins (what the runtime
+          # ships): an unconstrained resolve picks the newest litellm, whose
+          # model price map has drifted from the tests (e.g. 1.105.0).
+          python - > ci-constraints.txt <<'PY'
+          import tomllib
+          lock = tomllib.load(open("uv.lock", "rb"))
+          print("\n".join(f"{p['name']}=={p['version']}" for p in lock["package"] if p["name"] == "litellm"))
+          PY
+          cat ci-constraints.txt
+          pip install -c ci-constraints.txt "${WHEEL}[dev]" pytest-split
           # cwd's ./headroom source tree shadows the installed wheel; copy the
           # compiled extension in so tests import it (no second cargo build).
           SITE="$(python -c 'import sysconfig; print(sysconfig.get_path("platlib"))')"
@@ -412,7 +421,16 @@ jobs:
           python -m pip install --upgrade pip
           pip install torch --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple
           WHEEL="$(ls dist/*.whl)"
-          pip install "${WHEEL}[dev,relevance]"
+          # Test against the litellm version uv.lock pins (what the runtime
+          # ships): an unconstrained resolve picks the newest litellm, whose
+          # model price map has drifted from the tests (e.g. 1.105.0).
+          python - > ci-constraints.txt <<'PY'
+          import tomllib
+          lock = tomllib.load(open("uv.lock", "rb"))
+          print("\n".join(f"{p['name']}=={p['version']}" for p in lock["package"] if p["name"] == "litellm"))
+          PY
+          cat ci-constraints.txt
+          pip install -c ci-constraints.txt "${WHEEL}[dev,relevance]"
           SITE="$(python -c 'import sysconfig; print(sysconfig.get_path("platlib"))')"
           cp "${SITE}/headroom/"_core*.so headroom/
           python -c "from headroom._core import SmartCrusher; print('headroom._core OK')"
@@ -454,7 +472,16 @@ jobs:
           python -m pip install --upgrade pip
           pip install torch --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple
           WHEEL="$(ls dist/*.whl)"
-          pip install "${WHEEL}[dev,agno]"
+          # Test against the litellm version uv.lock pins (what the runtime
+          # ships): an unconstrained resolve picks the newest litellm, whose
+          # model price map has drifted from the tests (e.g. 1.105.0).
+          python - > ci-constraints.txt <<'PY'
+          import tomllib
+          lock = tomllib.load(open("uv.lock", "rb"))
+          print("\n".join(f"{p['name']}=={p['version']}" for p in lock["package"] if p["name"] == "litellm"))
+          PY
+          cat ci-constraints.txt
+          pip install -c ci-constraints.txt "${WHEEL}[dev,agno]"
           SITE="$(python -c 'import sysconfig; print(sysconfig.get_path("platlib"))')"
           cp "${SITE}/headroom/"_core*.so headroom/
       - name: Run agno tests
@@ -480,7 +507,16 @@ jobs:
           python -m pip install --upgrade pip
           pip install torch --index-url https://download.pytorch.org/whl/cpu --extra-index-url https://pypi.org/simple
           WHEEL="$(ls dist/*.whl)"
-          pip install "${WHEEL}[dev]" playwright
+          # Test against the litellm version uv.lock pins (what the runtime
+          # ships): an unconstrained resolve picks the newest litellm, whose
+          # model price map has drifted from the tests (e.g. 1.105.0).
+          python - > ci-constraints.txt <<'PY'
+          import tomllib
+          lock = tomllib.load(open("uv.lock", "rb"))
+          print("\n".join(f"{p['name']}=={p['version']}" for p in lock["package"] if p["name"] == "litellm"))
+          PY
+          cat ci-constraints.txt
+          pip install -c ci-constraints.txt "${WHEEL}[dev]" playwright
           SITE="$(python -c 'import sysconfig; print(sysconfig.get_path("platlib"))')"
           cp "${SITE}/headroom/"_core*.so headroom/
       - name: Install chromium
