@@ -3,6 +3,7 @@
 # CRITICAL: Must be set before ANY imports that could trigger sentence_transformers
 # The Rust tokenizers use parallelism that deadlocks with pytest-asyncio
 import os
+import sys
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -136,6 +137,22 @@ def _reset_catalog_model_resolution_cache():
     _resolve_catalog_model.cache_clear()
     yield
     _resolve_catalog_model.cache_clear()
+
+
+# The content-detection memo (CRA-1001) is process-wide and keyed by content
+# bytes, not by which detector a test patched in. Tests monkeypatch the native
+# detector and the backend env per test, so a verdict memoized under one test's
+# fake must not answer a neighbor's identical content. Only clear it when the
+# router is already imported, so this fixture never imports it as a side effect.
+@pytest.fixture(autouse=True)
+def _reset_detection_memo():
+    module = sys.modules.get("headroom.transforms.content_router")
+    if module is not None:
+        module._detection_memo.clear()
+    yield
+    module = sys.modules.get("headroom.transforms.content_router")
+    if module is not None:
+        module._detection_memo.clear()
 
 
 # =============================================================================
