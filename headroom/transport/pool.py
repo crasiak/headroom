@@ -481,7 +481,9 @@ class _LeaseProxy:
     and take the forwarder's compression-failure policy, and other leases keep
     compressing. As on the engine, a fresh timeout arms the quarantine for at
     most the engine's quarantine cap, so a worker that never returns cannot
-    quarantine the lease for good; its slot stays held regardless.
+    quarantine the lease for good; its slot stays held regardless. Past the
+    cap, a lease whose every slot is held by a stuck worker still fails fast
+    rather than waiting its whole budget for a slot that cannot come free.
     """
 
     def __init__(self, engine: Any, client: httpx.AsyncClient, concurrency: int) -> None:
@@ -489,6 +491,7 @@ class _LeaseProxy:
         self.http_client = client
         self.http_client_h1 = client
         self._compression_slots = asyncio.Semaphore(concurrency)
+        self._compression_concurrency = concurrency
         self._compression_lock = threading.Lock()
         # Jobs holding a slot (queued or running) and, of those, timed-out
         # jobs whose worker is still running.
@@ -502,7 +505,14 @@ class _LeaseProxy:
 
     def _quarantined(self) -> int:
         with self._compression_lock:
-            if self.compression_leaked and time.monotonic() < self._quarantine_deadline:
+            if not self.compression_leaked:
+                return 0
+            if time.monotonic() < self._quarantine_deadline:
+                return self.compression_leaked
+            # Past the cap, but every slot is held by a stuck worker: no slot
+            # can free up within the budget, so fail now instead of waiting it
+            # out. Slots held by live work still make callers wait as before.
+            if self.compression_leaked >= self._compression_concurrency:
                 return self.compression_leaked
             return 0
 

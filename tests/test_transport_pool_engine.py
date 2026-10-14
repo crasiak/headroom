@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import socket
 import threading
+import time
 from types import SimpleNamespace
 
 import pytest
@@ -376,6 +377,8 @@ async def test_a_timing_out_lease_never_holds_more_than_its_share_of_threads(poo
         assert blocker.running == 2
         assert blocker.peak == 2
         assert lease.compression_snapshot() == {"jobs": 2, "leaked": 2}
+        # Both slots stay with the stuck workers, not freed by the timeouts.
+        assert lease._compression_slots.locked()
 
         blocker.gate.set()
         await _until(lambda: lease.compression_snapshot()["jobs"] == 0)
@@ -387,3 +390,68 @@ async def test_a_timing_out_lease_never_holds_more_than_its_share_of_threads(poo
         assert results == [1, 2]
     finally:
         blocker.gate.set()
+
+
+async def test_a_lease_whose_every_slot_is_stuck_fails_fast_past_the_cap(pool) -> None:
+    from headroom.proxy.server import CompressionQuarantinedError
+
+    pool.build_engine()
+    # The quarantine cap has expired: only the stuck-slot rule applies.
+    pool.engine._compression_quarantine_max_seconds = 0.0
+    lease = _LeaseProxy(pool.engine, client=None, concurrency=2)  # type: ignore[arg-type]
+    first, second = _Blocker(), _Blocker()
+    try:
+        with pytest.raises(asyncio.TimeoutError):
+            await lease._run_compression_in_executor(first, timeout=0.1)
+        # One slot stuck, one free: the lease still compresses, on one slot only.
+        assert await lease._run_compression_in_executor(lambda: "free", timeout=5) == "free"
+        live = _Blocker()
+        running = [
+            asyncio.create_task(lease._run_compression_in_executor(live, timeout=5))
+            for _ in range(2)
+        ]
+        await _until(lambda: live.running == 1)
+        await asyncio.sleep(0.1)
+        assert live.running == 1
+        live.gate.set()
+        assert await asyncio.gather(*running) == ["late", "late"]
+        assert live.peak == 1
+
+        with pytest.raises(asyncio.TimeoutError):
+            await lease._run_compression_in_executor(second, timeout=0.1)
+        assert lease.compression_snapshot() == {"jobs": 2, "leaked": 2}
+        assert lease._compression_slots.locked()
+
+        # Every slot stuck: fail now, not after the whole budget.
+        started = time.monotonic()
+        with pytest.raises(CompressionQuarantinedError):
+            await lease._run_compression_in_executor(lambda: "never", timeout=3)
+        assert time.monotonic() - started < 0.5
+
+        # A stuck worker finishing frees its slot for the next compression.
+        first.gate.set()
+        await _until(lambda: lease.compression_snapshot()["leaked"] == 1)
+        assert await lease._run_compression_in_executor(lambda: "again", timeout=5) == "again"
+    finally:
+        first.gate.set()
+        second.gate.set()
+
+
+async def test_slots_held_by_live_work_still_make_a_lease_wait(pool) -> None:
+    pool.build_engine()
+    lease = _LeaseProxy(pool.engine, client=None, concurrency=2)  # type: ignore[arg-type]
+    live = _Blocker()
+    try:
+        holders = [
+            asyncio.create_task(lease._run_compression_in_executor(live, timeout=5))
+            for _ in range(2)
+        ]
+        await _until(lambda: live.running == 2)
+        loop = asyncio.get_running_loop()
+        loop.call_later(0.3, live.gate.set)
+        started = time.monotonic()
+        assert await lease._run_compression_in_executor(lambda: "waited", timeout=5) == "waited"
+        assert time.monotonic() - started >= 0.25
+        assert await asyncio.gather(*holders) == ["late", "late"]
+    finally:
+        live.gate.set()
