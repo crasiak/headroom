@@ -322,3 +322,106 @@ def test_memo_hits_are_isolated_copies(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_memo_capacity_env(monkeypatch: pytest.MonkeyPatch, raw: str, expected: int) -> None:
     monkeypatch.setenv(cr._DETECT_MEMO_ENTRIES_ENV, raw)
     assert cr._detect_memo_capacity() == expected
+
+
+# ---------------------------------------------------------------------------
+# Tenant scopes (transport pool: one process, several leases — CRA-970)
+# ---------------------------------------------------------------------------
+
+
+def _detect_in(scope: str | None, content: str) -> None:
+    if scope is None:
+        cr._detect_content(content)
+        return
+    with cr.detection_memo_scope(scope):
+        cr._detect_content(content)
+
+
+def test_scopes_never_share_a_verdict(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = _install(monkeypatch, _FakeNative())
+    content = "identical tool output sent by two leases"
+    _detect_in("lease-a", content)
+    _detect_in("lease-a", content)
+    assert fake.calls == 1
+    # Lease B's first sight of the same bytes must not be a (fast) hit on A's entry.
+    _detect_in("lease-b", content)
+    assert fake.calls == 2
+    _detect_in("lease-b", content)
+    # Nor does the process-wide scope see either lease's entries.
+    _detect_in(None, content)
+    assert fake.calls == 3
+
+
+def test_releasing_a_scope_drops_only_its_entries(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = _install(monkeypatch, _FakeNative())
+    for content in ("one", "two", "three"):
+        _detect_in("lease-a", content)
+    _detect_in("lease-b", "one")
+    assert cr._detection_memo.scope_size("lease-a") == 3
+
+    assert cr.release_detection_memo_scope("lease-a") == 3
+    assert cr._detection_memo.scope_size("lease-a") == 0
+    assert cr._detection_memo.scope_size("lease-b") == 1
+    assert cr.release_detection_memo_scope("lease-a") == 0
+
+    fake.calls = 0
+    _detect_in("lease-b", "one")
+    assert fake.calls == 0
+    _detect_in("lease-a", "one")
+    assert fake.calls == 1
+
+
+def test_scope_required_bypasses_the_memo_outside_any_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake = _install(monkeypatch, _FakeNative())
+    cr.require_detection_memo_scope()
+    for _ in range(3):
+        _detect_in(None, "pool work that escaped every lease scope")
+    assert fake.calls == 3
+    assert len(cr._detection_memo) == 0
+    # Inside a scope the memo still works.
+    _detect_in("lease-a", "scoped")
+    _detect_in("lease-a", "scoped")
+    assert fake.calls == 4
+
+
+def test_unscoped_process_keeps_the_shared_memo(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Plain proxy / single-lease ``serve``: no scope, none required.
+    fake = _install(monkeypatch, _FakeNative())
+    assert cr._detection_memo.scope_required is False
+    _detect_in(None, "single tenant")
+    _detect_in(None, "single tenant")
+    assert fake.calls == 1
+    assert cr._detection_memo.scope_size("") == 1
+
+
+def test_scopes_share_one_entry_bound(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install(monkeypatch, _FakeNative())
+    monkeypatch.setenv(cr._DETECT_MEMO_ENTRIES_ENV, "3")
+    for scope in ("lease-a", "lease-b", "lease-c"):
+        for content in ("x", "y"):
+            _detect_in(scope, content)
+    assert len(cr._detection_memo) == 3
+
+
+def test_scope_follows_the_router_into_worker_threads(monkeypatch: pytest.MonkeyPatch) -> None:
+    fake = _install(monkeypatch, _FakeNative())
+    cr.require_detection_memo_scope()
+    messages = _transport_messages(scale=0.2)
+    router = ContentRouter(ContentRouterConfig(lossless=True))
+    with cr.detection_memo_scope("lease-a"):
+        _apply(router, messages)
+        first = fake.calls
+        fake.calls = 0
+        _apply(router, messages)
+    assert first > 0
+    assert fake.calls == 0
+    assert cr._detection_memo.scope_size("lease-a") > 0
+    assert cr._detection_memo.scope_size("") == 0
+
+
+def test_empty_scope_is_rejected() -> None:
+    with pytest.raises(ValueError):
+        with cr.detection_memo_scope(""):
+            pass

@@ -46,8 +46,9 @@ import sys
 import threading
 import time
 from collections import OrderedDict
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from contextvars import ContextVar, copy_context
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
@@ -991,6 +992,9 @@ def _detect_memo_capacity() -> int:
     return entries if entries >= 0 else _DEFAULT_DETECT_MEMO_ENTRIES
 
 
+_MemoKey = tuple[str, str, bytes]
+
+
 class _DetectionMemo:
     """Bounded, thread-safe LRU of content-detection verdicts (CRA-1001).
 
@@ -1002,25 +1006,37 @@ class _DetectionMemo:
     degrades badly on a contended host, which pushed ``content_router`` past
     the 30 s compression budget.
 
-    Keys are ``(route, sha256(probe))``: exact for the bytes, and partitioned
-    by route so a verdict from the native detector is never served once the
-    process has degraded to the regex detector (or vice versa). Only verdicts
-    the route produced on its normal path are stored — a panic/timeout
-    fallback is recomputed next time, exactly as without the memo. Hits return
-    a copy so a caller mutating ``metadata`` cannot poison the entry.
+    Keys are ``(scope, route, sha256(probe))``: exact for the bytes, and
+    partitioned by route so a verdict from the native detector is never served
+    once the process has degraded to the regex detector (or vice versa). Only
+    verdicts the route produced on its normal path are stored — a
+    panic/timeout fallback is recomputed next time, exactly as without the
+    memo. Hits return a copy so a caller mutating ``metadata`` cannot poison
+    the entry.
+
+    ``scope`` isolates tenants that share one process. A plain proxy or a
+    single-lease transport uses the process-wide scope ``""``. A transport
+    pool serves several leases from one process, where a fast hit would tell
+    one lease that another sent the same bytes; the pool binds each lease's
+    work to its own scope (:func:`detection_memo_scope`), drops the scope's
+    entries when the lease ends (:func:`release_detection_memo_scope`), and
+    sets ``scope_required`` so that detection run outside any lease scope
+    bypasses the memo instead of falling back to the shared scope. All scopes
+    share the one entry bound.
     """
 
     def __init__(self) -> None:
-        self._entries: OrderedDict[tuple[str, bytes], DetectionResult] = OrderedDict()
+        self._entries: OrderedDict[_MemoKey, DetectionResult] = OrderedDict()
         self._lock = threading.Lock()
+        self.scope_required = False
 
     @staticmethod
-    def key(route: str, probe: str) -> tuple[str, bytes]:
+    def key(scope: str, route: str, probe: str) -> _MemoKey:
         # surrogatepass: tool output decoded from JSON can carry lone
         # surrogates; the encoding stays injective, so the key stays exact.
-        return route, hashlib.sha256(probe.encode("utf-8", "surrogatepass")).digest()
+        return scope, route, hashlib.sha256(probe.encode("utf-8", "surrogatepass")).digest()
 
-    def get(self, key: tuple[str, bytes]) -> DetectionResult | None:
+    def get(self, key: _MemoKey) -> DetectionResult | None:
         with self._lock:
             hit = self._entries.get(key)
             if hit is None:
@@ -1028,13 +1044,25 @@ class _DetectionMemo:
             self._entries.move_to_end(key)
         return replace(hit, metadata=deepcopy(hit.metadata))
 
-    def put(self, key: tuple[str, bytes], result: DetectionResult, capacity: int) -> None:
+    def put(self, key: _MemoKey, result: DetectionResult, capacity: int) -> None:
         stored = replace(result, metadata=deepcopy(result.metadata))
         with self._lock:
             self._entries[key] = stored
             self._entries.move_to_end(key)
             while len(self._entries) > capacity:
                 self._entries.popitem(last=False)
+
+    def release(self, scope: str) -> int:
+        """Drop every entry of ``scope``; returns how many were held."""
+        with self._lock:
+            doomed = [key for key in self._entries if key[0] == scope]
+            for key in doomed:
+                del self._entries[key]
+        return len(doomed)
+
+    def scope_size(self, scope: str) -> int:
+        with self._lock:
+            return sum(1 for key in self._entries if key[0] == scope)
 
     def clear(self) -> None:
         with self._lock:
@@ -1046,10 +1074,43 @@ class _DetectionMemo:
 
 
 _detection_memo = _DetectionMemo()
+# The tenant whose work is running on this thread; ``None`` outside any scope.
+# Router worker threads run under ``copy_context()``, so the scope follows a
+# request into its parallel compressions and detect watchdogs.
+_detection_memo_scope: ContextVar[str | None] = ContextVar(
+    "headroom_detection_memo_scope", default=None
+)
+
+
+@contextmanager
+def detection_memo_scope(scope: str) -> Iterator[None]:
+    """Run the enclosed detection under ``scope``'s own memo partition."""
+    if not scope:
+        raise ValueError("a detection memo scope must be a non-empty string")
+    token = _detection_memo_scope.set(scope)
+    try:
+        yield
+    finally:
+        _detection_memo_scope.reset(token)
+
+
+def release_detection_memo_scope(scope: str) -> int:
+    """Drop ``scope``'s memoized verdicts (its tenant ended); returns the count."""
+    return _detection_memo.release(scope)
+
+
+def require_detection_memo_scope() -> None:
+    """Serve memo hits only inside a :func:`detection_memo_scope` from now on.
+
+    For processes that serve several isolated tenants (the transport pool):
+    detection outside any tenant's scope is computed without the memo rather
+    than sharing a process-wide partition between tenants.
+    """
+    _detection_memo.scope_required = True
 
 
 def _detect_content(content: str) -> DetectionResult:
-    """Detect content type, memoized per exact probe bytes and detector route.
+    """Detect content type, memoized per scope, exact probe bytes and route.
 
     See :class:`_DetectionMemo` for why (CRA-1001) and why it is exact; the
     detection itself is :func:`_detect_content_uncached`.
@@ -1058,11 +1119,12 @@ def _detect_content(content: str) -> DetectionResult:
     # the whole result misclassified as HTML/XML (#route-converter corruption).
     probe = _strip_detection_envelope(content)
     capacity = _detect_memo_capacity()
-    if not capacity:
+    scope = _detection_memo_scope.get()
+    if not capacity or (scope is None and _detection_memo.scope_required):
         return _detect_content_uncached(probe)[0]
     backend = _resolve_detect_backend()
     route = "regex" if backend == "python" or _detect_native_unhealthy else "native"
-    key = _DetectionMemo.key(route, probe)
+    key = _DetectionMemo.key(scope or "", route, probe)
     cached = _detection_memo.get(key)
     if cached is not None:
         return cached

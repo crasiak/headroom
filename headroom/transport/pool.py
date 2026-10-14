@@ -484,10 +484,22 @@ class _LeaseProxy:
     quarantine the lease for good; its slot stays held regardless. Past the
     cap, a lease whose every slot is held by a stuck worker still fails fast
     rather than waiting its whole budget for a slot that cannot come free.
+
+    ``lease_id`` scopes the router's content-detection memo: every compression
+    job of this lease runs inside its own memo partition, so a memo hit can
+    never tell one lease that another sent the same bytes (CRA-1001, CRA-970).
     """
 
-    def __init__(self, engine: Any, client: httpx.AsyncClient, concurrency: int) -> None:
+    def __init__(
+        self,
+        engine: Any,
+        client: httpx.AsyncClient,
+        concurrency: int,
+        *,
+        lease_id: str | None = None,
+    ) -> None:
         self._engine = engine
+        self._lease_id = lease_id
         self.http_client = client
         self.http_client_h1 = client
         self._compression_slots = asyncio.Semaphore(concurrency)
@@ -553,7 +565,14 @@ class _LeaseProxy:
                     raise _AbandonedCompression
                 job.started = True
             try:
-                return fn()
+                from headroom.transforms.content_router import detection_memo_scope
+
+                if self._lease_id is None:
+                    # Unscoped: the pool's engine requires a scope, so the
+                    # detection memo is bypassed rather than shared.
+                    return fn()
+                with detection_memo_scope(self._lease_id):
+                    return fn()
             finally:
                 worker_finished()
 
@@ -727,7 +746,12 @@ class _PoolLease:
             )
             client = pool.new_http_client()
             replay = LeaseReplayState(pool.engine.config)
-            proxy = _LeaseProxy(pool.engine, client, pool.lease_compression_concurrency)
+            proxy = _LeaseProxy(
+                pool.engine,
+                client,
+                pool.lease_compression_concurrency,
+                lease_id=lease.lease_id,
+            )
             drain = _ConnectionDrain()
             context = LeaseContext(lease.lease_id, request, writer)
             boundary = _TransportBoundaryMiddleware(
@@ -835,6 +859,13 @@ class _PoolLease:
                 held = replay.clear()
                 if diagnostics is not None:
                     diagnostics.emit("replay_state_released", **held)
+            if lease_id is not None:
+                # So are the lease's memoized detection verdicts.
+                from headroom.transforms.content_router import release_detection_memo_scope
+
+                entries = release_detection_memo_scope(lease_id)
+                if diagnostics is not None:
+                    diagnostics.emit("detection_memo_released", entries=entries)
             if client is not None:
                 with suppress(Exception):
                     await client.aclose()
@@ -939,6 +970,12 @@ class TransportPool:
         if not hasattr(self.engine, "_compression_engine_quarantine"):
             raise RuntimeError("pool engine cannot scope the compression quarantine")
         self.engine._compression_engine_quarantine = False
+        # The router's detection memo is content-keyed; leases may not share
+        # it (a hit is a timing signal). Each lease binds its own scope around
+        # its compressions; detection outside any lease scope skips the memo.
+        from headroom.transforms.content_router import require_detection_memo_scope
+
+        require_detection_memo_scope()
         self._client_options = _provider_httpx_client_options(config, build_httpx_verify())
 
     def new_http_client(self) -> httpx.AsyncClient:
