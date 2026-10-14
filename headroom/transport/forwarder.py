@@ -16,10 +16,17 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, StreamingResponse
 from starlette.types import Message, Receive, Scope, Send
 
+from headroom.cache.prefix_tracker import _strip_cache_control, normalize_message_cache_control
 from headroom.proxy.helpers import COMPRESSION_TIMEOUT_SECONDS, read_request_json_with_bytes
 from headroom.proxy.outcome import RequestOutcome
 
 from .protocol import AcquireRequest, ReceiptWriter
+from .replay import MAX_CAPTURED_RESPONSE_BYTES, LeaseReplayState, ReplayTurn, parse_response
+
+# The route kind of Claude's /v1/messages. A single-lease transport serves it
+# through the proxy app; a pooled lease, whose upstream must come from its own
+# binding rather than the app's process-wide upstream, forwards it here.
+ANTHROPIC_MESSAGES = "anthropic_messages"
 
 
 class _FinalizingResponse(StreamingResponse):
@@ -61,6 +68,12 @@ def route(binding: AcquireRequest, request: Request) -> tuple[str, str] | None:
         and path == "/v1/messages/count_tokens"
     ):
         return path, "metadata"
+    if (
+        binding.account.provider_mode == "anthropic_oauth_passthrough"
+        and request.method == "POST"
+        and path == "/v1/messages"
+    ):
+        return path, ANTHROPIC_MESSAGES
     if binding.account.provider_mode.startswith("openai_"):
         if request.method == "GET" and path in {"/models", "/v1/models"}:
             return "/models", "metadata"
@@ -93,13 +106,22 @@ async def forward(
     writer: ReceiptWriter,
     proxy: Any,
     request: Request,
+    replay: LeaseReplayState | None = None,
 ) -> JSONResponse | StreamingResponse:
+    """Compress and forward one request on its binding.
+
+    With ``replay`` (a pooled lease's own conversation state), Claude's
+    /v1/messages is compressed as the proxy app's token-mode handler does it:
+    cached compressions swapped in, the previous turn's forwarded prefix
+    replayed over drift, and the turn recorded after the response.
+    """
     selected = route(binding, request)
     if selected is None:
         await writer.record_rejection(reason="unsupported_transport_route", bypass=False)
         return JSONResponse({"error": "unsupported_transport_route"}, status_code=404)
     suffix, model = selected
     metadata = model == "metadata"
+    anthropic_messages = model == ANTHROPIC_MESSAGES
     started = time.monotonic()
     request_id = await proxy._next_request_id()
     try:
@@ -143,6 +165,12 @@ async def forward(
             ]
             pipeline = proxy.openai_pipeline
         else:
+            if binding.account.provider_mode == "anthropic_oauth_passthrough":
+                # Claude's /v1/messages names its model in the body.
+                requested_model = body.get("model")
+                if not isinstance(requested_model, str) or not requested_model:
+                    raise ValueError("missing model")
+                model = requested_model
             requested_messages = body.get("messages")
             if not isinstance(requested_messages, list) or not requested_messages:
                 raise ValueError("missing messages")
@@ -156,11 +184,32 @@ async def forward(
     before = after = 0
     transforms: tuple[str, ...] = ()
     outbound = original
+    turn: ReplayTurn | None = None
+    forwarded_messages: list[dict[str, Any]] = []
     try:
-        if messages:
+        if messages and anthropic_messages and replay is not None:
+            pristine = copy.deepcopy(messages)
+            turn, forwarded_messages, before, after, transforms = await _compress_with_replay(
+                replay, proxy, pipeline, request, body, messages, model, request_id
+            )
+            if forwarded_messages != pristine:
+                changed = copy.deepcopy(body)
+                changed["messages"] = forwarded_messages
+                outbound = json.dumps(changed, ensure_ascii=False, separators=(",", ":")).encode()
+            else:
+                after = before
+        elif messages:
+            # Claude moves its cache breakpoint to the newest block every turn,
+            # and the router never compresses a block that carries one. Left in
+            # place, each block would go uncompressed on its first turn and
+            # compressed on the next, rewriting the cached prefix every turn.
+            # Compress the content without breakpoints and put the client's
+            # breakpoints back afterwards, so each block is forwarded the same
+            # way on every turn.
+            compression_input = _strip_cache_control(messages) if anthropic_messages else messages
             result = await proxy._run_compression_in_executor(
                 lambda: pipeline.apply(
-                    messages=copy.deepcopy(messages),
+                    messages=copy.deepcopy(compression_input),
                     model=model,
                     model_limit=200_000,
                     request_id=request_id,
@@ -171,7 +220,7 @@ async def forward(
             before, after = result.tokens_before, result.tokens_after
             if before < 0 or after < 0:
                 raise ValueError("invalid compression accounting")
-            if after <= before and result.messages != messages:
+            if after <= before and result.messages != compression_input:
                 changed = copy.deepcopy(body)
                 if binding.account.provider_mode.startswith("openai_"):
                     if len(result.messages) != len(slots):
@@ -180,6 +229,10 @@ async def forward(
                         if not isinstance(message.get("content"), str):
                             raise ValueError("compression changed output shape")
                         changed["input"][index]["output"] = message["content"]
+                elif anthropic_messages:
+                    changed["messages"] = normalize_message_cache_control(
+                        result.messages, None, client_messages=messages
+                    )
                 else:
                     changed["messages"] = result.messages
                 outbound = json.dumps(changed, ensure_ascii=False, separators=(",", ":")).encode()
@@ -227,6 +280,7 @@ async def forward(
         return JSONResponse({"error": "upstream_redirect_forbidden"}, status_code=502)
 
     completed = False
+    captured: bytearray | None = bytearray() if turn is not None else None
     terminal_line = b""
     terminal_line_overflow = False
     terminal_event = False
@@ -264,6 +318,21 @@ async def forward(
             finalized = True
             try:
                 await upstream.aclose()
+                if (
+                    turn is not None
+                    and replay is not None
+                    and captured is not None
+                    and completed
+                    and 200 <= upstream.status_code < 300
+                ):
+                    replay.record_response(
+                        turn,
+                        forwarded=forwarded_messages,
+                        original=messages,
+                        response=parse_response(
+                            bytes(captured), upstream.headers.get("content-type", ""), proxy
+                        ),
+                    )
             finally:
                 await writer.record(
                     RequestOutcome(
@@ -283,9 +352,15 @@ async def forward(
                 )
 
     async def stream_bytes() -> AsyncIterator[bytes]:
-        nonlocal completed
+        nonlocal completed, captured
         try:
             async for chunk in upstream.aiter_raw():
+                if captured is not None:
+                    if len(captured) + len(chunk) <= MAX_CAPTURED_RESPONSE_BYTES:
+                        captured.extend(chunk)
+                    else:
+                        # Too large to record; the previous turn's state stays.
+                        captured = None
                 yield chunk
             completed = True
         finally:
@@ -303,3 +378,88 @@ async def forward(
         finalize=finalize,
         on_body_sent=on_body_sent,
     )
+
+
+async def _compress_with_replay(
+    replay: LeaseReplayState,
+    proxy: Any,
+    pipeline: Any,
+    request: Request,
+    body: dict[str, Any],
+    messages: list[dict[str, Any]],
+    model: str,
+    request_id: str,
+) -> tuple[ReplayTurn, list[dict[str, Any]], int, int, tuple[str, ...]]:
+    """Token-mode compression of Claude's messages, mirroring the app handler.
+
+    The same steps, in the same order, as the proxy's Anthropic token-mode
+    path: prepare_turn (cached compressions in, provider-confirmed prefix
+    frozen), the pipeline with the same arguments, the compression cache
+    update, finalize_turn (previous forwarded prefix replayed over drift), the
+    inflation guard, and the client's breakpoints re-placed.
+    """
+
+    from headroom.agent_savings import proxy_pipeline_kwargs
+    from headroom.proxy.auth_mode import classify_auth_mode
+    from headroom.proxy.handlers.anthropic import _strip_streaming_only_content_fields
+    from headroom.proxy.session_engine import (
+        FREEZE_POLICY_CONFIRMED_CLAMP,
+        finalize_turn,
+        prepare_turn,
+    )
+    from headroom.transforms.cold_prefix import anthropic_cache_ttl_seconds
+    from headroom.transforms.compression_policy import resolve_policy
+    from headroom.utils import extract_user_query
+
+    # As the app handler: canonicalize in place before anything is tracked.
+    _strip_streaming_only_content_fields(messages)
+    client_messages = copy.deepcopy(messages)
+    turn = replay.begin(request, model, body, client_messages)
+    confirmed_frozen = max(int(turn.frozen_message_count or 0), 0)
+    prep = prepare_turn(
+        turn.compression_cache,
+        messages,
+        policy=FREEZE_POLICY_CONFIRMED_CLAMP,
+        tracker_frozen=turn.frozen_message_count,
+    )
+    working = prep.pipeline_input
+    context_limit = proxy.anthropic_provider.get_context_limit(model)
+    compression_policy = resolve_policy(classify_auth_mode(request.headers))
+    cache_ttl = anthropic_cache_ttl_seconds(model, client_messages, body.get("system"))
+    result = await proxy._run_compression_in_executor(
+        lambda: pipeline.apply(
+            messages=working,
+            model=model,
+            model_limit=context_limit,
+            context=extract_user_query(working),
+            frozen_message_count=prep.frozen_message_count,
+            prefix_replay_guaranteed=True,
+            idle_seconds=turn.idle_seconds,
+            biases=None,
+            request_id=request_id,
+            compression_policy=compression_policy,
+            cache_ttl_seconds=cache_ttl,
+            **proxy_pipeline_kwargs(proxy.config),
+        ),
+        timeout=COMPRESSION_TIMEOUT_SECONDS,
+    )
+    if result.messages != working:
+        turn.compression_cache.update_from_result(messages, result.messages)
+    before, after = result.tokens_before, result.tokens_after
+    if before < 0 or after < 0:
+        raise ValueError("invalid compression accounting")
+    final = finalize_turn(
+        result.messages,
+        client_messages,
+        turn.previous_original,
+        turn.previous_forwarded,
+        confirmed_frozen_count=confirmed_frozen,
+    )
+    forwarded = final.messages
+    if after > before and not final.replayed:
+        # The app handler's inflation guard: never forward a larger form.
+        forwarded, after = client_messages, before
+    forwarded = normalize_message_cache_control(
+        forwarded, turn.previous_forwarded, client_messages=client_messages
+    )
+    return turn, forwarded, before, after, tuple(result.transforms_applied)
