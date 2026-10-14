@@ -217,14 +217,17 @@ def test_replay_state_is_per_lease_and_released_with_it(tmp_path) -> None:
 
         first.release()
         assert first.ended()
-        released = [
-            event
-            for event in first.diagnostics.remaining()
-            if event["event"] == "replay_state_released"
-        ]
+        events = list(first.diagnostics.remaining())
+        released = [event for event in events if event["event"] == "replay_state_released"]
         assert len(released) == 1
         assert released[0]["sessions"] == 1
         assert released[0]["trackers"] >= 1
+        # The lease's detection-memo partition (CRA-1001) ends with it too.
+        memo_released = [event for event in events if event["event"] == "detection_memo_released"]
+        assert len(memo_released) == 1
+        # Its compressions detected content under its own scope, and the
+        # release dropped those verdicts (no lease ever shares the partition).
+        assert memo_released[0]["entries"] >= 1
 
         second.control.close()
         assert second.ended()

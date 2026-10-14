@@ -45,9 +45,12 @@ import re
 import sys
 import threading
 import time
-from collections.abc import Callable
+from collections import OrderedDict
+from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from contextvars import ContextVar, copy_context
+from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any
@@ -969,8 +972,175 @@ def _strip_detection_envelope(content: str) -> str:
     return content
 
 
+_DETECT_MEMO_ENTRIES_ENV = "HEADROOM_DETECT_MEMO_ENTRIES"
+_DEFAULT_DETECT_MEMO_ENTRIES = 4096
+
+
+def _detect_memo_capacity() -> int:
+    """Entry bound for the detection memo; ``0`` disables it.
+
+    Override with ``HEADROOM_DETECT_MEMO_ENTRIES``; blank, non-numeric, or
+    negative values fall back to the default.
+    """
+    raw = os.environ.get(_DETECT_MEMO_ENTRIES_ENV, "").strip()
+    if not raw:
+        return _DEFAULT_DETECT_MEMO_ENTRIES
+    try:
+        entries = int(raw)
+    except ValueError:
+        return _DEFAULT_DETECT_MEMO_ENTRIES
+    return entries if entries >= 0 else _DEFAULT_DETECT_MEMO_ENTRIES
+
+
+_MemoKey = tuple[str, str, bytes]
+
+
+class _DetectionMemo:
+    """Bounded, thread-safe LRU of content-detection verdicts (CRA-1001).
+
+    Detection is a pure function of the probed bytes and the detector route,
+    but the native route runs a Magika ONNX inference per call. ``apply`` runs
+    it for every eligible message on every turn, *before* the compression
+    cache is consulted, so a long conversation re-detected its whole history
+    each turn even when every message was a cache hit — and ORT inference
+    degrades badly on a contended host, which pushed ``content_router`` past
+    the 30 s compression budget.
+
+    Keys are ``(scope, route, sha256(probe))``: exact for the bytes, and
+    partitioned by route so a verdict from the native detector is never served
+    once the process has degraded to the regex detector (or vice versa). Only
+    verdicts the route produced on its normal path are stored — a
+    panic/timeout fallback is recomputed next time, exactly as without the
+    memo. Hits return a copy so a caller mutating ``metadata`` cannot poison
+    the entry.
+
+    ``scope`` isolates tenants that share one process. A plain proxy or a
+    single-lease transport uses the process-wide scope ``""``. A transport
+    pool serves several leases from one process, where a fast hit would tell
+    one lease that another sent the same bytes; the pool binds each lease's
+    work to its own scope (:func:`detection_memo_scope`), drops the scope's
+    entries when the lease ends (:func:`release_detection_memo_scope`), and
+    sets ``scope_required`` so that detection run outside any lease scope
+    bypasses the memo instead of falling back to the shared scope. All scopes
+    share the one entry bound.
+    """
+
+    def __init__(self) -> None:
+        self._entries: OrderedDict[_MemoKey, DetectionResult] = OrderedDict()
+        self._lock = threading.Lock()
+        self.scope_required = False
+
+    @staticmethod
+    def key(scope: str, route: str, probe: str) -> _MemoKey:
+        # surrogatepass: tool output decoded from JSON can carry lone
+        # surrogates; the encoding stays injective, so the key stays exact.
+        return scope, route, hashlib.sha256(probe.encode("utf-8", "surrogatepass")).digest()
+
+    def get(self, key: _MemoKey) -> DetectionResult | None:
+        with self._lock:
+            hit = self._entries.get(key)
+            if hit is None:
+                return None
+            self._entries.move_to_end(key)
+        return replace(hit, metadata=deepcopy(hit.metadata))
+
+    def put(self, key: _MemoKey, result: DetectionResult, capacity: int) -> None:
+        stored = replace(result, metadata=deepcopy(result.metadata))
+        with self._lock:
+            self._entries[key] = stored
+            self._entries.move_to_end(key)
+            while len(self._entries) > capacity:
+                self._entries.popitem(last=False)
+
+    def release(self, scope: str) -> int:
+        """Drop every entry of ``scope``; returns how many were held."""
+        with self._lock:
+            doomed = [key for key in self._entries if key[0] == scope]
+            for key in doomed:
+                del self._entries[key]
+        return len(doomed)
+
+    def scope_size(self, scope: str) -> int:
+        with self._lock:
+            return sum(1 for key in self._entries if key[0] == scope)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._entries.clear()
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._entries)
+
+
+_detection_memo = _DetectionMemo()
+# The tenant whose work is running on this thread; ``None`` outside any scope.
+# Router worker threads run under ``copy_context()``, so the scope follows a
+# request into its parallel compressions and detect watchdogs.
+_detection_memo_scope: ContextVar[str | None] = ContextVar(
+    "headroom_detection_memo_scope", default=None
+)
+
+
+@contextmanager
+def detection_memo_scope(scope: str) -> Iterator[None]:
+    """Run the enclosed detection under ``scope``'s own memo partition."""
+    if not scope:
+        raise ValueError("a detection memo scope must be a non-empty string")
+    token = _detection_memo_scope.set(scope)
+    try:
+        yield
+    finally:
+        _detection_memo_scope.reset(token)
+
+
+def release_detection_memo_scope(scope: str) -> int:
+    """Drop ``scope``'s memoized verdicts (its tenant ended); returns the count."""
+    return _detection_memo.release(scope)
+
+
+def require_detection_memo_scope() -> None:
+    """Serve memo hits only inside a :func:`detection_memo_scope` from now on.
+
+    For processes that serve several isolated tenants (the transport pool):
+    detection outside any tenant's scope is computed without the memo rather
+    than sharing a process-wide partition between tenants.
+    """
+    _detection_memo.scope_required = True
+
+
 def _detect_content(content: str) -> DetectionResult:
+    """Detect content type, memoized per scope, exact probe bytes and route.
+
+    See :class:`_DetectionMemo` for why (CRA-1001) and why it is exact; the
+    detection itself is :func:`_detect_content_uncached`.
+    """
+    # Detect on the unwrapped payload so a tool-output envelope's tags don't get
+    # the whole result misclassified as HTML/XML (#route-converter corruption).
+    probe = _strip_detection_envelope(content)
+    capacity = _detect_memo_capacity()
+    scope = _detection_memo_scope.get()
+    if not capacity or (scope is None and _detection_memo.scope_required):
+        return _detect_content_uncached(probe)[0]
+    backend = _resolve_detect_backend()
+    route = "regex" if backend == "python" or _detect_native_unhealthy else "native"
+    key = _DetectionMemo.key(scope or "", route, probe)
+    cached = _detection_memo.get(key)
+    if cached is not None:
+        return cached
+    result, memoizable = _detect_content_uncached(probe)
+    if memoizable:
+        _detection_memo.put(key, result, capacity)
+    return result
+
+
+def _detect_content_uncached(content: str) -> tuple[DetectionResult, bool]:
     """Detect content type via the native chain, with a safe Windows default.
+
+    ``content`` is the probe, already stripped of any tool-output envelope.
+    Returns ``(result, memoizable)``: ``memoizable`` is False when the result
+    came from a degrade path (native failure, hang, or an ORT preflight that
+    just tripped the circuit breaker), so the memo never pins a fallback.
 
     Stage-3d (PR5) wired this through `headroom._core.detect_content_type`,
     which runs the magika→unidiff→PlainText chain. On Windows, native Magika
@@ -986,10 +1156,6 @@ def _detect_content(content: str) -> DetectionResult:
     """
     global _detect_backend_warned, _detect_panic_warned, _detect_native_unhealthy
 
-    # Detect on the unwrapped payload so a tool-output envelope's tags don't get
-    # the whole result misclassified as HTML/XML (#route-converter corruption).
-    content = _strip_detection_envelope(content)
-
     backend = _resolve_detect_backend()
     if backend == "python":
         if not _detect_backend_warned:
@@ -999,13 +1165,13 @@ def _detect_content(content: str) -> DetectionResult:
                 "(native Magika/ONNX detector is unsafe by default on Windows; "
                 "override with HEADROOM_DETECT_BACKEND=rust)."
             )
-        return _regex_detect_content_type(content)
+        return _regex_detect_content_type(content), True
 
     if _detect_native_unhealthy:
         # Circuit breaker (#575): the native detector hung once under the
         # watchdog; every later call would wait the full budget and strand
         # another stuck daemon thread, so route straight to pure-Python.
-        return _regex_detect_content_type(content)
+        return _regex_detect_content_type(content), True
 
     # fastembed enables ort's API-24 feature. Entering the native initializer
     # with an older pip ONNX Runtime does not raise: ort recursively re-enters
@@ -1019,7 +1185,7 @@ def _detect_content(content: str) -> DetectionResult:
             "Native content detection requires ONNX Runtime 1.24+; "
             "using pure-Python detection for this process."
         )
-        return _regex_detect_content_type(content)
+        return _regex_detect_content_type(content), False
 
     from headroom._core import detect_content_type as _rust_detect
 
@@ -1063,7 +1229,7 @@ def _detect_content(content: str) -> DetectionResult:
                 "Native content detector failed (%s); falling back to pure-Python detection.",
                 type(exc).__name__,
             )
-        return _regex_detect_content_type(content)
+        return _regex_detect_content_type(content), False
 
     # HTML misroute guard (native/magika path): dense punctuation in grep
     # output and build logs (file paths, </>, brackets) can read as markup, so
@@ -1075,7 +1241,7 @@ def _detect_content(content: str) -> DetectionResult:
     if content_type is ContentType.HTML:
         override = _try_detect_log(content) or _try_detect_search(content)
         if override is not None:
-            return override
+            return override, True
 
     # Config misroute guard (native/magika path): magika classifies YAML/TOML/
     # INI as SourceCode, which routes to the (default-disabled) code path and
@@ -1084,16 +1250,19 @@ def _detect_content(content: str) -> DetectionResult:
     if content_type is ContentType.SOURCE_CODE:
         config_override = _try_detect_structured_config(content)
         if config_override is not None and config_override.confidence >= 0.7:
-            return config_override
+            return config_override, True
 
     if content_type is ContentType.PLAIN_TEXT:
         regex_result = _regex_detect_content_type(content)
         if regex_result.content_type is not ContentType.PLAIN_TEXT:
-            return regex_result
-    return DetectionResult(
-        content_type=content_type,
-        confidence=rust_result.confidence,
-        metadata={},
+            return regex_result, True
+    return (
+        DetectionResult(
+            content_type=content_type,
+            confidence=rust_result.confidence,
+            metadata={},
+        ),
+        True,
     )
 
 

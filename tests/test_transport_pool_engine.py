@@ -455,3 +455,64 @@ async def test_slots_held_by_live_work_still_make_a_lease_wait(pool) -> None:
         assert await asyncio.gather(*holders) == ["late", "late"]
     finally:
         live.gate.set()
+
+
+async def test_leases_never_share_the_detection_memo(pool, monkeypatch) -> None:
+    """CRA-1001 / CRA-970: the router's content-keyed detection memo is per lease.
+
+    A memo hit is fast, so a shared memo would tell one lease that another sent
+    the same bytes. Each lease's compressions run in that lease's own memo
+    scope; work outside any lease scope skips the memo.
+    """
+    import headroom._ort as ort_runtime
+    from headroom.transforms import content_router as cr
+
+    calls = {"n": 0}
+
+    def native(content):
+        calls["n"] += 1
+        return SimpleNamespace(content_type="text", confidence=0.9)
+
+    monkeypatch.setenv("HEADROOM_DETECT_BACKEND", "rust")
+    monkeypatch.setattr(ort_runtime, "rust_ort_runtime_compatible", lambda: True)
+    monkeypatch.setattr(cr, "_detect_native_unhealthy", False)
+    monkeypatch.setattr("headroom._core.detect_content_type", native)
+
+    pool.build_engine()
+    assert cr._detection_memo.scope_required is True
+    first = _LeaseProxy(pool.engine, None, 2, lease_id="lease-a")  # type: ignore[arg-type]
+    second = _LeaseProxy(pool.engine, None, 2, lease_id="lease-b")  # type: ignore[arg-type]
+    unscoped = _LeaseProxy(pool.engine, client=None, concurrency=2)  # type: ignore[arg-type]
+    messages = [
+        {"role": "tool", "content": f"shared tool output line {i} " * 40, "tool_call_id": f"c{i}"}
+        for i in range(5)
+    ]
+
+    def compress():
+        return pool.engine.openai_pipeline.apply(
+            messages=[dict(m) for m in messages],
+            model="gpt-4o",
+            model_limit=200_000,
+            protect_recent=0,
+        ).messages
+
+    out_a = await first._run_compression_in_executor(compress, timeout=30)
+    assert calls["n"] == 5
+    assert await first._run_compression_in_executor(compress, timeout=30) == out_a
+    assert calls["n"] == 5  # lease A's own warm pass hits its memo
+
+    # Lease B's first pass over identical bytes detects; it never hits A's entries.
+    assert await second._run_compression_in_executor(compress, timeout=30) == out_a
+    assert calls["n"] == 10
+    assert cr._detection_memo.scope_size("lease-a") == 5
+    assert cr._detection_memo.scope_size("lease-b") == 5
+
+    # Compression that is not bound to a lease never uses (or fills) the memo.
+    await unscoped._run_compression_in_executor(compress, timeout=30)
+    assert calls["n"] == 15
+    assert cr._detection_memo.scope_size("") == 0
+
+    # A lease's release drops its entries and only its entries.
+    assert cr.release_detection_memo_scope("lease-a") == 5
+    assert cr._detection_memo.scope_size("lease-a") == 0
+    assert cr._detection_memo.scope_size("lease-b") == 5
