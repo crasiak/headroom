@@ -415,6 +415,9 @@ def transport_proxy_config(
         discover_pipeline_extensions=False,
         stateless=True,
         isolated_transport=True,
+        # HTTP/1.1 upstream: on a graceful HTTP/2 GOAWAY httpcore fails every
+        # in-flight stream, including ones the server would still answer.
+        http2=False,
     )
 
 

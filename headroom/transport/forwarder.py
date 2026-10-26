@@ -20,6 +20,7 @@ from headroom.cache.prefix_tracker import _strip_cache_control, normalize_messag
 from headroom.proxy.helpers import COMPRESSION_TIMEOUT_SECONDS, read_request_json_with_bytes
 from headroom.proxy.outcome import RequestOutcome
 
+from .diagnostics import current_request
 from .protocol import AcquireRequest, ReceiptWriter
 from .replay import MAX_CAPTURED_RESPONSE_BYTES, LeaseReplayState, ReplayTurn, parse_response
 
@@ -268,7 +269,10 @@ async def forward(
             stream=True,
             follow_redirects=False,
         )
-    except httpx.HTTPError:
+    except httpx.HTTPError as error:
+        record = current_request.get()
+        if record is not None:
+            record.note_upstream_error(error)
         await writer.record_rejection(reason="upstream_request_error", bypass=False)
         return JSONResponse({"error": "upstream_request_error"}, status_code=502)
 
