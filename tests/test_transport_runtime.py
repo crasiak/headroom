@@ -60,6 +60,20 @@ def test_transport_app_is_stateless_and_has_no_fallback(tmp_path, monkeypatch) -
     assert not (tmp_path / "workspace").exists()
 
 
+def test_transport_upstream_is_http1(tmp_path, monkeypatch) -> None:
+    # Aperture's graceful HTTP/2 GOAWAY makes httpcore fail every in-flight
+    # stream, which the forwarder surfaces as 502 upstream_request_error.
+    from headroom.proxy.server import _provider_httpx_client_options
+
+    monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(tmp_path / "workspace"))
+    monkeypatch.setenv("HEADROOM_HTTP2", "1")
+    request = AcquireRequest.from_dict(_acquire_payload())
+    app = create_transport_app(request, ReceiptWriter(request, lambda record: None), port=49112)
+
+    http2, _ = _provider_httpx_client_options(app.state.proxy.config, True)
+    assert http2 is False
+
+
 def test_transport_app_rejects_caller_bypass_without_reading_body() -> None:
     request = AcquireRequest.from_dict(_acquire_payload())
     records: list[dict] = []

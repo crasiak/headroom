@@ -60,3 +60,49 @@ async def test_model_discovery_is_typed_and_cannot_redirect_outside_binding(redi
             assert records[0]["model"] == "metadata"
             assert records[0]["saved_tokens"] == 0
         assert "unbound.example" not in json.dumps(records)
+
+
+@pytest.mark.asyncio
+async def test_upstream_transport_error_names_its_class_in_diagnostics():
+    from headroom.transport.diagnostics import Diagnostics, current_request
+
+    binding = AcquireRequest.from_dict(mode_payload("openai_oauth_passthrough"))
+    records, events = [], []
+    diagnostics = Diagnostics(run_id=binding.run_id, sink=events.append)
+
+    def respond(request):
+        raise httpx.RemoteProtocolError("SECRET_URL ConnectionTerminated", request=request)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(respond)) as client:
+        proxy = SimpleNamespace(
+            _next_request_id=AsyncMock(return_value="req-goaway"),
+            http_client=client,
+            openai_pipeline=None,
+        )
+        record = diagnostics.begin("openai_models")
+        token = current_request.set(record)
+        try:
+            response = await forward(
+                binding,
+                ReceiptWriter(binding, records.append),
+                proxy,
+                Request(
+                    {
+                        "type": "http",
+                        "method": "GET",
+                        "path": "/models",
+                        "query_string": b"",
+                        "headers": [],
+                    }
+                ),
+            )
+        finally:
+            current_request.reset(token)
+        record.finish("failed")
+
+    assert response.status_code == 502
+    assert records[0]["error_reason"] == "upstream_request_error"
+    terminal = events[-1]
+    assert terminal["stage"] == "failed"
+    assert terminal["upstream_error"] == "RemoteProtocolError"
+    assert "SECRET_URL" not in json.dumps(events)

@@ -83,6 +83,7 @@ class RequestDiagnostic:
         self.started = owner.clock()
         self.last_stage = "accepted"
         self.status: int | None = None
+        self.upstream_error: str | None = None
         self.finished = False
         self.transitions = 0
         if self.request_id is not None:
@@ -90,6 +91,7 @@ class RequestDiagnostic:
             self._emit(None)
 
     def _emit(self, previous: str | None) -> None:
+        extra = {"upstream_error": self.upstream_error} if self.upstream_error else {}
         self.owner.emit(
             "request_stage",
             request_id=self.request_id,
@@ -98,7 +100,12 @@ class RequestDiagnostic:
             previous_stage=previous,
             status=self.status,
             elapsed_ms=max(0, (self.owner.clock() - self.started) * 1000),
+            **extra,
         )
+
+    def note_upstream_error(self, error: BaseException) -> None:
+        # Class name only: exception text can carry upstream URLs.
+        self.upstream_error = type(error).__name__
 
     def stage(self, stage: str, *, status: int | None = None) -> None:
         if stage not in STAGES:
