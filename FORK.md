@@ -24,6 +24,9 @@ undo. After every merge from headroomlabs-ai/headroom, check each item below.
   `npm@12.2.1`, which is the latest release. Bundled copies cannot be overridden.
   Bump the `npm` override once a release ships patched copies.
 - Regenerate lockfiles with Node's own npm (11+). npm below 8.3 ignores `overrides`.
+- After any `plugins/opencode` dependency change, run `npm run build:standalone`
+  and copy `dist-standalone/{entry.opencode.js,hook-shim/handler.js}` into
+  `headroom/providers/opencode/`. CI compares them byte for byte, because the wheel bundles zod.
 
 ## Behaviour
 
