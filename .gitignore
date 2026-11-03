@@ -21,6 +21,8 @@ scripts/*
 !scripts/pr-governance.py
 !scripts/bootstrap-windows-dev.ps1
 !scripts/build_npm_release_assets.mjs
+!scripts/build_security_npm.py
+!scripts/test_security_npm.mjs
 !scripts/build_python_release_smoke.py
 !scripts/release_smoke_all.py
 !scripts/verify_npm_release_assets.mjs
