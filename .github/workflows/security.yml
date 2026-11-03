@@ -70,6 +70,7 @@ jobs:
           - plugins/openclaw
           - plugins/opencode
           - e2e/wrap/tools
+          - e2e/wrap/tools/npm-security
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
@@ -78,6 +79,85 @@ jobs:
       - name: Audit locked dependencies at every severity
         working-directory: ${{ matrix.directory }}
         run: npm audit --package-lock-only --audit-level=low
+
+  # Pure-JS source packaging only: no provider/model calls or runtime rollout.
+  security-npm-bundle:
+    name: Patched npm reproducibility and offline CLI
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: Fetch the integrity-pinned native build toolchain
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import hashlib, json, os, pathlib, tarfile, urllib.request
+          recipe = json.loads(pathlib.Path('e2e/wrap/tools/npm-security/recipe.json').read_text())
+          name = 'node-v24.22.2-linux-x64.tar.gz'
+          archive = pathlib.Path(os.environ['RUNNER_TEMP']) / name
+          with urllib.request.urlopen('https://nodejs.org/dist/v24.22.2/' + name, timeout=60) as response:
+              archive.write_bytes(response.read())
+          assert hashlib.sha256(archive.read_bytes()).hexdigest() == recipe['node_distributions'][name]
+          with tarfile.open(archive, 'r:gz') as source:
+              source.extractall(archive.parent, filter='data')
+          PY
+      - name: Build twice from clean source and reviewed lock
+        run: |
+          set -euo pipefail
+          tool="$RUNNER_TEMP/node-v24.22.2-linux-x64"
+          for attempt in first second; do
+            python scripts/build_security_npm.py \
+              --work-dir "$RUNNER_TEMP/npm-build-$attempt" \
+              --output-dir "$RUNNER_TEMP/npm-dist-$attempt" \
+              --node "$tool/bin/node" \
+              --npm-cli "$tool/lib/node_modules/npm/bin/npm-cli.js" \
+              --node-distribution "$RUNNER_TEMP/node-v24.22.2-linux-x64.tar.gz"
+          done
+          cmp "$RUNNER_TEMP/npm-dist-first/npm-12.2.1-crasiak.1.tgz" \
+              "$RUNNER_TEMP/npm-dist-second/npm-12.2.1-crasiak.1.tgz"
+          sha256sum "$RUNNER_TEMP/npm-dist-first/npm-12.2.1-crasiak.1.tgz"
+          python - "$RUNNER_TEMP/npm-dist-first/artifact.json" <<'PY'
+          import json, pathlib, sys
+          actual = json.loads(pathlib.Path(sys.argv[1]).read_text())
+          expected = json.loads(pathlib.Path('e2e/wrap/tools/npm-security/artifact.json').read_text())
+          # Actual bootstrap archive differs by platform; shipped bytes must not.
+          for field in ('sha256', 'integrity', 'builder_sha256', 'recipe_sha256', 'lock_sha256'):
+              assert actual[field] == expected[field], f'canonical artifact mismatch: {field}'
+          PY
+      - name: Materialize packed artifact and exercise offline CLI consumers
+        run: |
+          set -euo pipefail
+          tool="$RUNNER_TEMP/node-v24.22.2-linux-x64"
+          consumer="$RUNNER_TEMP/npm-consumer"
+          mkdir -p "$consumer" "$RUNNER_TEMP/npm-smoke-home"
+          python - "$consumer" "$RUNNER_TEMP/npm-dist-first/npm-12.2.1-crasiak.1.tgz" <<'PY'
+          import json, pathlib, sys
+          (pathlib.Path(sys.argv[1]) / 'package.json').write_text(json.dumps({
+              'name': 'security-npm-smoke', 'version': '1.0.0', 'private': True,
+              'dependencies': {'npm': 'file:' + sys.argv[2]}
+          }))
+          PY
+          touch "$consumer/user.npmrc" "$consumer/global.npmrc"
+          env -i PATH="$tool/bin:/usr/bin:/bin" HOME="$RUNNER_TEMP/npm-smoke-home" \
+            NPM_CONFIG_USERCONFIG="$consumer/user.npmrc" \
+            NPM_CONFIG_GLOBALCONFIG="$consumer/global.npmrc" \
+            "$tool/bin/node" "$tool/lib/node_modules/npm/bin/npm-cli.js" \
+            install --prefix "$consumer" --ignore-scripts --offline --no-audit --no-fund
+          env -i PATH="$tool/bin:/usr/bin:/bin" HOME="$RUNNER_TEMP/npm-smoke-home" \
+            NPM_CONFIG_USERCONFIG="$consumer/user.npmrc" \
+            NPM_CONFIG_GLOBALCONFIG="$consumer/global.npmrc" \
+            SECURITY_NPM_PACKAGE="$consumer/node_modules/npm" \
+            SECURITY_NPM_LOCK="$GITHUB_WORKSPACE/e2e/wrap/tools/npm-security/package-lock.json" \
+            "$tool/bin/node" --test scripts/test_security_npm.mjs
+      - uses: actions/upload-artifact@v7
+        with:
+          name: cra-1534-npm-source-artifact
+          path: |
+            ${{ runner.temp }}/npm-dist-first/npm-12.2.1-crasiak.1.tgz
+            ${{ runner.temp }}/npm-dist-first/artifact.json
 
   # ---- SAST: CodeQL static analysis ------------------------------------
   codeql:
