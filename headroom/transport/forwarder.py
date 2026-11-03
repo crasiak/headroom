@@ -36,20 +36,33 @@ class _FinalizingResponse(StreamingResponse):
         *args: Any,
         finalize: Callable[[], Awaitable[None]],
         on_body_sent: Callable[[bytes], None] | None = None,
+        on_disconnect: Callable[[], None] | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(*args, **kwargs)
         self.finalize = finalize
         self.on_body_sent = on_body_sent
+        self.on_disconnect = on_disconnect
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        async def tracked_receive() -> Message:
+            message = await receive()
+            if message["type"] == "http.disconnect" and self.on_disconnect:
+                self.on_disconnect()
+            return message
+
         async def tracked_send(message: Message) -> None:
-            await send(message)
+            try:
+                await send(message)
+            except OSError:
+                if self.on_disconnect:
+                    self.on_disconnect()
+                raise
             if self.on_body_sent and message["type"] == "http.response.body":
                 self.on_body_sent(message.get("body", b""))
 
         try:
-            await super().__call__(scope, receive, tracked_send)
+            await super().__call__(scope, tracked_receive, tracked_send)
         finally:
             # Disconnect can happen before the response iterator starts.
             await asyncio.shield(self.finalize())
@@ -284,7 +297,14 @@ async def forward(
         return JSONResponse({"error": "upstream_redirect_forbidden"}, status_code=502)
 
     completed = False
+    client_disconnected = False
+    upstream_read_failed = False
     captured: bytearray | None = bytearray() if turn is not None else None
+
+    def on_disconnect() -> None:
+        nonlocal client_disconnected
+        client_disconnected = True
+
     terminal_line = b""
     terminal_line_overflow = False
     terminal_event = False
@@ -353,10 +373,19 @@ async def forward(
                         status_code=upstream.status_code if completed else 499,
                     ),
                     request_kind="metadata" if metadata else "inference",
+                    metadata_client_cancelled=(
+                        metadata
+                        and suffix == "/models"
+                        and binding.account.provider_mode.startswith("openai_")
+                        and 200 <= upstream.status_code < 300
+                        and not completed
+                        and client_disconnected
+                        and not upstream_read_failed
+                    ),
                 )
 
     async def stream_bytes() -> AsyncIterator[bytes]:
-        nonlocal completed, captured
+        nonlocal completed, captured, upstream_read_failed
         try:
             async for chunk in upstream.aiter_raw():
                 if captured is not None:
@@ -367,6 +396,9 @@ async def forward(
                         captured = None
                 yield chunk
             completed = True
+        except Exception:
+            upstream_read_failed = True
+            raise
         finally:
             await asyncio.shield(finalize())
 
@@ -381,6 +413,7 @@ async def forward(
         headers=response_headers,
         finalize=finalize,
         on_body_sent=on_body_sent,
+        on_disconnect=on_disconnect,
     )
 
 

@@ -684,9 +684,27 @@ class ReceiptWriter:
     def cursor(self) -> int:
         return self._cursor
 
-    async def record(self, outcome: RequestOutcome, *, request_kind: str = "inference") -> None:
+    async def record(
+        self,
+        outcome: RequestOutcome,
+        *,
+        request_kind: str = "inference",
+        metadata_client_cancelled: bool = False,
+    ) -> None:
         if request_kind not in {"inference", "metadata"}:
             raise ValueError("invalid transport request kind")
+        # Only the forwarder's observed downstream-disconnect path supplies this
+        # provenance. A generic 499 (including an upstream HTTP 499) is ambiguous.
+        if metadata_client_cancelled and not (
+            request_kind == "metadata"
+            and self._request.account.provider_mode.startswith("openai_")
+            and outcome.model == "metadata"
+            and outcome.status_code == 499
+            and not outcome.from_response_cache
+            and outcome.original_tokens == outcome.optimized_tokens == outcome.tokens_saved == 0
+            and not outcome.transforms_applied
+        ):
+            raise ValueError("invalid metadata cancellation evidence")
         async with self._lock:
             self._cursor += 1
             ended = self._now_factory().astimezone(timezone.utc)
@@ -721,9 +739,11 @@ class ReceiptWriter:
                 "saved_tokens": outcome.tokens_saved,
                 "transforms": list(outcome.transforms_applied),
                 "bypass_reason": bypass_reason,
-                "error_reason": f"upstream_status_{outcome.status_code}"
-                if outcome.status_code >= 400
-                else None,
+                "error_reason": "metadata_client_cancelled"
+                if metadata_client_cancelled
+                else (
+                    f"upstream_status_{outcome.status_code}" if outcome.status_code >= 400 else None
+                ),
             }
             if request_kind == "metadata":
                 record["request_kind"] = "metadata"
