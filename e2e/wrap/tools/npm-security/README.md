@@ -94,7 +94,18 @@ from the complete audited build lock.
 
 ## Publication and retirement
 
-Publish a qualified, content-hashed prerelease artifact on **crasiak/headroom**,
+The qualified source component is `23deae961c662919ce90db6302d38ec0102975a6`;
+public prerelease `npm-security-cra-1534-1` ships the canonical bytes in
+`artifact.json`. Native macOS and exact-source Linux clean rebuilds matched.
+This does not qualify consumer/global-image behavior by itself.
+
+Consumers must also declare the complete npm-scoped override profile: installed
+packages do not export their own root overrides to another project's resolver.
+The outer profile must describe the shipped glob14/minimatch11/ip-address10/
+undici6 graph; ordinary undici8 stays outside that subtree. Materialize a full
+lock, then test frozen `ci`, not just lock-only resolution.
+
+For future versions, publish a qualified, content-hashed prerelease on **crasiak/headroom**,
 with source revision and the external manifest. Never replace an existing asset
 under the same fork version. Consumers pin its integrity; source publication is
 not runtime adoption. Keep repository credentials out of artifacts and fixtures.
@@ -104,6 +115,7 @@ release's actual packed copies clear all audits and pass the same compatibility
 and materialized-inventory checks. Upstream issue closure alone is not proof.
 
 Python is a separate approved support change: this fork now requires **>=3.11**
-for patched filelock >=4.2.1, alongside LiteLLM >=1.101.3 security constraints.
+for patched filelock >=4.2.1, alongside LiteLLM >=1.101.3 security floors in both
+pip/wheel dependency metadata and the canonical uv constraints/lock.
 No vulnerable Python 3.10 marker fallback is permitted. The existing conservative
 static-analysis dialect and native ABI floor do not grant Python 3.10 support.

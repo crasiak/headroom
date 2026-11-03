@@ -5,10 +5,18 @@
   "description": "Locked CLI dependencies for the Docker wrap E2E harness",
   "dependencies": {
     "@openai/codex": "0.153.4",
-    "openclaw": "2026.10.7"
+    "openclaw": "2026.10.7",
+    "npm": "https://github.com/crasiak/headroom/releases/download/npm-security-cra-1534-1/npm-12.2.1-crasiak.1.tgz"
   },
   "overrides": {
-    "npm": "12.2.1",
+    "npm": {
+      ".": "$npm",
+      "glob": "14.0.3",
+      "minimatch": "11.0.4",
+      "ip-address": "10.7.5",
+      "undici": "6.29.1"
+    },
+    "minimatch": "11.0.4",
     "undici": "8.12.3",
     "zod": "4.6.7"
   }

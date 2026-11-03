@@ -51,8 +51,12 @@ dependencies = [
     # Model registry, pricing and non-core providers; all lazily imported and
     # ImportError-guarded. 1.96.2 is the first litellm with prebuilt wheels for
     # Python 3.10-3.14 on Linux, macOS and Windows: older releases either reject
-    # Python 3.14 (GH #956) or fall back to a Rust source build.
-    "litellm>=1.96.2,<2.0",
+    # Python 3.14 (GH #956) or fall back to a Rust source build. CRA-1534 raises
+    # that historical wheel floor to the CVE-2026-114612 security fix.
+    "litellm>=1.101.3,<2.0",
+    # Also enforce this transitive cache-lock floor in wheel/pip metadata, not
+    # only tool.uv constraints (CVE-2026-112909/112910; Python >=3.11).
+    "filelock>=4.2.1",
     "click>=8.3.3",               # CLI framework; PYSEC-2026-2132 fix (command injection in click.edit())
     "rich>=13.0.0",               # Rich terminal output
     "opentelemetry-api>=1.24.0",  # Safe no-op OTEL API for instrumentation
@@ -293,7 +297,7 @@ dev = [
     "pre-commit>=3.0.0",
     "openai>=1.0.0",
     "anthropic>=0.18.0",
-    "litellm>=1.96.2,<2.0",       # see core deps note
+    "litellm>=1.101.3,<2.0",      # see core deps security/wheel note
     "fastapi>=0.100.0",
     "uvicorn>=0.23.0,<1.0",
     "httpx[http2]>=0.24.0",

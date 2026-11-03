@@ -7,7 +7,9 @@ undo. After every merge from headroomlabs-ai/headroom, check each item below.
 
 - CRA-1534 intentionally raises this personal fork's Python minimum to **3.11**
   for patched `filelock>=4.2.1` (CVE-2026-112909/112910), with
-  `litellm>=1.101.3` (CVE-2026-114612). Do not restore vulnerable 3.10 marker
+  `litellm>=1.101.3` (CVE-2026-114612). Floors are enforced in wheel/pip
+  `Requires-Dist` as well as the canonical uv lock; tool.uv alone does not
+  constrain a pip install into an existing environment. Do not restore vulnerable 3.10 marker
   fallbacks. Existing static-analysis dialect/native ABI floors are not support
   promises. Preserve the explicit fork distinction in installation docs.
 - `[tool.uv] constraint-dependencies` in `pyproject.toml` is the record. On a
@@ -23,8 +25,11 @@ undo. After every merge from headroomlabs-ai/headroom, check each item below.
 
 - `plugins/opencode/package.json` `overrides`: `zod`, `toml`. `@opencode-ai/plugin`
   pins vulnerable versions (zod 4.1.8, toml via effect).
-- `e2e/wrap/tools/package.json` `overrides`: `npm`, `undici`, `zod`. openclaw pins
-  vulnerable versions.
+- `e2e/wrap/tools/package.json` keeps the explicit npm artifact dependency,
+  `$npm` reference and the complete npm-scoped glob/minimatch/ip-address/undici
+  profile. Installed dependency overrides are not inherited by consumers; frozen
+  `ci` needs the outer profile too. Keep ordinary minimatch/undici/zod overrides
+  separate from npm's undici6 subtree; OpenClaw's own pins are vulnerable.
 - CRA-1534's candidate [npm security distribution](e2e/wrap/tools/npm-security/README.md)
   rebuilds the npm 12.2.1 payload from verified upstream code and a separately
   audited complete lock; downstream overrides cannot fix bundled copies.

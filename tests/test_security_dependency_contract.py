@@ -1,5 +1,6 @@
 """CRA-1534: shipping locks must enforce the approved security/support floors."""
 
+import json
 from pathlib import Path
 
 import pytest
@@ -38,6 +39,22 @@ def test_security_constraints_exclude_unpatched_versions(
     assert fixed in constraints[name].specifier
 
 
+@pytest.mark.parametrize(
+    ("name", "vulnerable", "fixed"),
+    [("filelock", "4.2.0", "4.2.1"), ("litellm", "1.101.0", "1.101.3")],
+)
+def test_shipping_metadata_enforces_floors_even_when_installed_without_uv(
+    name: str, vulnerable: str, fixed: str
+) -> None:
+    data = tomllib.loads((ROOT / "pyproject.toml").read_text())
+    requirements = [Requirement(value) for value in data["project"]["dependencies"]]
+    matching = [requirement for requirement in requirements if requirement.name == name]
+    assert matching, f"pip metadata lacks the security floor for {name}"
+    for requirement in matching:
+        assert vulnerable not in requirement.specifier
+        assert fixed in requirement.specifier
+
+
 @pytest.mark.parametrize(("name", "floor"), [("filelock", "4.2.1"), ("litellm", "1.101.3")])
 def test_frozen_lock_contains_only_patched_target_versions(name: str, floor: str) -> None:
     lock = tomllib.loads((ROOT / "uv.lock").read_text())
@@ -46,6 +63,41 @@ def test_frozen_lock_contains_only_patched_target_versions(name: str, floor: str
     versions = [Version(pkg["version"]) for pkg in lock["package"] if pkg["name"] == name]
     assert versions
     assert all(version >= Version(floor) for version in versions)
+
+
+def test_wrap_consumer_keeps_cli_pins_and_scopes_complete_npm_rebuild() -> None:
+    directory = ROOT / "e2e/wrap/tools"
+    manifest = json.loads((directory / "package.json").read_text())
+    recipe = json.loads((directory / "npm-security/recipe.json").read_text())
+    artifact = json.loads((directory / "npm-security/artifact.json").read_text())
+    assert manifest["dependencies"]["@openai/codex"] == "0.153.4"
+    assert manifest["dependencies"]["openclaw"] == "2026.10.7"
+    url = manifest["dependencies"]["npm"]
+    assert url.startswith("https://github.com/crasiak/headroom/releases/download/")
+    assert url.endswith("/" + artifact["filename"])
+    assert manifest["overrides"]["npm"] == {".": "$npm", **recipe["security_versions"]}
+    assert manifest["overrides"]["minimatch"] == recipe["security_versions"]["minimatch"]
+    assert manifest["overrides"]["undici"] == "8.12.3"
+    assert manifest["overrides"]["zod"] == "4.6.7"
+
+
+def test_wrap_lock_enumerates_every_packed_npm_dependency_and_binds_integrity() -> None:
+    directory = ROOT / "e2e/wrap/tools"
+    manifest = json.loads((directory / "package.json").read_text())
+    consumer = json.loads((directory / "package-lock.json").read_text())["packages"]
+    artifact = json.loads((directory / "npm-security/artifact.json").read_text())
+    audited = json.loads((directory / "npm-security/package-lock.json").read_text())["packages"]
+    installed = consumer["node_modules/npm"]
+    assert installed["version"] == artifact["version"]
+    assert installed["resolved"] == manifest["dependencies"]["npm"]
+    assert installed["integrity"] == artifact["integrity"]
+    expected = {name: package["version"] for name, package in audited.items() if name}
+    actual = {
+        name.removeprefix("node_modules/npm/"): package["version"]
+        for name, package in consumer.items()
+        if name.startswith("node_modules/npm/")
+    }
+    assert actual == expected
 
 
 def test_security_workflow_audits_every_maintained_npm_lock() -> None:

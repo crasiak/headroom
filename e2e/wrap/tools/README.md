@@ -1,37 +1,68 @@
 # Wrap E2E CLI dependencies
 
-The Docker harness installs Codex and OpenClaw here using npm 11.16.0 and
-`npm ci`. Keep the manifest and lockfile together: pinning only the CLI versions
-still lets transitive dependency ranges change on every image build. That broke
-main during an AWS SDK publication on 2026-09-09 (ETARGET and tarball 404).
+Codex **0.153.4** and OpenClaw **2026.10.7** remain pinned. CRA-1534 adds the
+qualified **npm 12.2.1-crasiak.1** source artifact and keeps manifest/lock together.
+The image uses the same verified npm distribution globally and in `/opt/wrap-tools`.
+No installed user npm, Headroom runtime or report scheduler is changed by this source.
 
-The image installs into `/opt/wrap-tools` and exposes `node_modules/.bin` on
-PATH. `npm ci` does not support global installs, so diagnostics must also use
-`npm list --prefix /opt/wrap-tools`.
+[Build recipe, provenance, full inventory and audit contract](npm-security/README.md).
+The public prerelease is on `crasiak/headroom`, tag `npm-security-cra-1534-1`,
+source component `23deae961c662919ce90db6302d38ec0102975a6`. The lock pins its
+actual SRI; `npm-security/artifact.json` pins SHA256 and source/build identities.
+Never replace existing asset bytes under the same version.
 
-After editing a CLI version in `package.json`, regenerate the lockfile using
-Node 22 and npm 11.16.0 on Linux:
+## Why the overrides are scoped
+
+npm's bundled copies cannot be fixed by ordinary consumer overrides. Its artifact
+is rebuilt first, with glob14/minimatch11 and patched ip-address/undici. Because
+nested dependencies still declare their upstream ranges, the consumer's `npm`
+override must preserve the **complete scoped security profile** from the recipe,
+including the `.` reference to `$npm`. Without it, frozen `ci` correctly rejects
+missing old glob13 requirements. An artifact-root override alone is insufficient.
+
+OpenClaw's ordinary minimatch copy also moves to11.0.4. Its ordinary undici8.12.3
+and zod4.6.7 overrides remain separate: do not force undici8 into npm's6.x subtree.
+Glob/minimatch APIs changed across majors; qualification must cover actual
+workspaces, install/ci/list/pack and the local plugin, not merely audit output.
+
+## Installation and qualification
+
+Use Node **24.22.2** for exact-source reproduction; the pinned OpenClaw needs
+>=24.22.1 on the24.x line. npm12's remote policy is kept intact. The image's `ci`
+opts in with **`--allow-remote=root`** for the single explicit, integrity-bound npm
+artifact URL. It does not allow arbitrary transitive URLs or bypass script policy.
 
 ```sh
-cd e2e/wrap/tools
-npm install --package-lock-only --no-fund --no-audit
-npm ci --no-fund --no-audit
-cd ../../..
-docker build -f e2e/wrap/Dockerfile -t headroom-wrap-e2e .
-docker run --rm headroom-wrap-e2e
+npm ci --allow-remote=root --no-fund --no-audit
+npm list --prefix /opt/wrap-tools --depth=0 @openai/codex openclaw npm
 ```
 
-To intentionally refresh transitive versions without changing the pinned CLI
-versions, use `npm update --package-lock-only --no-fund --no-audit` in this
-directory instead of `npm install --package-lock-only`, then run the same
-installation and Docker checks above.
+`npm ci` is local, not global. The Docker build checks both actual npm inventories
+against the separately audited complete build lock. Wrap/plugin/image behavior
+still requires the real isolated fake-provider E2E; offline CLI fixtures alone
+are not that evidence. No real provider/model call is needed.
 
-Review the lockfile diff and justify dependency changes in the PR. A lockfile
-fixes resolution and checks package integrity; it cannot make the npm registry
-available during an outage. Do not delete the lockfile or add fallback installs
-to make a build pass.
+## Lock maintenance
 
-These are existing test tools, not new product dependencies. Codex is maintained
-by OpenAI; OpenClaw and its transitive dependencies retain their upstream
-maintainers. Their install surface includes registry downloads, native optional
-packages and lifecycle scripts, as before. Top-level CLI versions are unchanged.
+Keep the reviewed lock in source; do not delete or trim entries to conceal audit
+findings. Use the verified Node24.22.2/npm11.19.1 bootstrap in an owned disposable
+HOME/config/cache to maintain metadata, then qualify with the **actual patched
+npm12 CLI**. The bootstrap and runtime need not have the same version; their
+identities and roles are recorded rather than silently substituted.
+
+`--package-lock-only` can retain stale bundled entries or omit them completely.
+Materialize the artifact with lifecycle scripts disabled first, ensure every
+bundled node is enumerated in the saved lock, and require the full inventory to
+equal the independent build lock. Then run frozen `ci` with the patched CLI and
+assert the lock does not change. A lock-only zero count is not full audit coverage.
+
+Review the complete diff, preserve every existing floor/override and run all
+**six** maintained all-severity npm audits. Do not use forced repair, omit-dev,
+ignore lists, reduced severity or fallback installers. The image retains normal
+reviewed install lifecycle behavior; controlled host qualification disables hooks.
+
+The lock fixes resolution and checks content integrity; it cannot make GitHub or
+the registry available during an outage. These remain existing test tools with
+upstream licenses; jws owns the patched npm source artifact's maintenance until
+an upstream bundle passes the same packed/installed inventory and compatibility
+gates. Source publication is not merge, runtime activation or report recovery.
