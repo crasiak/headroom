@@ -52,3 +52,12 @@ undo. After every merge from headroomlabs-ai/headroom, check each item below.
   streams, which surfaced as 502 `upstream_request_error`. Upstream defaults to HTTP/2.
 - `headroom/transport/forwarder.py` records the upstream exception class as
   `upstream_error` on the request's terminal diagnostic event.
+- CRA-1489: cancelled OpenAI model-list delivery has explicit receipt provenance.
+  An observed ASGI downstream disconnect/send `OSError` after upstream 2xx headers,
+  before completion and without an observed upstream read error, emits
+  `error_reason: metadata_client_cancelled`. The receipt stays **failed** with
+  evaluated, zero-token metadata accounting and no bypass. Generic HTTP 499,
+  upstream errors, inference/token-counting interruption and shutdown cancellation
+  do not get that marker. Ledger separately decides whether that precise optional
+  failure may coexist with successful inference; older consumers reject it safely.
+  Preserve `tests/test_transport_metadata_cancellation.py` when merging upstream.
