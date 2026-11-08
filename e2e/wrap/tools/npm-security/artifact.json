@@ -1,0 +1,27 @@
+{
+  "filename": "npm-12.2.1-crasiak.1.tgz",
+  "version": "12.2.1-crasiak.1",
+  "sha256": "1a254c2a4bee70163b29675aead78abbbfd1f756021689729c9625ec7feeb28e",
+  "integrity": "sha512-2ijAZDxyNEjq3jjTToqieLc1f3mOAkAIoCGdHwBJGRzQFAakwPI4re8kx90G0H8cImdWpg7Ly8IXnpNeKG+SXQ==",
+  "recipe_sha256": "1c732369ea11f3da46d3ef75d2a69a6e2d1c41376e01e407308fc6c953363345",
+  "builder_sha256": "73cb7cf175ed31d164dd4d6f3968694e9ce4b5188dd4f67b007ebb48f528ad8f",
+  "lock_sha256": "e603e16cc0ce515c27075f9b20e3fe9fce45a46b6c65ace924c5963da78c2cce",
+  "upstream_revision": "ae98c62586b6fea44114f72e249e246a2981de70",
+  "node": "v24.22.2",
+  "bootstrap_npm": "11.19.1",
+  "node_distribution_sha256": "aa9549349e47dffaa42dcf95d6e06ade8c4bdafc980979883b88767670df385a",
+  "packed_security_versions": {
+    "glob": [
+      "14.0.3"
+    ],
+    "minimatch": [
+      "11.0.4"
+    ],
+    "ip-address": [
+      "10.7.5"
+    ],
+    "undici": [
+      "6.29.1"
+    ]
+  }
+}
