@@ -5,6 +5,13 @@ undo. After every merge from headroomlabs-ai/headroom, check each item below.
 
 ## Security floors (Python)
 
+- CRA-1534 intentionally raises this personal fork's Python minimum to **3.11**
+  for patched `filelock>=4.2.1` (CVE-2026-112909/112910), with
+  `litellm>=1.101.3` (CVE-2026-114612). Floors are enforced in wheel/pip
+  `Requires-Dist` as well as the canonical uv lock; tool.uv alone does not
+  constrain a pip install into an existing environment. Do not restore vulnerable 3.10 marker
+  fallbacks. Existing static-analysis dialect/native ABI floors are not support
+  promises. Preserve the explicit fork distinction in installation docs.
 - `[tool.uv] constraint-dependencies` in `pyproject.toml` is the record. On a
   conflict, keep the **union** of both lists, with the higher floor for each package.
 - Never resolve a `uv.lock` conflict by taking upstream's file. Take either side,
@@ -18,11 +25,21 @@ undo. After every merge from headroomlabs-ai/headroom, check each item below.
 
 - `plugins/opencode/package.json` `overrides`: `zod`, `toml`. `@opencode-ai/plugin`
   pins vulnerable versions (zod 4.1.8, toml via effect).
-- `e2e/wrap/tools/package.json` `overrides`: `npm`, `undici`, `zod`. openclaw pins
-  vulnerable versions.
-- Known residual (2026-10-26): `undici` and `ip-address` **bundled inside**
-  `npm@12.2.1`, which is the latest release. Bundled copies cannot be overridden.
-  Bump the `npm` override once a release ships patched copies.
+- `e2e/wrap/tools/package.json` keeps the explicit npm artifact dependency,
+  `$npm` reference and the complete npm-scoped glob/minimatch/ip-address/undici
+  profile. Installed dependency overrides are not inherited by consumers; frozen
+  `ci` needs the outer profile too. Keep ordinary minimatch/undici/zod overrides
+  separate from npm's undici6 subtree; OpenClaw's own pins are vulnerable.
+- CRA-1534's candidate [npm security distribution](e2e/wrap/tools/npm-security/README.md)
+  rebuilds the npm 12.2.1 payload from verified upstream code and a separately
+  audited complete lock; downstream overrides cannot fix bundled copies.
+  Preserve its recipe, integrity, honest fork version, licenses, full-inventory
+  checks and offline CLI regressions. Keep the OpenClaw/Codex pins and ordinary
+  undici/zod overrides. Do not force minimatch 11 under glob 13: matcher APIs changed.
+  Source publication/CI qualification is not installed-runtime adoption.
+- Official npm 12.2.1 still bundles vulnerable copies; retire the local
+  distribution only after inspecting and qualifying a genuinely patched upstream
+  release. A closed upstream issue or a lock-only audit count is not sufficient.
 - Regenerate lockfiles with Node's own npm (11+). npm below 8.3 ignores `overrides`.
 - After any `plugins/opencode` dependency change, run `npm run build:standalone`
   and copy `dist-standalone/{entry.opencode.js,hook-shim/handler.js}` into

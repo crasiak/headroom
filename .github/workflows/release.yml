@@ -198,9 +198,10 @@ jobs:
           name: release-assets
           path: release-assets/
 
-  # Cross-platform wheel matrix. Each entry produces wheels for cp310/11/12/13
-  # in one maturin invocation (PyO3 ABI3 forward-compat handles 3.14+ until
-  # we bump pyo3 past 0.22). The `headroom-ai` wheel contains the entire
+  # Cross-platform wheel matrix. The personal fork supports Python 3.11+ (CRA-1534).
+  # Retain the native ABI floor; build with 3.11/12/13, not unsupported 3.10.
+  # PyO3 ABI3 forward-compat handles 3.14+ until
+  # we bump pyo3 past 0.22. The `headroom-ai` wheel contains the entire
   # Python source under `headroom/` plus the compiled `headroom/_core.so`
   # — one atomic install via `pip install headroom-ai`.
   build-wheels:
@@ -286,7 +287,7 @@ jobs:
         uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
-          args: --release --out dist --interpreter python3.10 python3.11 python3.12 python3.13
+          args: --release --out dist --interpreter python3.11 python3.12 python3.13
           manylinux: ${{ matrix.manylinux }}
           # No before-script-linux needed: the rustls-everywhere refactor
           # (PR #371) switched fastembed to `hf-hub-rustls-tls` +

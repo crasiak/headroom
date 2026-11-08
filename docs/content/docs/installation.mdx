@@ -15,8 +15,9 @@ description: Install Headroom via pip, npm, or Docker. Includes all Python extra
 
 ## Python
 
-Headroom requires **Python 3.10+** and is published as `headroom-ai` on PyPI.
-Release wheels are built for CPython **3.10 through 3.13** on Linux
+This personal fork requires **Python 3.11+** (CRA-1534: patched filelock requires
+3.11). Upstream `headroom-ai` PyPI metadata may differ.
+Fork release wheels are built with CPython **3.11 through 3.13** on Linux
 (manylinux_2_28 x86_64 / aarch64), macOS (Apple Silicon and Intel), and
 Windows x86_64. The Rust extension uses the CPython stable ABI, so those wheels
 are forward-compatible with newer supported CPython versions; optional
@@ -309,7 +310,7 @@ These are common issues faced during initial setup and how to resolve them.
 
 ### Python version error
 
-This project requires **Python 3.10+**.
+This personal fork requires **Python 3.11+**; Python 3.10 is intentionally unsupported.
 
 Check your version:
 

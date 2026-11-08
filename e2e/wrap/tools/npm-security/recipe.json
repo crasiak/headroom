@@ -1,0 +1,23 @@
+{
+  "tracker": "CRA-1534",
+  "upstream_version": "12.2.1",
+  "upstream_revision": "ae98c62586b6fea44114f72e249e246a2981de70",
+  "upstream_url": "https://registry.npmjs.org/npm/-/npm-12.2.1.tgz",
+  "upstream_integrity": "sha512-bKCmFRVT/BB+YPEYbZwQ1XUI3N5t4xKSpU1MxOjo7z3iWzKBJ0ZXRC1xFdEN+TC7N5TdywaBzf2dMXGJq/e2PQ==",
+  "version": "12.2.1-crasiak.1",
+  "node": "v24.22.2",
+  "bootstrap_npm": "11.19.1",
+  "node_distributions": {
+    "node-v24.22.2-darwin-arm64.tar.gz": "aa9549349e47dffaa42dcf95d6e06ade8c4bdafc980979883b88767670df385a",
+    "node-v24.22.2-linux-arm64.tar.gz": "95c264150aceb7f3437a29fd6984924f5f8d1511ea3cbd6c508b83f6c555dae2",
+    "node-v24.22.2-linux-x64.tar.gz": "361718c444e49af2ca5a110c83ba6a8901143f23ab285ebbef0341f391f482a9"
+  },
+  "install_strategy": "nested",
+  "security_versions": {
+    "glob": "14.0.3",
+    "minimatch": "11.0.4",
+    "ip-address": "10.7.5",
+    "undici": "6.29.1"
+  },
+  "lock_sha256": "e603e16cc0ce515c27075f9b20e3fe9fce45a46b6c65ace924c5963da78c2cce"
+}

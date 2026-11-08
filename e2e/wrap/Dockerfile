@@ -69,8 +69,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
 
-# OpenClaw 2026.9.3 requires Node >=24.16.0 (or >=26.1.0). Install the
-# Node 24 LTS line alongside Python 3.11. Also install git for packages
+# Pinned OpenClaw 2026.10.7 requires Node >=24.22.1 <25 (or >=26.12.1).
+# Install the Node 24 LTS line alongside Python 3.11. Also install git for packages
 # that clone at install time.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
@@ -82,16 +82,46 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends nodejs && \
     rm -rf /var/lib/apt/lists/*
 
-# npm 10.9.8 crashes in Arborist's peer-set resolver when installing the local
-# OpenClaw plugin (Cannot read properties of null, reading 'edgesOut'). Pin the
-# tested npm version so both wrap-e2e callers use the same working installer.
-RUN npm install -g --no-fund --no-audit npm@11.16.0
+# CRA-1534: use the same qualified distribution globally and inside wrap-tools.
+# Verify public artifact bytes before installing; no user runtime is changed.
+COPY e2e/wrap/tools/npm-security/artifact.json /tmp/cra1534-npm-artifact.json
+COPY e2e/wrap/tools/npm-security/package-lock.json /tmp/cra1534-npm-lock.json
+COPY scripts/test_security_npm.mjs /tmp/cra1534-test-security-npm.mjs
+RUN python - <<'PY'
+import base64
+import hashlib
+import json
+from pathlib import Path
+import urllib.request
+metadata = json.loads(Path('/tmp/cra1534-npm-artifact.json').read_text())
+url = 'https://github.com/crasiak/headroom/releases/download/npm-security-cra-1534-1/' + metadata['filename']
+with urllib.request.urlopen(url, timeout=60) as response:
+    payload = response.read(32 * 1024 * 1024 + 1)
+if len(payload) > 32 * 1024 * 1024:
+    raise SystemExit('npm source artifact exceeds size budget')
+if hashlib.sha256(payload).hexdigest() != metadata['sha256']:
+    raise SystemExit('npm source artifact SHA256 mismatch')
+if 'sha512-' + base64.b64encode(hashlib.sha512(payload).digest()).decode() != metadata['integrity']:
+    raise SystemExit('npm source artifact SRI mismatch')
+with Path('/tmp/cra1534-npm.tgz').open('xb') as output:
+    output.write(payload)
+PY
+RUN npm install -g --ignore-scripts --no-fund --no-audit /tmp/cra1534-npm.tgz && \
+    SECURITY_NPM_PACKAGE="$(npm root -g)/npm" \
+    SECURITY_NPM_LOCK=/tmp/cra1534-npm-lock.json \
+    node --test /tmp/cra1534-test-security-npm.mjs
 
 # Freeze transitive CLI dependencies as well as the top-level versions.
 # Global npm install re-resolves ranges and can select partially published
 # dependency releases; npm ci consumes the reviewed lockfile instead.
 COPY e2e/wrap/tools/package.json e2e/wrap/tools/package-lock.json /opt/wrap-tools/
-RUN npm ci --prefix /opt/wrap-tools --no-fund --no-audit
+# npm12 permits only the explicitly declared root artifact URL, never all remote
+# transitive URLs. Keep normal reviewed image lifecycle behavior; do not bypass
+# npm's script policy. Verify both actual npm copies rather than only the lock.
+RUN npm ci --prefix /opt/wrap-tools --allow-remote=root --no-fund --no-audit && \
+    SECURITY_NPM_PACKAGE=/opt/wrap-tools/node_modules/npm \
+    SECURITY_NPM_LOCK=/tmp/cra1534-npm-lock.json \
+    node --test /tmp/cra1534-test-security-npm.mjs
 
 WORKDIR /workspace
 

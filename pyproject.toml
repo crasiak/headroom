@@ -8,7 +8,7 @@ version = "0.37.0"
 description = "The Context Optimization Layer for LLM Applications - Cut costs by 50-90%"
 readme = "README.md"
 license = "Apache-2.0"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 authors = [
     { name = "Headroom Contributors" }
 ]
@@ -36,7 +36,6 @@ classifiers = [
     "License :: OSI Approved :: Apache Software License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
@@ -52,8 +51,12 @@ dependencies = [
     # Model registry, pricing and non-core providers; all lazily imported and
     # ImportError-guarded. 1.96.2 is the first litellm with prebuilt wheels for
     # Python 3.10-3.14 on Linux, macOS and Windows: older releases either reject
-    # Python 3.14 (GH #956) or fall back to a Rust source build.
-    "litellm>=1.96.2,<2.0",
+    # Python 3.14 (GH #956) or fall back to a Rust source build. CRA-1534 raises
+    # that historical wheel floor to the CVE-2026-114612 security fix.
+    "litellm>=1.101.3,<2.0",
+    # Also enforce this transitive cache-lock floor in wheel/pip metadata, not
+    # only tool.uv constraints (CVE-2026-112909/112910; Python >=3.11).
+    "filelock>=4.2.1",
     "click>=8.3.3",               # CLI framework; PYSEC-2026-2132 fix (command injection in click.edit())
     "rich>=13.0.0",               # Rich terminal output
     "opentelemetry-api>=1.24.0",  # Safe no-op OTEL API for instrumentation
@@ -294,7 +297,7 @@ dev = [
     "pre-commit>=3.0.0",
     "openai>=1.0.0",
     "anthropic>=0.18.0",
-    "litellm>=1.96.2,<2.0",       # see core deps note
+    "litellm>=1.101.3,<2.0",      # see core deps security/wheel note
     "fastapi>=0.100.0",
     "uvicorn>=0.23.0,<1.0",
     "httpx[http2]>=0.24.0",
@@ -369,6 +372,11 @@ Changelog = "https://github.com/headroomlabs-ai/headroom/blob/main/CHANGELOG.md"
 # transitively; the floor pins below ensure uv resolves to patched versions.
 [tool.uv]
 constraint-dependencies = [
+    # CRA-1534: lock-file truncation/Windows ACL fixes require Python >=3.11.
+    # CVE-2026-112909 / CVE-2026-112910; no vulnerable Python 3.10 fallback.
+    "filelock>=4.2.1",
+    # CVE-2026-114612 — LiteLLM proxy privilege escalation; patch-line fix.
+    "litellm>=1.101.3",
     # CVE-2026-63374 / CVE-2026-64847 — TLS hostname and process-pool fixes
     "anyio>=4.14.2",
     # GHSA-5239-wwwm-4pmq (Low) — transitive via rich; fix at 2.20.0
@@ -447,6 +455,7 @@ features = ["extension-module"]
 bindings = "pyo3"
 
 [tool.ruff]
+# Keep the existing conservative static dialect; requires-python governs support.
 target-version = "py310"
 line-length = 100
 
