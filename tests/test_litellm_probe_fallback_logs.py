@@ -110,8 +110,11 @@ def test_cohere_context_limit_probe_failure_is_logged_safely(
 def test_counterfactual_catalog_failure_is_logged_safely(
     monkeypatch: pytest.MonkeyPatch, records: _Records
 ) -> None:
-    broken_catalog = SimpleNamespace(model_cost=SimpleNamespace(get=_failing))
-    monkeypatch.setattr(counterfactual, "_litellm", lambda: broken_catalog)
+    from tests._model_catalog import fake_catalog
+
+    catalog = fake_catalog({"probe-fail-model": {"input_cost_per_token": 1e-6}})
+    monkeypatch.setattr(type(catalog), "is_pricing_resolvable", _failing)
+    monkeypatch.setattr(counterfactual, "load_model_catalog", lambda: catalog)
     counterfactual.resolve_rates.cache_clear()
     try:
         assert counterfactual.resolve_rates("probe-fail-model") is None

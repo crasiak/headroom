@@ -1043,9 +1043,10 @@ def test_savings_tracker_rollup_carries_exact_cache_read_cost_per_provider(tmp_p
     # on "flat-model" at the usual 0.1x. A consumer that backs the read cost
     # out of the discount as "discount / 9" gets flat-model right and
     # steep-model 4.3x too high, so the rollup has to carry the real figure.
-    fake_litellm = SimpleNamespace(
-        cost_per_token=lambda **_: (_ for _ in ()).throw(RuntimeError("unused")),
-        model_cost={
+    from tests._model_catalog import fake_catalog
+
+    catalog = fake_catalog(
+        {
             "steep-model": {
                 "input_cost_per_token": 1e-5,
                 "cache_read_input_token_cost": 2.5e-7,
@@ -1054,10 +1055,9 @@ def test_savings_tracker_rollup_carries_exact_cache_read_cost_per_provider(tmp_p
                 "input_cost_per_token": 2e-6,
                 "cache_read_input_token_cost": 2e-7,
             },
-        },
+        }
     )
-    monkeypatch.setattr(savings_tracker_module, "LITELLM_AVAILABLE", True)
-    monkeypatch.setattr(savings_tracker_module, "litellm", fake_litellm)
+    monkeypatch.setattr(savings_tracker_module, "load_model_catalog", lambda: catalog)
     tracker = SavingsTracker(
         path=str(tmp_path / "proxy_savings.json"),
         max_history_points=100,

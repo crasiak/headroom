@@ -425,30 +425,42 @@ def _catalog_row(model: str) -> tuple[None, str, Mapping[str, Any]] | None:
         static_alias_map,
     )
 
-    catalog = load_model_catalog()
-    if catalog is None:
+    if not isinstance(model, str):
         return None
-    aliases = static_alias_map()
-    resolved = (
-        reduce_to_priced_key(aliases.get(model, model), catalog.pricing_models) if aliases else None
-    )
-    if resolved is None:
-        resolved = resolve_litellm_model_name(model, catalog.is_pricing_resolvable)
-        if not catalog.is_pricing_resolvable(resolved):
-            for pattern, prefix in (
-                ("claude-", "anthropic/"),
-                ("gpt-", "openai/"),
-                ("o1-", "openai/"),
-                ("o3-", "openai/"),
-                ("o4-", "openai/"),
-                ("gemini-", "google/"),
-            ):
-                candidate = prefix + model
-                if model.startswith(pattern) and catalog.is_pricing_resolvable(candidate):
-                    resolved = candidate
-                    break
-    info = catalog.pricing_models.get(resolved)
-    return (None, resolved, info) if info is not None else None
+    try:
+        catalog = load_model_catalog()
+        if catalog is None:
+            return None
+        aliases = static_alias_map()
+        resolved = (
+            reduce_to_priced_key(aliases.get(model, model), catalog.pricing_models)
+            if aliases
+            else None
+        )
+        if resolved is None:
+            resolved = resolve_litellm_model_name(model, catalog.is_pricing_resolvable)
+            if not catalog.is_pricing_resolvable(resolved):
+                for pattern, prefix in (
+                    ("claude-", "anthropic/"),
+                    ("gpt-", "openai/"),
+                    ("o1-", "openai/"),
+                    ("o3-", "openai/"),
+                    ("o4-", "openai/"),
+                    ("gemini-", "google/"),
+                ):
+                    candidate = prefix + model
+                    if model.startswith(pattern) and catalog.is_pricing_resolvable(candidate):
+                        resolved = candidate
+                        break
+        info = catalog.pricing_models.get(resolved)
+        return (None, resolved, info) if info is not None else None
+    except Exception as exc:
+        logger.debug(
+            "counterfactual: pinned catalog lookup failed for %s: %s",
+            safe_id(model),
+            describe_exception(exc),
+        )
+        return None
 
 
 def _billing_catalog_row(model: str) -> tuple[Any, str, dict[str, Any]] | None:
@@ -510,6 +522,8 @@ def resolve_rates(
     Memoized — see :data:`_RATE_CACHE_MAXSIZE`. Tests that swap the snapshot
     (or SDK catalog for billing) must call ``resolve_rates.cache_clear()``.
     """
+    if not isinstance(model, str):
+        return None
     row = _billing_catalog_row(model) if for_billing else _catalog_row(model)
     if row is None:
         return None

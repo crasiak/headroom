@@ -2,6 +2,8 @@
 
 import pytest
 
+from tests._model_catalog import fake_catalog
+
 
 class TestContextLimitCache:
     @pytest.mark.parametrize("metadata_field", ["max_input_tokens", "max_tokens"])
@@ -40,13 +42,15 @@ class TestContextLimitCache:
 
         lookups = []
 
-        def get_model_info(model):
-            lookups.append(model)
-            return {metadata_field: metadata[model]} if model in metadata else None
+        catalog = fake_catalog({name: {metadata_field: limit} for name, limit in metadata.items()})
+        original_context_window = type(catalog).context_window
 
-        monkeypatch.setattr(
-            anthropic_module, "_get_litellm_clients", lambda: (None, get_model_info)
-        )
+        def context_window(self, model):
+            lookups.append(model)
+            return original_context_window(self, model)
+
+        monkeypatch.setattr(type(catalog), "context_window", context_window)
+        monkeypatch.setattr(anthropic_module, "load_model_catalog", lambda: catalog)
         provider = anthropic_module.AnthropicProvider(warn=False)
 
         assert (provider.get_context_limit(first), provider.get_context_limit(second)) == expected
@@ -58,7 +62,7 @@ class TestContextLimitCache:
     def test_configured_aliases_and_1m_suffix_keep_their_limits(self, monkeypatch):
         import headroom.providers.anthropic as anthropic_module
 
-        monkeypatch.setattr(anthropic_module, "_get_litellm_clients", lambda: (None, None))
+        monkeypatch.setattr(anthropic_module, "load_model_catalog", lambda: fake_catalog({}))
         provider = anthropic_module.AnthropicProvider(
             context_limits={"gateway": 64000, "gateway-exact": 96000}, warn=False
         )
@@ -599,7 +603,7 @@ class TestAnthropicCostEstimation:
         """
         import headroom.providers.anthropic as anthropic_module
 
-        monkeypatch.setattr(anthropic_module, "_get_litellm_clients", lambda: (None, None))
+        monkeypatch.setattr(anthropic_module, "load_model_catalog", lambda: fake_catalog({}))
         provider = anthropic_module.AnthropicProvider()
         haiku_default = anthropic_module._PATTERN_DEFAULTS["haiku"]
         assert provider.get_context_limit("claude-haiku-5") == haiku_default["context"]
@@ -626,3 +630,19 @@ class TestAnthropicCostEstimation:
         from headroom.providers.anthropic import _is_release_of
 
         assert _is_release_of(model, known_model) is expected
+
+
+def test_lazy_pricing_wrapper_forwards_timestamp_and_cache_tokens(monkeypatch):
+    from datetime import datetime, timezone
+    from unittest.mock import Mock
+
+    from headroom.pricing import litellm_pricing
+    from headroom.providers import anthropic
+
+    price = Mock(return_value=0.125)
+    monkeypatch.setattr(litellm_pricing, "estimate_cost_from_tokens", price)
+    now = datetime(2026, 11, 27, 17, tzinfo=timezone.utc)
+    assert anthropic.estimate_cost_from_tokens("deepseek-v4-pro", 100, 20, 30, now=now) == 0.125
+    price.assert_called_once_with(
+        "deepseek-v4-pro", input_tokens=100, output_tokens=20, cached_tokens=30, now=now
+    )

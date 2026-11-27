@@ -24,6 +24,15 @@ def haiku_card(monkeypatch):
             "output_cost_per_token_above_100k_tokens": 2.5e-6,
         },
     )
+    from headroom.pricing import counterfactual as cf
+    from headroom.proxy import savings_tracker as st
+    from tests._model_catalog import fake_catalog
+
+    def catalog():
+        return fake_catalog({"claude-haiku-5-5": litellm.model_cost["claude-haiku-5-5"]})
+
+    monkeypatch.setattr(cf, "load_model_catalog", catalog)
+    monkeypatch.setattr(st, "load_model_catalog", catalog)
     resolve_rates.cache_clear()
     long_context_threshold.cache_clear()
     yield

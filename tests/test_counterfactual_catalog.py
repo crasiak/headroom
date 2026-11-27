@@ -126,3 +126,10 @@ def test_snapshot_free_and_unknown_are_distinct(snapshot_only):
     assert rates is not None
     assert rates.price(cf.TokenSplit(read=100, write_5m=100, write_1h=100, uncached=100)) == 0
     assert cf.resolve_rates("not-in-snapshot") is None
+
+
+@pytest.mark.parametrize("model", [None, 42, float("nan"), True])
+def test_non_string_models_are_unpriced_without_resolver_errors(snapshot_only, model):
+    assert cf._catalog_row(model) is None
+    assert cf.resolve_rates(model) is None
+    assert cf.long_context_threshold(model) == cf.LONG_CONTEXT_THRESHOLD_TOKENS

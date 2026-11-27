@@ -132,13 +132,17 @@ def test_public_model_cache_is_bounded(clean_public_model_cache):
 
 def test_public_model_evicted_name_is_recomputed(clean_public_model_cache, monkeypatch):
     calls: list[str] = []
-    real_pin = session.pin_litellm_cost_map_local
+    from dataclasses import replace
 
-    def counting_pin() -> None:
-        calls.append("probe")
-        real_pin()
+    from tests._model_catalog import fake_catalog
 
-    monkeypatch.setattr(session, "pin_litellm_cost_map_local", counting_pin)
+    class CountingPublicModels:
+        def __contains__(self, model):
+            calls.append(model)
+            return False
+
+    catalog = replace(fake_catalog({}), public_models=CountingPublicModels())
+    monkeypatch.setattr(session.model_catalog, "load_model_catalog", lambda: catalog)
 
     cap = session._MODEL_CACHE_MAXSIZE
     session._public_model("seed-model")
@@ -147,7 +151,7 @@ def test_public_model_evicted_name_is_recomputed(clean_public_model_cache, monke
     probes_before = len(calls)
 
     assert session._public_model("seed-model") is None
-    assert len(calls) == probes_before + 1
+    assert len(calls) == probes_before + 3  # exact, slash-stripped, dot-stripped candidates
     assert len(session._model_cache) == cap
 
 

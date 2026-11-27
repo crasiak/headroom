@@ -14,6 +14,7 @@ import pytest
 
 import headroom.proxy.savings_tracker as st
 from headroom.log_safety import WarnOnce
+from tests._model_catalog import fake_catalog
 
 CREDENTIAL_CANARY = "sk-ant-CREDENTIAL-CANARY-91c2"
 
@@ -36,17 +37,13 @@ class _CredentialEchoingPrice:
 
 @pytest.fixture
 def captured(monkeypatch: pytest.MonkeyPatch):
-    class _FakeLiteLLM:
-        model_cost = {"weird-priced-model": {"input_cost_per_token": _CredentialEchoingPrice()}}
-
-        @staticmethod
-        def cost_per_token(**_kwargs):
-            raise Exception(f"This model isn't mapped yet. key={CREDENTIAL_CANARY}")
-
-    monkeypatch.setattr(st, "_get_litellm_module", lambda: _FakeLiteLLM())
+    catalog = fake_catalog(
+        {"weird-priced-model": {"input_cost_per_token": _CredentialEchoingPrice()}}
+    )
+    monkeypatch.setattr(st, "load_model_catalog", lambda: catalog)
     monkeypatch.setattr(st, "_unpriced_models_logged", WarnOnce(256, "test unpriced models"))
     monkeypatch.delenv("HEADROOM_DEBUG_DUMP", raising=False)
-    st._resolve_litellm_model.cache_clear()
+    st._resolve_catalog_model.cache_clear()
     handler = _Capture()
     old_level = st.logger.level
     st.logger.addHandler(handler)
@@ -56,7 +53,7 @@ def captured(monkeypatch: pytest.MonkeyPatch):
     finally:
         st.logger.removeHandler(handler)
         st.logger.setLevel(old_level)
-        st._resolve_litellm_model.cache_clear()
+        st._resolve_catalog_model.cache_clear()
 
 
 def _assert_no_canary(records: list[logging.LogRecord]) -> None:
