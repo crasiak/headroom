@@ -27,7 +27,21 @@ if (process.argv[2] === '--serve') {
   const BUNDLED_FIXES = {
     glob: '14.0.3', minimatch: '11.0.4', undici: '6.29.1', 'ip-address': '10.7.5',
   };
-  const bundlePath = (name) => `node_modules/npm/node_modules/${name}`;
+  // The reproducible fork uses a nested install strategy; a fixed package
+  // may be below its actual consumer rather than flattened at npm's root.
+  const installedBundles = (modules) => fs.readdirSync(modules, { withFileTypes: true }).flatMap((entry) => {
+    if (entry.name === '.bin' || entry.name === '.package-lock.json') return [];
+    assert.equal(entry.isSymbolicLink(), false, `unexpected bundle link: ${entry.name}`);
+    const names = entry.name.startsWith('@')
+      ? fs.readdirSync(path.join(modules, entry.name)).map((name) => path.join(entry.name, name))
+      : [entry.name];
+    return names.flatMap((name) => {
+      const directory = path.join(modules, name);
+      const manifest = JSON.parse(fs.readFileSync(path.join(directory, 'package.json'), 'utf8'));
+      const nested = path.join(directory, 'node_modules');
+      return [{ ...manifest, directory }, ...(fs.existsSync(nested) ? installedBundles(nested) : [])];
+    });
+  });
   const parse = (version) => version.split('.').map(Number);
   const atLeast = (version, floor) => {
     const [a, b] = [parse(version), parse(floor)];
@@ -42,14 +56,13 @@ if (process.argv[2] === '--serve') {
       fs.readFileSync(path.join(process.cwd(), 'npm-audit-exceptions.json'), 'utf8'),
     );
     assert.deepEqual(exceptions.advisories, {}, 'no advisories may be excepted');
+    const bundles = installedBundles(path.join(process.cwd(), 'node_modules', 'npm', 'node_modules'));
     for (const [name, fixed] of Object.entries(BUNDLED_FIXES)) {
-      const manifest = path.join(process.cwd(), 'node_modules', 'npm', 'node_modules', name, 'package.json');
-      const { version } = JSON.parse(fs.readFileSync(manifest, 'utf8'));
-      assert.ok(atLeast(version, fixed), `npm bundles ${name} ${version}, below the fixed ${fixed}`);
-      const excepted = Object.keys(exceptions.advisories).filter(
-        (advisory) => bundlePath(name) in exceptions.advisories[advisory],
-      );
-      assert.deepEqual(excepted, [], `${bundlePath(name)} ${version} carries a fix: drop its exceptions`);
+      const copies = bundles.filter((pkg) => pkg.name === name);
+      assert.ok(copies.length > 0, `npm must include the reviewed ${name} dependency`);
+      for (const { version, directory } of copies) {
+        assert.ok(atLeast(version, fixed), `${directory} is ${version}, below the fixed ${fixed}`);
+      }
     }
   });
 

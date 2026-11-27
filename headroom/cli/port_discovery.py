@@ -381,16 +381,22 @@ def port_option_callback(ctx: click.Context, param: click.Parameter, value: Any)
     return reconcile_default_port(int(value), option_name=option_name)
 
 
-def proxy_port_option(*param_decls: str, help_text: str | None = None) -> Callable[[Any], Any]:
+def proxy_port_option(
+    *param_decls: str,
+    help_text: str | None = None,
+    default_port: int | None = DEFAULT_PROXY_PORT,
+) -> Callable[[Any], Any]:
     """``--port`` option shared by ``wrap`` subcommands.
 
     Defaults to ``HEADROOM_PORT`` (else 8787) and, when left at the default,
     detects a live Headroom proxy on another recorded port (see module docs).
+    Profile-aware callers may pass ``default_port=None`` to resolve their
+    profile first, then reconcile only a legacy (non-profile) default.
     """
     decls = param_decls or ("--port", "-p")
     option: Callable[[Any], Any] = click.option(
         *decls,
-        default=DEFAULT_PROXY_PORT,
+        default=default_port,
         envvar=PORT_ENV,
         show_envvar=False,
         type=click.IntRange(1, 65535),

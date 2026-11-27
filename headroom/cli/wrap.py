@@ -70,7 +70,11 @@ from headroom._version import normalize_release_version as _normalize_release_ve
 from headroom.agent_savings import (
     apply_agent_savings_env_defaults,
 )
-from headroom.cli.port_discovery import proxy_port_option, warn_codex_provider_port_change
+from headroom.cli.port_discovery import (
+    proxy_port_option,
+    reconcile_default_port,
+    warn_codex_provider_port_change,
+)
 from headroom.cli.proxy import ensure_proxy_dependencies
 from headroom.copilot_auth import (
     _API_TOKEN_ENV_VARS,
@@ -363,6 +367,8 @@ def _claude_managed_settings_env(path: Path) -> dict[str, object]:
 
 def _claude_env_layers(
     project_local_settings_path: Path,
+    *,
+    shell_env: Mapping[str, object] | None = None,
 ) -> list[tuple[str, Mapping[str, object]]]:
     """Claude Code's env sources, lowest precedence first.
 
@@ -373,7 +379,7 @@ def _claude_env_layers(
     project = Path.cwd() / ".claude" / "settings.json"
     managed = _claude_managed_settings_path()
     return [
-        ("shell environment", os.environ),
+        ("shell environment", os.environ if shell_env is None else shell_env),
         (str(user), _claude_settings_env(user)),
         (str(project), _claude_settings_env(project)),
         (str(project_local_settings_path), _claude_settings_env(project_local_settings_path)),
@@ -6687,12 +6693,11 @@ def _detect_inbound_anthropic_upstream(port: int) -> str | None:
 @wrap.command(context_settings={"ignore_unknown_options": True})
 @_retired_context_tool_option
 @_serena_instructions_option
-@click.option(
-    # Claude's own -p/--print must fall through to CLAUDE_ARGS.
+# Claude's own -p/--print must fall through to CLAUDE_ARGS.
+@proxy_port_option(
     "--port",
-    default=None,
-    type=click.IntRange(1, 65535),
-    help="Proxy port (default: profile port or 8787)",
+    default_port=None,
+    help_text="Proxy port (default: $HEADROOM_PORT, profile port, or discovered legacy port)",
 )
 @click.option(
     "--no-mcp",
@@ -6826,6 +6831,8 @@ def claude(
 
     resolved = _resolve_claude_profile(flag=profile, bedrock_base_url=bedrock_base_url)
     effective_port = port if port is not None else resolved.port
+    if port is None and resolved.name == "(none)":
+        effective_port = reconcile_default_port(effective_port)
     proxy_holder: list[subprocess.Popen | None] = [None]
     _saved_base_url: list[str | None] = [None]  # previous settings.json value for restore
     _tool_search_not_written = object()
@@ -6839,7 +6846,16 @@ def claude(
     # early proxy-start failure would make the finally raise UnboundLocalError,
     # masking the real error and skipping cleanup(). Mirrors the holders above.
     _wrap_settings_path = Path.cwd() / ".claude" / "settings.local.json"
-    _claude_env_sources = _claude_env_layers(_wrap_settings_path)
+    # Backend preflight must inspect exactly the profile-adjusted shell that
+    # the child will inherit, not an ambient cloud flag that we later scrub.
+    _profile_shell_env = dict(os.environ)
+    _scrub_ambient_bedrock_env(
+        _profile_shell_env,
+        profile_name=resolved.name,
+        bedrock_base_url=resolved.bedrock_base_url,
+    )
+    _profile_shell_env.update(resolved.claude_env)
+    _claude_env_sources = _claude_env_layers(_wrap_settings_path, shell_env=_profile_shell_env)
     _raise_on_claude_auth_conflict(_claude_env_sources)
     # What Claude Code will see, with the source of each value.
     _claude_env = claude_effective_env(*_claude_env_sources)
@@ -8185,12 +8201,9 @@ def _run_codex_wrap(
 @wrap.command(context_settings={"ignore_unknown_options": True})
 @_retired_context_tool_option
 @_serena_instructions_option
-@click.option(
-    "--port",
-    "-p",
-    default=None,
-    type=click.IntRange(1, 65535),
-    help="Proxy port (default: profile port or 8787)",
+@proxy_port_option(
+    default_port=None,
+    help_text="Proxy port (default: $HEADROOM_PORT, profile port, or discovered legacy port)",
 )
 @click.option(
     "--no-mcp",
@@ -8280,6 +8293,8 @@ def codex(
     )
 
     if resolved is None or owned_home is None:
+        if port is None:
+            effective_port = reconcile_default_port(effective_port)
         # Legacy in-place wrap (no profiles file): original behavior.
         return _run_codex_wrap(
             port=effective_port,
@@ -8319,6 +8334,22 @@ def codex(
 
     env, env_vars_display = _build_codex_launch_env(effective_port, os.environ)
     env["CODEX_HOME"] = str(owned_home)  # headroom-owned config; user's ~/.codex* untouched
+
+    def configure_owned_codex_launch(
+        actual_port: int,
+        current_args: tuple,
+        current_env: dict[str, str],
+        current_display: list[str],
+    ) -> tuple[tuple, dict[str, str], list[str]]:
+        # _ensure_proxy may select a fallback listener. Rebind only the owned
+        # config, retaining provider identity, auth and the seed's original bytes.
+        from headroom.cli.codex_owned_config import build_owned_codex_config
+
+        owned_config = owned_home / "config.toml"
+        if owned_config.exists():
+            owned_config.write_text(build_owned_codex_config(owned_config.read_text(), actual_port))
+        return current_args, current_env, current_display
+
     _launch_tool(
         binary=codex_bin,
         args=codex_args,
@@ -8338,6 +8369,7 @@ def codex(
         region=region,
         openai_api_url=resolved.openai_upstream,
         bedrock_api_url=resolved.bedrock_base_url,
+        configure_launch=configure_owned_codex_launch,
     )
 
 

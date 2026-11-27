@@ -30,6 +30,18 @@ class _FakeProxyProcess:
         return None
 
 
+@pytest.fixture(autouse=True)
+def private_native_account(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # A developer's real profiles/settings must not select the cloud backend
+    # for these legacy-launch fixtures or expose native account state.
+    home = tmp_path / "native-home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("HEADROOM_WORKSPACE_DIR", str(tmp_path / "workspace"))
+    for key in ("HEADROOM_PROFILE", "HEADROOM_PORT", "HEADROOM_BACKEND"):
+        monkeypatch.delenv(key, raising=False)
+
+
 @pytest.fixture
 def runner() -> CliRunner:
     return CliRunner()
@@ -52,6 +64,8 @@ def _clear_claude_mode_env(monkeypatch: pytest.MonkeyPatch) -> None:
         "ANTHROPIC_API_KEY",
         "ANTHROPIC_AUTH_TOKEN",
         "CLAUDE_CODE_USE_BEDROCK",
+        "ANTHROPIC_BEDROCK_BASE_URL",
+        "CLAUDE_CODE_SKIP_BEDROCK_AUTH",
         # The RC sibling note reflects the resolved ENABLE_TOOL_SEARCH mode;
         # clear any ambient value so the default-session assertions hold.
         "ENABLE_TOOL_SEARCH",
