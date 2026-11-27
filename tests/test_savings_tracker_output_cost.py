@@ -10,19 +10,20 @@ the rollup series, plus the legacy-checkpoint path.
 
 from __future__ import annotations
 
-
-from tests._model_catalog import fake_catalog
 from headroom.proxy import savings_tracker as st
 from headroom.proxy.savings_tracker import SavingsTracker, _normalize_history_entry
+from tests._model_catalog import fake_catalog
 
 
 def _priced_litellm():
-    return fake_catalog({
+    return fake_catalog(
+        {
             "test-model": {
                 "input_cost_per_token": 1e-06,
                 "output_cost_per_token": 5e-06,
             }
-        })
+        }
+    )
 
 
 def _tracker(tmp_path) -> SavingsTracker:

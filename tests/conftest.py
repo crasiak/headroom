@@ -599,19 +599,17 @@ def _never_kill_real_proxies(request, monkeypatch):
     simply override this default. Return values mirror the no-proxy-running
     CI environment.
     """
-    if (
-        "stop_local_proxy_for_unwrap" in request.node.name
-        or (
-            request.node.path.name == "test_wrap_codex.py"
-            and request.node.originalname in {
-                "test_kill_proxy_uses_taskkill_tree_on_windows",
-                "test_kill_proxy_by_pid_never_signals_unsafe_pid",
-                "test_kill_proxy_by_pid_never_signals_own_process",
-                "test_kill_proxy_by_pid_never_signals_a_live_process_that_is_not_the_proxy",
-                "test_kill_proxy_by_pid_rechecks_the_pid_before_sigkill",
-                "test_kill_proxy_by_pid_positive_control_signals_the_listener",
-            }
-        )
+    if "stop_local_proxy_for_unwrap" in request.node.name or (
+        request.node.path.name == "test_wrap_codex.py"
+        and request.node.originalname
+        in {
+            "test_kill_proxy_uses_taskkill_tree_on_windows",
+            "test_kill_proxy_by_pid_never_signals_unsafe_pid",
+            "test_kill_proxy_by_pid_never_signals_own_process",
+            "test_kill_proxy_by_pid_never_signals_a_live_process_that_is_not_the_proxy",
+            "test_kill_proxy_by_pid_rechecks_the_pid_before_sigkill",
+            "test_kill_proxy_by_pid_positive_control_signals_the_listener",
+        }
     ):
         # Unit tests OF the stopper itself; they mock _check_proxy /
         # _query_proxy_config / _kill_proxy_by_pid internally and are hermetic.

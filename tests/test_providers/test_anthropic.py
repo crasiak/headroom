@@ -636,8 +636,8 @@ def test_lazy_pricing_wrapper_forwards_timestamp_and_cache_tokens(monkeypatch):
     from datetime import datetime, timezone
     from unittest.mock import Mock
 
-    from headroom.providers import anthropic
     from headroom.pricing import litellm_pricing
+    from headroom.providers import anthropic
 
     price = Mock(return_value=0.125)
     monkeypatch.setattr(litellm_pricing, "estimate_cost_from_tokens", price)

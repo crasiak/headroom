@@ -433,7 +433,9 @@ def _catalog_row(model: str) -> tuple[None, str, Mapping[str, Any]] | None:
             return None
         aliases = static_alias_map()
         resolved = (
-            reduce_to_priced_key(aliases.get(model, model), catalog.pricing_models) if aliases else None
+            reduce_to_priced_key(aliases.get(model, model), catalog.pricing_models)
+            if aliases
+            else None
         )
         if resolved is None:
             resolved = resolve_litellm_model_name(model, catalog.is_pricing_resolvable)

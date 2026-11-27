@@ -2697,6 +2697,7 @@ def _import_aliases(module: ast.Module) -> dict[str, str]:
                 if name.name == "*":
                     continue
                 aliases[name.asname or name.name] = f"{node.module}.{name.name}"
+
     # urllib openers can be assigned before they are invoked (install/health.py).
     # Recognize only these concrete network callables, not arbitrary .open().
     def urllib_opener(value: ast.expr) -> bool:
@@ -3341,9 +3342,12 @@ class TestSiteScannerRules:
         assert sites[0].guarded is False
 
     def test_assigned_local_open_is_not_an_egress_site(self) -> None:
-        assert _python_egress_sites(
-            "def f(local, path):\n    opener = local.open\n    return opener(path)\n"
-        ) == []
+        assert (
+            _python_egress_sites(
+                "def f(local, path):\n    opener = local.open\n    return opener(path)\n"
+            )
+            == []
+        )
 
     def test_module_level_httpx_verbs_are_sites(self) -> None:
         source = "def f():\n    return httpx.get('https://x')\n"

@@ -37,9 +37,9 @@ class _CredentialEchoingPrice:
 
 @pytest.fixture
 def captured(monkeypatch: pytest.MonkeyPatch):
-    catalog = fake_catalog({
-        "weird-priced-model": {"input_cost_per_token": _CredentialEchoingPrice()}
-    })
+    catalog = fake_catalog(
+        {"weird-priced-model": {"input_cost_per_token": _CredentialEchoingPrice()}}
+    )
     monkeypatch.setattr(st, "load_model_catalog", lambda: catalog)
     monkeypatch.setattr(st, "_unpriced_models_logged", WarnOnce(256, "test unpriced models"))
     monkeypatch.delenv("HEADROOM_DEBUG_DUMP", raising=False)

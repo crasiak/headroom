@@ -6,23 +6,25 @@ from pathlib import Path
 
 import pytest
 
-from tests._model_catalog import fake_catalog
 from headroom.proxy import savings_tracker as st
 from headroom.proxy.savings_tracker import (
     DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN,
     SavingsTracker,
     _estimate_input_cost_usd,
 )
+from tests._model_catalog import fake_catalog
 
 
 def _fake_litellm_gpt4o():
-    return fake_catalog({
+    return fake_catalog(
+        {
             "gpt-4o": {
                 "input_cost_per_token": 2.5e-06,
                 "cache_read_input_token_cost": 1.25e-06,
                 "cache_creation_input_token_cost": 2.5e-06,
             }
-        })
+        }
+    )
 
 
 def test_issue_4961_reproducer_with_inferred_flag(monkeypatch):
