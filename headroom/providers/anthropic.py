@@ -46,12 +46,17 @@ def estimate_cost_from_tokens(
     input_tokens: int = 0,
     output_tokens: int = 0,
     cached_tokens: int = 0,
+    now: datetime | None = None,
 ) -> float | None:
     """Load pricing on demand, keeping provider construction lightweight."""
     from headroom.pricing.litellm_pricing import estimate_cost_from_tokens as estimate
 
     return estimate(
-        model, input_tokens=input_tokens, output_tokens=output_tokens, cached_tokens=cached_tokens
+        model,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        cached_tokens=cached_tokens,
+        now=now,
     )
 
 

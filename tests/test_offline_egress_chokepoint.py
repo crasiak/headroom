@@ -2697,6 +2697,26 @@ def _import_aliases(module: ast.Module) -> dict[str, str]:
                 if name.name == "*":
                     continue
                 aliases[name.asname or name.name] = f"{node.module}.{name.name}"
+    # urllib openers can be assigned before they are invoked (install/health.py).
+    # Recognize only these concrete network callables, not arbitrary .open().
+    def urllib_opener(value: ast.expr) -> bool:
+        if isinstance(value, ast.IfExp):
+            return urllib_opener(value.body) or urllib_opener(value.orelse)
+        if _canonical_callee(ast.unparse(value), aliases) == "urllib.request.urlopen":
+            return True
+        return (
+            isinstance(value, ast.Attribute)
+            and value.attr == "open"
+            and isinstance(value.value, ast.Call)
+            and _canonical_callee(ast.unparse(value.value.func), aliases)
+            == "urllib.request.build_opener"
+        )
+
+    for node in ast.walk(module):
+        if isinstance(node, ast.Assign) and urllib_opener(node.value):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    aliases[target.id] = "urllib.request.urlopen"
     return aliases
 
 
@@ -2831,6 +2851,16 @@ _EGRESS_ALLOWLIST: dict[str, tuple[int, str]] = {
         "upstream they configured. Blocking this would break every air-gapped "
         "deployment that points Headroom at an on-prem model endpoint, which "
         "is the main reason such a deployment exists.",
+    ),
+    "transport/pool.py": (
+        1,
+        "user-traffic: new_http_client is the lease-private forwarding client. "
+        "AcquireRequest validates the operator binding's HTTPS/loopback upstream "
+        "and digest; admission checks live parent identity and pool scope. The "
+        "forwarder uses only binding.upstream, strips caller x-headroom-* routing "
+        "headers and refuses redirects. The client installs upstream pinning "
+        "and retains HTTP/1.1. Offline permits operator-bound inference traffic, "
+        "just as proxy/server.py does; it does not permit ancillary downloads.",
     ),
     "backends/litellm.py": (
         4,
@@ -3288,6 +3318,32 @@ class TestSiteScannerRules:
         """
         source = "def f(h):\n    return h.Client()\n"
         assert _python_egress_sites(source) == []
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "urllib.request.urlopen",
+            "urllib.request.build_opener().open",
+            "urllib.request.urlopen if flag else urllib.request.build_opener().open",
+            "urllib.request.build_opener().open if flag else None",
+        ],
+    )
+    def test_assigned_urllib_openers_are_egress_sites(self, value) -> None:
+        source = (
+            "import urllib.request\n"
+            "def f(url, flag):\n"
+            f"    opener = {value}\n"
+            "    return opener(url)\n"
+        )
+        sites = _python_egress_sites(source)
+        assert len(sites) == 1
+        assert sites[0].callee == "urllib.request.urlopen"
+        assert sites[0].guarded is False
+
+    def test_assigned_local_open_is_not_an_egress_site(self) -> None:
+        assert _python_egress_sites(
+            "def f(local, path):\n    opener = local.open\n    return opener(path)\n"
+        ) == []
 
     def test_module_level_httpx_verbs_are_sites(self) -> None:
         source = "def f():\n    return httpx.get('https://x')\n"

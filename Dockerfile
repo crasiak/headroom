@@ -53,15 +53,13 @@ COPY headroom/ headroom/
 # [redis] backs the replica-shared stores: without it HEADROOM_COMPRESS_SESSION_STORE
 # stops startup and HEADROOM_CCR_BACKEND=redis falls back to a per-process store.
 ARG HEADROOM_EXTRAS=proxy,code,bedrock,redis
-# `uv pip install` ignores [tool.uv] override-dependencies (uv.lock only), so
-# pass them explicitly: the image gets the security overrides the lock has
-# (pillow 13 over fastembed's <13 cap).
+# Security floors (including Pillow 13 and compatible fastembed) are declared
+# in project metadata, so pip and uv enforce the same install contract.
 RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/build/target \
-    python -c "exec('try: import tomllib\\nexcept ImportError: from pip._vendor import tomli as tomllib'); print('\\n'.join(tomllib.load(open('pyproject.toml', 'rb'))['tool']['uv']['override-dependencies']))" > /tmp/overrides.txt && \
-    uv pip install --system --overrides /tmp/overrides.txt ".[${HEADROOM_EXTRAS}]"
+    uv pip install --system ".[${HEADROOM_EXTRAS}]"
 
 RUN --mount=type=bind,source=.,target=/context,readonly \
     HEADROOM_BUILD_VERSION="${HEADROOM_BUILD_VERSION}" PYTHON_SITE_PACKAGES="${PYTHON_SITE_PACKAGES}" python - <<'PY'
