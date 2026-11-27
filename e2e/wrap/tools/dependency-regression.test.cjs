@@ -20,6 +20,7 @@ if (process.argv[2] === '--serve') {
   const test = require('node:test');
   const assert = require('node:assert/strict');
   const http = require('node:http');
+  const { createHash } = require('node:crypto');
   const { fork } = require('node:child_process');
 
   // Consumer overrides cannot repair bundled copies. Check the complete
@@ -64,6 +65,33 @@ if (process.argv[2] === '--serve') {
         assert.ok(atLeast(version, fixed), `${directory} is ${version}, below the fixed ${fixed}`);
       }
     }
+  });
+
+  test('Koffi uses the reviewed prebuilt with its install hook denied', async () => {
+    const manifest = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+    const lock = JSON.parse(fs.readFileSync('package-lock.json', 'utf8'));
+    assert.equal(manifest.allowScripts['koffi@3.3.2'], false);
+    assert.deepEqual(
+      Object.keys(manifest.allowScripts).filter((key) => key.startsWith('koffi')),
+      ['koffi@3.3.2'],
+    );
+    const pinned = lock.packages['node_modules/koffi'];
+    assert.equal(pinned.version, '3.3.2');
+    assert.equal(pinned.resolved, 'https://registry.npmjs.org/koffi/-/koffi-3.3.2.tgz');
+    assert.equal(pinned.integrity, 'sha512-f9Rrcmpy7lQs0ayJfhaxiG5OLp1aZjXKOFLXo7Gax6snJRKmdpYnYEOkpQ7ImCBrbvOdzFT06EP+FaLZv35W7Q==');
+    const directory = path.dirname(fromTools.resolve('koffi'));
+    const hook = fs.readFileSync(path.join(directory, 'cnoke.cjs'));
+    assert.equal(createHash('sha256').update(hook).digest('hex'),
+      'd5e4c3b53c1166265f3b7a386a0aec446bb99c41bf58c6c05643d1dcade12ffd');
+    assert.equal(fs.existsSync(path.join(directory, 'build')), false, 'no source-build fallback');
+    assert.ok(fromTools.resolve(`@koromix/koffi-${process.platform}-${process.arch}`));
+    const koffi = fromTools('koffi');
+    assert.equal(koffi.version, '3.3.2');
+    assert.equal(koffi.load(null).func('int abs(int value)')(-42), 42);
+    const { pathToFileURL } = require('node:url');
+    const esm = await import(pathToFileURL(path.join(directory, 'index.js')).href);
+    assert.equal(esm.default.version, '3.3.2');
+    assert.equal(esm.default.load(null).func('int abs(int value)')(-7), 7);
   });
 
   test('Ajv rejects a percent-encoded scheme instead of aliasing an HTTPS schema', () => {

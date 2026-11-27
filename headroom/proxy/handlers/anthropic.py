@@ -2091,11 +2091,11 @@ class AnthropicHandlerMixin:
                                 "type": "error",
                                 "error": {
                                     "type": "security_block",
-                                    "message": str(e),
+                                    "message": "Request blocked by security policy.",
                                 },
                             },
                         )
-                    logger.warning(f"[{request_id}] Security scan error: {e}")
+                    logger.warning("[%s] Security scan failed", request_id)
 
             # Hook: pre_compress — let hooks modify messages before compression
 

@@ -36,6 +36,10 @@ The image allows only the explicit, integrity-bound root artifact URL with
 `--strict-allow-scripts` make an unreviewed lifecycle identity a hard failure.
 Version-specific `allowScripts` entries require independent hook review;
 no wildcard, blanket approval, fallback installer or script-policy bypass.
+Koffi3.3.2's install hook is explicitly denied: the image requires its locked
+platform prebuilt, with no source-build fallback. `npm test` verifies the hook
+identity and exercises both module loaders and a local native call; missing or
+incompatible prebuilts fail qualification.
 
 ```sh
 cd e2e/wrap/tools

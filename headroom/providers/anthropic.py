@@ -68,28 +68,30 @@ logger = logging.getLogger(__name__)
 _FALLBACK_WARNING_SHOWN = False
 _UNKNOWN_MODEL_WARNINGS: set[str] = set()
 _ANSI_ESCAPE_RE = re.compile(r"\x1b(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
-_DANGLING_ANSI_STYLE_SUFFIX_RE = re.compile(r"(?:\[[0-9;]*m\])+$")
 
 
 def sanitize_anthropic_model_id(model: str) -> str:
     """Return an Anthropic model id without terminal styling artifacts."""
     cleaned = _ANSI_ESCAPE_RE.sub("", str(model)).strip()
-    return _DANGLING_ANSI_STYLE_SUFFIX_RE.sub("", cleaned)
+    end = len(cleaned)
+    while end >= 3 and cleaned[end - 2 : end] == "m]":
+        start = end - 3
+        while start >= 0 and cleaned[start] in "0123456789;":
+            start -= 1
+        if start < 0 or cleaned[start] != "[":
+            break
+        end = start
+    return cleaned[:end]
 
 
-# `[1m]` is not only an ANSI artifact: Claude Code appends it to a model id to
-# request the 1M context tier, and only then sends the `context-1m` beta header
-# (#1158). Upstream rejects the suffix, so `sanitize_anthropic_model_id()` must
-# keep stripping it before forwarding (#2027) — but the tier it encodes has to
-# be read off the id *before* that happens, or a 1M request gets budgeted as if
-# it were the base model's window.
-_CONTEXT_1M_SUFFIX_RE = re.compile(r"(?:\[1m\])+$")
+# Claude Code's display suffix also selects the 1M tier. Read it before
+# sanitizing the wire model so request budgeting retains that tier.
 CONTEXT_1M_TOKENS = 1_000_000
 
 
 def has_context_1m_suffix(model: str) -> bool:
     """Return True if ``model`` carries Claude Code's ``[1m]`` 1M-tier marker."""
-    return bool(_CONTEXT_1M_SUFFIX_RE.search(_ANSI_ESCAPE_RE.sub("", str(model)).strip()))
+    return _ANSI_ESCAPE_RE.sub("", str(model)).strip().endswith("[1m]")
 
 
 def sanitize_anthropic_model_metadata(value: Any) -> Any:
