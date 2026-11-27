@@ -72,6 +72,10 @@ def test_xai_cache_savings_and_billing_use_their_respective_price_sources(
     }
     if catalog_read is not None:
         row["cache_read_input_token_cost"] = catalog_read
+    from headroom.pricing import counterfactual as cf
+    from tests._model_catalog import fake_catalog
+
+    monkeypatch.setattr(cf, "load_model_catalog", lambda: fake_catalog({model: row}))
     original_row = litellm.model_cost[model]
     # Register through the public API; keep the isolated row free of inherited rates.
     monkeypatch.setitem(litellm.model_cost, model, dict(row))

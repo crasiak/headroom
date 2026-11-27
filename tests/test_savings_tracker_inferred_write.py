@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from tests._model_catalog import fake_catalog
 from headroom.proxy import savings_tracker as st
 from headroom.proxy.savings_tracker import (
     DEFAULT_FALLBACK_INPUT_COST_PER_TOKEN,
@@ -14,21 +15,18 @@ from headroom.proxy.savings_tracker import (
 )
 
 
-def _fake_litellm_gpt4o() -> types.SimpleNamespace:
-    return types.SimpleNamespace(
-        model_cost={
+def _fake_litellm_gpt4o():
+    return fake_catalog({
             "gpt-4o": {
                 "input_cost_per_token": 2.5e-06,
                 "cache_read_input_token_cost": 1.25e-06,
                 "cache_creation_input_token_cost": 2.5e-06,
             }
-        },
-        cost_per_token=lambda **_kw: (0.0, 0.0),
-    )
+        })
 
 
 def test_issue_4961_reproducer_with_inferred_flag(monkeypatch):
-    monkeypatch.setattr(st, "_get_litellm_module", _fake_litellm_gpt4o)
+    monkeypatch.setattr(st, "load_model_catalog", _fake_litellm_gpt4o)
     # Inferred write: the 1000 write tokens ARE the 1000 uncached tokens.
     cost = _estimate_input_cost_usd(
         "gpt-4o",
@@ -42,7 +40,7 @@ def test_issue_4961_reproducer_with_inferred_flag(monkeypatch):
 
 
 def test_disjoint_write_is_priced_separately(monkeypatch):
-    monkeypatch.setattr(st, "_get_litellm_module", _fake_litellm_gpt4o)
+    monkeypatch.setattr(st, "load_model_catalog", _fake_litellm_gpt4o)
     cost = _estimate_input_cost_usd(
         "gpt-4o",
         1000,
@@ -55,7 +53,7 @@ def test_disjoint_write_is_priced_separately(monkeypatch):
 
 
 def test_default_cache_inferred_is_false(monkeypatch):
-    monkeypatch.setattr(st, "_get_litellm_module", _fake_litellm_gpt4o)
+    monkeypatch.setattr(st, "load_model_catalog", _fake_litellm_gpt4o)
     # Backward compatibility: omitting cache_inferred defaults to False.
     cost = _estimate_input_cost_usd(
         "gpt-4o",
@@ -67,7 +65,7 @@ def test_default_cache_inferred_is_false(monkeypatch):
 
 
 def test_inferred_write_with_partial_cache_read(monkeypatch):
-    monkeypatch.setattr(st, "_get_litellm_module", _fake_litellm_gpt4o)
+    monkeypatch.setattr(st, "load_model_catalog", _fake_litellm_gpt4o)
     # 400 cached read (1.25e-6) + 600 uncached (2.5e-6) + 600 inferred write (zeroed)
     cost = _estimate_input_cost_usd(
         "gpt-4o",
@@ -82,7 +80,7 @@ def test_inferred_write_with_partial_cache_read(monkeypatch):
 
 
 def test_inferred_write_fallback_pricing(monkeypatch):
-    monkeypatch.setattr(st, "_get_litellm_module", lambda: types.SimpleNamespace(model_cost={}))
+    monkeypatch.setattr(st, "load_model_catalog", lambda: fake_catalog({}))
     cost = _estimate_input_cost_usd(
         "unknown-model",
         1000,
@@ -96,7 +94,7 @@ def test_inferred_write_fallback_pricing(monkeypatch):
 
 
 def test_inferred_write_without_uncached_breakdown_falls_back_to_total(monkeypatch):
-    monkeypatch.setattr(st, "_get_litellm_module", _fake_litellm_gpt4o)
+    monkeypatch.setattr(st, "load_model_catalog", _fake_litellm_gpt4o)
     cost = _estimate_input_cost_usd(
         "gpt-4o",
         1000,
@@ -108,7 +106,7 @@ def test_inferred_write_without_uncached_breakdown_falls_back_to_total(monkeypat
 
 
 def test_record_lifetime_request_inferred_write(monkeypatch):
-    monkeypatch.setattr(st, "_get_litellm_module", _fake_litellm_gpt4o)
+    monkeypatch.setattr(st, "load_model_catalog", _fake_litellm_gpt4o)
     with tempfile.TemporaryDirectory() as tmp:
         tracker = SavingsTracker(path=str(Path(tmp) / "savings.json"))
         tracker.record_lifetime_request(
@@ -125,7 +123,7 @@ def test_record_lifetime_request_inferred_write(monkeypatch):
 
 
 def test_record_request_inferred_write(monkeypatch):
-    monkeypatch.setattr(st, "_get_litellm_module", _fake_litellm_gpt4o)
+    monkeypatch.setattr(st, "load_model_catalog", _fake_litellm_gpt4o)
     with tempfile.TemporaryDirectory() as tmp:
         tracker = SavingsTracker(path=str(Path(tmp) / "savings.json"))
         tracker.record_request(
@@ -143,7 +141,7 @@ def test_record_request_inferred_write(monkeypatch):
 async def test_prometheus_metrics_record_request_inferred_write(monkeypatch):
     from headroom.proxy.prometheus_metrics import PrometheusMetrics
 
-    monkeypatch.setattr(st, "_get_litellm_module", _fake_litellm_gpt4o)
+    monkeypatch.setattr(st, "load_model_catalog", _fake_litellm_gpt4o)
     with tempfile.TemporaryDirectory() as tmp:
         tracker = SavingsTracker(path=str(Path(tmp) / "savings.json"))
         metrics = PrometheusMetrics(savings_tracker=tracker, stateless=True)
@@ -169,7 +167,7 @@ def test_request_outcome_updates_lifetime_cost_for_inferred_write(tmp_path, monk
     from headroom.proxy.outcome import RequestOutcome, emit_request_outcome
     from headroom.proxy.prometheus_metrics import PrometheusMetrics
 
-    monkeypatch.setattr(st, "_get_litellm_module", _fake_litellm_gpt4o)
+    monkeypatch.setattr(st, "load_model_catalog", _fake_litellm_gpt4o)
     tracker = SavingsTracker(path=str(tmp_path / "proxy_savings.json"))
     handler = types.SimpleNamespace(
         metrics=PrometheusMetrics(savings_tracker=tracker, stateless=True),

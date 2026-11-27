@@ -601,11 +601,23 @@ def _never_kill_real_proxies(request, monkeypatch):
     """
     if (
         "stop_local_proxy_for_unwrap" in request.node.name
-        or request.node.name == "test_kill_proxy_uses_taskkill_tree_on_windows"
+        or (
+            request.node.path.name == "test_wrap_codex.py"
+            and request.node.originalname in {
+                "test_kill_proxy_uses_taskkill_tree_on_windows",
+                "test_kill_proxy_by_pid_never_signals_unsafe_pid",
+                "test_kill_proxy_by_pid_never_signals_own_process",
+                "test_kill_proxy_by_pid_never_signals_a_live_process_that_is_not_the_proxy",
+                "test_kill_proxy_by_pid_rechecks_the_pid_before_sigkill",
+                "test_kill_proxy_by_pid_positive_control_signals_the_listener",
+            }
+        )
     ):
         # Unit tests OF the stopper itself; they mock _check_proxy /
         # _query_proxy_config / _kill_proxy_by_pid internally and are hermetic.
-        # The Windows kill-helper test also mocks subprocess.run completely.
+        # The named kill-helper tests mock signaling via _record_signals (or
+        # subprocess.run on Windows); their real children are disposable and
+        # cleaned up by the tests. No other kill-helper tests are exempt.
         yield
         return
 

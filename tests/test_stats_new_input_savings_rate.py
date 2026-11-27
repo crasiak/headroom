@@ -246,6 +246,15 @@ def test_inferred_openai_write_carries_no_write_premium(tmp_path, monkeypatch):
             "mode": "chat",
         },
     )
+    from headroom.pricing import counterfactual as cf
+    from headroom.proxy import savings_tracker as st
+    from tests._model_catalog import fake_catalog
+
+    def catalog():
+        return fake_catalog({model: litellm.model_cost[model]})
+
+    monkeypatch.setattr(cf, "load_model_catalog", catalog)
+    monkeypatch.setattr(st, "load_model_catalog", catalog)
     resolve_rates.cache_clear()
     try:
         with _make_client(tmp_path, monkeypatch) as client:

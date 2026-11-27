@@ -10,22 +10,19 @@ the rollup series, plus the legacy-checkpoint path.
 
 from __future__ import annotations
 
-import types
 
+from tests._model_catalog import fake_catalog
 from headroom.proxy import savings_tracker as st
 from headroom.proxy.savings_tracker import SavingsTracker, _normalize_history_entry
 
 
-def _priced_litellm() -> types.SimpleNamespace:
-    return types.SimpleNamespace(
-        model_cost={
+def _priced_litellm():
+    return fake_catalog({
             "test-model": {
                 "input_cost_per_token": 1e-06,
                 "output_cost_per_token": 5e-06,
             }
-        },
-        cost_per_token=lambda **_kw: (0.0, 0.0),
-    )
+        })
 
 
 def _tracker(tmp_path) -> SavingsTracker:
@@ -33,7 +30,7 @@ def _tracker(tmp_path) -> SavingsTracker:
 
 
 def test_emitted_output_tokens_are_priced_onto_lifetime(monkeypatch, tmp_path):
-    monkeypatch.setattr(st, "_get_litellm_module", _priced_litellm)
+    monkeypatch.setattr(st, "load_model_catalog", _priced_litellm)
     tracker = _tracker(tmp_path)
 
     tracker.record_request(
@@ -52,7 +49,7 @@ def test_emitted_output_tokens_are_priced_onto_lifetime(monkeypatch, tmp_path):
 
 def test_output_cost_is_disjoint_from_output_savings(monkeypatch, tmp_path):
     """Emitted and not-emitted are separate counts at the same rate."""
-    monkeypatch.setattr(st, "_get_litellm_module", _priced_litellm)
+    monkeypatch.setattr(st, "load_model_catalog", _priced_litellm)
     tracker = _tracker(tmp_path)
 
     tracker.record_request(
@@ -70,7 +67,7 @@ def test_output_cost_is_disjoint_from_output_savings(monkeypatch, tmp_path):
 
 def test_bill_share_rate_is_computable_and_below_the_input_only_one(monkeypatch, tmp_path):
     """The reason the field exists: an input-only denominator overstates."""
-    monkeypatch.setattr(st, "_get_litellm_module", _priced_litellm)
+    monkeypatch.setattr(st, "load_model_catalog", _priced_litellm)
     tracker = _tracker(tmp_path)
 
     tracker.record_request(
@@ -103,7 +100,7 @@ def test_legacy_checkpoints_default_the_field_rather_than_dropping(tmp_path):
 
 
 def test_rollup_series_carries_the_per_bucket_output_spend(monkeypatch, tmp_path):
-    monkeypatch.setattr(st, "_get_litellm_module", _priced_litellm)
+    monkeypatch.setattr(st, "load_model_catalog", _priced_litellm)
     tracker = _tracker(tmp_path)
 
     for _ in range(3):
@@ -130,7 +127,7 @@ def test_lifetime_output_spend_survives_a_restart(monkeypatch, tmp_path):
     lands on a zeroed counter and the rollup's ``max(delta, 0)`` clamp hides
     the regression by reporting a flat total instead of a negative one.
     """
-    monkeypatch.setattr(st, "_get_litellm_module", _priced_litellm)
+    monkeypatch.setattr(st, "load_model_catalog", _priced_litellm)
     path = tmp_path / "savings.json"
 
     def record(tracker: SavingsTracker) -> None:

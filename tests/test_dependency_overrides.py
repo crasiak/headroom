@@ -1,39 +1,44 @@
-"""Security overrides reach every install the project controls.
-
-fastembed caps pillow <13 while the decoder fixes are only in 13, so uv.lock
-takes 13 through [tool.uv] override-dependencies. A lock refresh, or a build
-step that installs from package metadata, would silently drop it.
-"""
+"""Patched Pillow/fastembed floors are real metadata, not uv-only overrides."""
 
 from __future__ import annotations
 
 import re
+import tomllib
 from pathlib import Path
 
-try:
-    import tomllib
-except ModuleNotFoundError:  # Python 3.10
-    import tomli as tomllib  # type: ignore[no-redef]
+from packaging.requirements import Requirement
+from packaging.version import Version
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def _overrides() -> list[str]:
-    with open(ROOT / "pyproject.toml", "rb") as f:
-        return tomllib.load(f)["tool"]["uv"]["override-dependencies"]
+def _packages():
+    with open(ROOT / "uv.lock", "rb") as f:
+        return tomllib.load(f)["package"]
 
 
 def test_the_lock_takes_the_fixed_pillow_on_supported_pythons():
-    with open(ROOT / "uv.lock", "rb") as f:
-        versions = [p["version"] for p in tomllib.load(f)["package"] if p["name"] == "pillow"]
-    assert any(int(v.split(".")[0]) >= 13 for v in versions), versions
-    assert any(o.startswith("pillow>=13") for o in _overrides())
+    versions = [p["version"] for p in _packages() if p["name"] == "pillow"]
+    assert versions and all(Version(v) >= Version("13.0.0") for v in versions), versions
 
 
-def test_the_image_build_applies_the_overrides():
-    # `uv pip install` ignores [tool.uv] override-dependencies; the Dockerfile
-    # must pass them, or the image installs pillow 12 under fastembed's cap.
+def test_security_floors_are_declared_in_install_metadata():
+    with open(ROOT / "pyproject.toml", "rb") as f:
+        extras = tomllib.load(f)["project"]["optional-dependencies"]
+    for extra, package, floor, vulnerable in (
+        ("image", "pillow", "13.0.0", "12.2.0"),
+        ("tray", "pillow", "13.0.0", "12.2.0"),
+        ("relevance", "fastembed", "0.9.1", "0.9.0"),
+    ):
+        requirement = next(Requirement(r) for r in extras[extra] if Requirement(r).name == package)
+        assert floor in requirement.specifier
+        assert vulnerable not in requirement.specifier
+    versions = [p["version"] for p in _packages() if p["name"] == "fastembed"]
+    assert versions and all(Version(v) >= Version("0.9.1") for v in versions), versions
+
+
+def test_the_image_build_installs_project_metadata_without_stale_override_key():
     dockerfile = (ROOT / "Dockerfile").read_text()
     install = re.search(r"uv pip install --system (.*)", dockerfile)
-    assert install and "--overrides" in install.group(1)
-    assert "override-dependencies" in dockerfile
+    assert install and '".[${HEADROOM_EXTRAS}]"' in install.group(1)
+    assert "['override-dependencies']" not in dockerfile

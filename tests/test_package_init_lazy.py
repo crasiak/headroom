@@ -364,7 +364,8 @@ def test_provider_pricing_remains_available_on_demand() -> None:
         ):
             with patch("headroom.pricing.litellm_pricing.estimate_cost_from_tokens", return_value=12.5) as price:
                 assert provider.estimate_cost(17, 9, model, cached_tokens=5) == 12.5
-                price.assert_called_once_with(model, input_tokens=17, output_tokens=9, cached_tokens=5)
+                extra = {"now": None} if module is anthropic else {}
+                price.assert_called_once_with(model, input_tokens=17, output_tokens=9, cached_tokens=5, **extra)
             with patch.object(module, "estimate_cost_from_tokens", return_value=3.5):
                 assert provider.estimate_cost(17, 9, model) == 3.5
         """
