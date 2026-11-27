@@ -450,13 +450,7 @@ def test_isolated_transport_finalizes_responses_without_litellm(tmp_path, mode, 
             leftovers = sorted(
                 str(path.relative_to(transport_root)) for path in transport_root.rglob("*")
             )
-            if beacon == "on" and mode == "anthropic_oauth_passthrough":
-                # Predates CRA-459 (the unchanged baseline leaves it too): the
-                # beacon's exit flush persists an install id after stateless
-                # cleanup has removed the config directory.
-                assert leftovers == ["config", "config/install_id"]
-            else:
-                assert leftovers == []
+            assert leftovers == []
         finally:
             transport.close()
 
