@@ -1,6 +1,6 @@
 """Savings estimates priced from the pinned catalog (CRA-459).
 
-Expected dollars below are written out from the pinned LiteLLM 1.101.0 rates
+Expected dollars below are written out from the pinned LiteLLM 1.101.3 rates
 (e.g. claude-sonnet-4-5: $3 in / $15 out / $0.30 cache read / $3.75 cache
 write per 1M), not computed with the resolver under test.
 """
@@ -81,14 +81,25 @@ def test_segmented_input_never_adds_total_input_on_top() -> None:
 
 
 def test_request_savings_breakdown_uses_the_catalog() -> None:
-    assert st.estimate_request_savings_usd(
+    result = st.estimate_request_savings_usd(
         "claude-sonnet-4-5",
         compression_tokens_saved=M,
         tool_schema_tokens_saved=M // 2,
         output_tokens_saved=M // 10,
         cache_read_tokens=M,
-    ) == pytest.approx(
-        {"compression": 3.00, "tool_schema": 1.50, "output_shaping": 1.50, "provider_cache": 2.70}
+    )
+    # The million-token billed prompt selects the long-context card. Upstream's
+    # cache-aware breakdown also retains both list upper bounds explicitly.
+    assert result.pop("basis") == "catalog"
+    assert result == pytest.approx(
+        {
+            "compression": 6.00,
+            "compression_list": 6.00,
+            "tool_schema": 0.30,
+            "tool_schema_list": 3.00,
+            "output_shaping": 1.50,
+            "provider_cache": 2.70,
+        }
     )
 
 

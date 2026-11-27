@@ -130,8 +130,7 @@ class LeaseReplayState:
             for key in store._trackers
             if key == session_id or key.startswith(session_id + "\x00")
         ]:
-            del store._trackers[key]
-            store._lineage_affinities.pop(key, None)
+            store._discard_tracker(key)
         store._lineages.pop(session_id, None)
 
     @staticmethod
@@ -177,6 +176,7 @@ class LeaseReplayState:
         self.trackers._trackers.clear()
         self.trackers._lineages.clear()
         self.trackers._lineage_affinities.clear()
+        self.trackers._lineage_history.clear()
         return held
 
 

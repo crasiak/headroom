@@ -17,9 +17,10 @@ undo. After every merge from headroomlabs-ai/headroom, check each item below.
 - Never resolve a `uv.lock` conflict by taking upstream's file. Take either side,
   then run `uv lock` so the floors apply again, and confirm with:
   `uv export --frozen --no-dev --no-emit-project --no-hashes --extra all --format requirements-txt > /tmp/req.txt && uvx pip-audit -r /tmp/req.txt --disable-pip --no-deps`
-- `mcp>=1.30.0` needs `crewai>=1.15.30`; older crewai pins `mcp~=1.28.1`.
-- `pillow` is split by Python version in the `image` extra: 13.x needs 3.11+,
-  and 3.10 stays on 12.3 until `requires-python` moves.
+- Keep the upstream MCP2 security floor alongside compatible integration extras.
+- Shipping image/tray metadata requires Pillow>=13. fastembed>=0.9.1 admits
+  Pillow13 without a uv-only override; pip and uv must honor the same floor.
+  decoder_guard is defense in depth, never an advisory exception.
 
 ## Security overrides (npm)
 
@@ -41,11 +42,25 @@ undo. After every merge from headroomlabs-ai/headroom, check each item below.
   distribution only after inspecting and qualifying a genuinely patched upstream
   release. A closed upstream issue or a lock-only audit count is not sufficient.
 - Regenerate lockfiles with Node's own npm (11+). npm below 8.3 ignores `overrides`.
-- After any `plugins/opencode` dependency change, run `npm run build:standalone`
-  and copy `dist-standalone/{entry.opencode.js,hook-shim/handler.js}` into
-  `headroom/providers/opencode/`. CI compares them byte for byte, because the wheel bundles zod.
+- After any `plugins/opencode` dependency change, run `npm run build:standalone`.
+  Copy `dist-standalone/index.js` to `headroom/providers/opencode/_dist/index.js`
+  and `dist-standalone/hook-shim/handler.js` to the sibling
+  `headroom/providers/opencode/hook-shim/handler.js`. `_dist` contains only
+  `index.js`, not the obsolete `entry.opencode.js` or loader aliases. CI compares
+  both outputs byte for byte because the wheel bundles dependencies.
 
 ## Behaviour
+
+- Request/response savings and telemetry must not import the LiteLLM SDK or
+  trust its mutable model registry. Preserve the hash-verified raw catalog and
+  exact public membership. The separate immutable pricing view composes trusted
+  upstream DeepSeek off-peak rows without widening telemetry. Actual tier-aware
+  request calculators retain their timestamp/weekend rules; flat savings are
+  estimates. Preserve extracted `prompt_cache_min_tokens` and cache eligibility.
+- Replay eviction/clear must discard every store index, including upstream's
+  canonical lineage history, across all forks of each evicted session.
+- Native Darwin process identity uses the kernel without spawning `ps`, while
+  preserving exact whole-second identity compatibility and fail-closed guards.
 
 - `headroom/transport/runtime.py` `transport_proxy_config`: `http2=False`
   (CRA-1265). Aperture's graceful HTTP/2 GOAWAY made httpcore abort in-flight

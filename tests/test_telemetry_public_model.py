@@ -8,6 +8,7 @@ set contains it, and never the private prefix a client wrapped around it.
 from __future__ import annotations
 
 import json
+import sys
 from types import SimpleNamespace
 from typing import Any
 
@@ -79,6 +80,18 @@ def _outcome(model: str) -> Any:
         transforms_applied=(),
         tags={},
     )
+
+
+def test_mutable_sdk_registry_cannot_bless_a_private_deployment(monkeypatch) -> None:
+    private = "acme-private-deployment"
+    monkeypatch.setitem(sys.modules, "litellm", SimpleNamespace(model_cost={private: {}}))
+    assert session._public_model(private) is None
+    emitted = []
+    aggregator = session.SessionAggregator(emitted.append, idle_s=60.0)
+    aggregator.record(_outcome(private), now=1000.0)
+    aggregator.flush_all()
+    assert emitted
+    assert private not in json.dumps(emitted)
 
 
 def test_session_payload_carries_only_public_model_ids() -> None:

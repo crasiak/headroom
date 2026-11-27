@@ -982,8 +982,18 @@ class TransportPool:
         """A lease's own upstream client: no connection is shared across leases."""
 
         assert self._client_options is not None
+        from headroom.proxy.tcp_keepalive import install_tcp_keepalive
+        from headroom.proxy.upstream_pinning import install_upstream_pinning
+
         http2, options = self._client_options
-        client = httpx.AsyncClient(http2=http2, **options)
+        # Match the app's guarded connection stack, preserving lease-private
+        # pools, HTTP/1.1 and operator-owned destinations without caller routing.
+        client = install_upstream_pinning(
+            install_tcp_keepalive(
+                httpx.AsyncClient(http2=http2, **options),
+                self.engine.config.upstream_tcp_keepalive_seconds,
+            )
+        )
         client.event_hooks.setdefault("request", []).append(trace_request)
         return client
 

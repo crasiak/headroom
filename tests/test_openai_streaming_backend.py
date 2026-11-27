@@ -30,6 +30,7 @@ from headroom.proxy.server import ProxyConfig, create_app  # noqa: E402
 
 
 @pytest.mark.skipif(not os.environ.get("OPENAI_API_KEY"), reason="OPENAI_API_KEY not set")
+@pytest.mark.live
 class TestOpenAIStreamingRealAPI:
     """Test streaming with real OpenAI API calls through the proxy."""
 
@@ -281,6 +282,9 @@ class TestOpenAIStreamingMock:
         with (
             patch("headroom.backends.litellm._fetch_bedrock_inference_profiles", return_value={}),
             patch("headroom.backends.litellm.acompletion", new_callable=AsyncMock) as mock_acomp,
+            # Suppress the SDK preflight: this test proves LiteLLM request-shaping,
+            # not whether google-cloud-aiplatform is installed in the CI environment.
+            patch("headroom.providers.vertex.diagnostics.vertex_sdk_available", return_value=True),
         ):
             mock_acomp.return_value = fake_stream()
             app = create_app(config)

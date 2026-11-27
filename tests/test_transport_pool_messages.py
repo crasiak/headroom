@@ -6,14 +6,12 @@ reads a process-wide upstream) with its own copy of the handler's per-session
 prefix replay. This compares what one recording upstream receives from each
 path for the same requests.
 
-Same on both paths: method, path, every forwarded request header except
-accept-encoding, the client response bytes, and the forwarded body bytes on
+Same on both paths: method, path and query string, every forwarded request
+header except accept-encoding, the client response bytes, and the forwarded body bytes on
 every turn of a five-turn conversation, including the turn where the router
 would otherwise reclassify an older tool result.
 
 Known differences, asserted below so a change to either is noticed:
-- The forwarder keeps the request's query string (Claude sends ``?beta=true``);
-  the app's handler drops it.
 - The forwarder asks the upstream for ``accept-encoding: identity`` and relays
   the response bytes untouched; the app's handler forwards the client's value.
 - Request bodies without ``model`` or ``messages`` are refused locally (400,
@@ -111,6 +109,7 @@ SMALL = {
 STREAMED = {**_conversation(2)[1], "system": "streamed conversation", "stream": True}
 CASES: list[tuple[str, dict[str, Any], str]] = [
     ("small", SMALL, "?beta=true"),
+    ("query", SMALL, "?beta=true&beta=false&tag=a%2Fb"),
     ("stream", STREAMED, ""),
     *[(f"turn-{index}", body, "") for index, body in enumerate(_conversation(5))],
 ]
@@ -161,8 +160,8 @@ def test_claude_messages_through_the_forwarder_match_the_app_handler(tmp_path) -
 
     for name, _, query in CASES:
         app, forwarder = served[name]["upstream"], pooled[name]["upstream"]
-        assert app["path"] == "/v1/messages", name
-        assert forwarder["path"] == "/v1/messages" + query, name
+        assert app["path"] == "/v1/messages" + query, name
+        assert forwarder["path"] == app["path"], name
         app_headers = dict(app["headers"])
         forwarded_headers = dict(forwarder["headers"])
         assert forwarded_headers.pop("accept-encoding") == "identity"

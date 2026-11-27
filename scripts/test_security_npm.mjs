@@ -1,7 +1,7 @@
 // CRA-1534: exercise an installed packed artifact, not just its build directory.
 // No registry/provider requests: all install, ci and pack fixtures are local.
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -21,13 +21,13 @@ function json(file, value) {
   writeFileSync(file, JSON.stringify(value, null, 2) + "\n");
 }
 
-function npm(args, cwd = fixtures) {
+function npm(args, cwd = fixtures, expectedStatus = 0) {
   const result = spawnSync(process.execPath, [cli, ...args, "--no-audit", "--no-fund"], {
     cwd, env, encoding: "utf8", timeout: 20_000, maxBuffer: 8 * 1024 * 1024,
   });
   assert.equal(result.error, undefined, result.error?.message);
-  assert.equal(result.status, 0, `${args.join(" ")}\n${result.stdout}\n${result.stderr}`);
-  return result.stdout;
+  assert.equal(result.status, expectedStatus, `${args.join(" ")}\n${result.stdout}\n${result.stderr}`);
+  return expectedStatus === 0 ? result.stdout : result.stdout + result.stderr;
 }
 
 function project(name, manifest) {
@@ -76,6 +76,42 @@ test("install, clean ci and list work with an offline local dependency", () => {
   const listed = JSON.parse(npm(["list", "--json"], second));
   assert.equal(listed.dependencies["fixture-dependency"].version, "1.0.0");
   assert.equal(createRequire(path.join(second, "package.json"))("fixture-dependency"), 42);
+});
+
+test("exact lifecycle denial is reviewed but cannot authorize another version", () => {
+  const allowed = requireNpm("./node_modules/@npmcli/arborist/lib/script-allowed.js");
+  const node = (version) => ({
+    resolved: `https://registry.npmjs.org/koffi/-/koffi-${version}.tgz`,
+    package: { name: "koffi", version },
+    isRegistryDependency: true,
+  });
+  assert.equal(allowed(node("3.3.2"), { "koffi@3.3.2": false }), false);
+  assert.equal(allowed(node("3.3.3"), { "koffi@3.3.2": false }), null);
+  assert.equal(allowed(node("3.3.2"), { "koffi@3.3.2": true }), true);
+});
+
+test("strict ci suppresses denied scripts and rejects unreviewed scripts", () => {
+  const dependency = project("script-dependency", {
+    name: "fixture-script-dependency", version: "1.0.0",
+    scripts: { install: "node install.cjs" },
+  });
+  writeFileSync(path.join(dependency, "install.cjs"),
+    "require('node:fs').writeFileSync('script-ran', 'yes');\n");
+  npm(["pack", "--ignore-scripts", "--offline"], dependency);
+  const spec = "file:../script-dependency/fixture-script-dependency-1.0.0.tgz";
+  for (const decision of [false, true, null]) {
+    const root = project(`script-consumer-${decision}`, {
+      name: "fixture-script-consumer", version: "1.0.0",
+      dependencies: { "fixture-script-dependency": spec },
+      allowScripts: decision === null ? {} : { [spec]: decision },
+    });
+    npm(["install", "--ignore-scripts", "--offline"], root);
+    const lock = readFileSync(path.join(root, "package-lock.json"));
+    const output = npm(["ci", "--strict-allow-scripts", "--offline"], root, decision === null ? 1 : 0);
+    assert.deepEqual(readFileSync(path.join(root, "package-lock.json")), lock);
+    if (decision === null) assert.match(output, /ESTRICTALLOWSCRIPTS/);
+    assert.equal(existsSync(path.join(root, "node_modules", "fixture-script-dependency", "script-ran")), decision === true);
+  }
 });
 
 test("workspace glob discovery, listing and packing include both packages", () => {

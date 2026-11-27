@@ -18,7 +18,11 @@ from headroom.observability import (
     set_otel_metrics,
     unregister_otel_metric_attribute_provider,
 )
-from headroom.proxy.prometheus_metrics import PrometheusMetrics
+from headroom.proxy.prometheus_metrics import (
+    MAX_DISTINCT_PATHS,
+    MAX_DISTINCT_SAVINGS_ROWS,
+    PrometheusMetrics,
+)
 from headroom.telemetry.context import MAX_DISTINCT_MODELS
 from headroom.transforms.pipeline import TransformPipeline
 
@@ -262,6 +266,23 @@ def test_request_attribute_provider_enriches_core_and_savings_metrics() -> None:
         unregister_otel_metric_attribute_provider(identity_attributes)
 
 
+def test_coalesced_savings_rows_count_every_event() -> None:
+    """A row summed from 33 recordings is 33 events, not 1; a bare row is 1."""
+    reader = InMemoryMetricReader()
+    otel_metrics = HeadroomOtelMetrics(meter_provider=MeterProvider(metric_readers=[reader]))
+
+    otel_metrics.record_savings_attribution(
+        [
+            {"source": "tool_search", "tokens": 3_300, "events": 33},
+            {"source": "router", "tokens": 5},
+        ]
+    )
+
+    events = _collect_metrics(reader)["headroom.savings.attribution.events"]
+    assert _find_point(events, source="tool_search").value == 33
+    assert _find_point(events, source="router").value == 1
+
+
 def test_failing_request_attribute_provider_is_fail_open() -> None:
     reader = InMemoryMetricReader()
     provider = MeterProvider(metric_readers=[reader])
@@ -356,9 +377,54 @@ async def test_prometheus_metrics_reads_late_configured_otel_metrics() -> None:
         await metrics.record_rate_limited(provider="anthropic", model="claude-sonnet")
 
         assert spy.failed_calls == [{"provider": "openai", "model": None}]
-        assert spy.rate_limited_calls == [{"provider": "anthropic", "model": "claude-sonnet"}]
+        # ``source`` reaches OTel too — the split must not exist in Prometheus only.
+        assert spy.rate_limited_calls == [
+            {"provider": "anthropic", "model": "claude-sonnet", "source": "headroom"}
+        ]
     finally:
         reset_otel_metrics()
+
+
+@pytest.mark.asyncio
+async def test_prometheus_metrics_forwards_rate_limit_source_to_otel() -> None:
+    """An upstream 429 must reach OTel labelled as upstream, not as our own limiter."""
+
+    spy = _SpyProxyMetrics()
+    metrics = PrometheusMetrics(stateless=True)
+    set_otel_metrics(spy)  # type: ignore[arg-type]
+
+    try:
+        await metrics.record_rate_limited(provider="anthropic", source="upstream")
+        await metrics.record_rate_limited(provider="anthropic", source="headroom")
+        # An unrecognised value is clamped rather than exported as a new label.
+        await metrics.record_rate_limited(provider="anthropic", source="nonsense")
+
+        assert [call["source"] for call in spy.rate_limited_calls] == [
+            "upstream",
+            "headroom",
+            "headroom",
+        ]
+    finally:
+        reset_otel_metrics()
+
+
+def test_otel_rate_limited_counter_carries_source_attribute() -> None:
+    reader = InMemoryMetricReader()
+    provider = MeterProvider(metric_readers=[reader])
+    otel_metrics = HeadroomOtelMetrics(meter_provider=provider)
+
+    otel_metrics.record_proxy_rate_limited(provider="anthropic", source="upstream")
+    otel_metrics.record_proxy_rate_limited(provider="openai", source="headroom")
+
+    metrics = _collect_metrics(reader)
+    upstream = _find_point(
+        metrics["headroom.proxy.requests.rate_limited"], provider="anthropic", source="upstream"
+    )
+    headroom_side = _find_point(
+        metrics["headroom.proxy.requests.rate_limited"], provider="openai", source="headroom"
+    )
+    assert upstream.value == 1
+    assert headroom_side.value == 1
 
 
 @pytest.mark.asyncio
@@ -465,6 +531,175 @@ async def test_prometheus_metrics_caps_model_cardinality() -> None:
 
 
 @pytest.mark.asyncio
+async def test_prometheus_metrics_buckets_invalid_model_keys() -> None:
+    """A model key with control characters or past 128 chars counts under
+    "other", never as its own key, while legitimate names stay untouched.
+    Invalid writes are also excluded from per-model cache-bust attribution,
+    so they never warm _cache_requests_by_model."""
+    metrics = PrometheusMetrics(stateless=True)
+
+    async def record(model: str) -> None:
+        await metrics.record_request(
+            provider="openai",
+            model=model,
+            input_tokens=10,
+            output_tokens=1,
+            tokens_saved=0,
+            latency_ms=1.0,
+            cache_read_tokens=1,
+        )
+
+    await record("pasted terminal output\nsecond line\n" + "x" * 200)
+    await record("bad\tmodel")
+    await record("x" * 129)
+    await record("claude-opus-4-7[1m]")
+    await record("x" * 128)
+
+    assert metrics.requests_by_model["other"] == 3
+    assert metrics.requests_by_model["claude-opus-4-7[1m]"] == 1
+    assert metrics.requests_by_model["x" * 128] == 1
+    assert len(metrics.requests_by_model) == 3
+    # The three invalid writes never warm the cache-bust dict; only the two
+    # valid models are tracked there.
+    assert "other" not in metrics._cache_requests_by_model
+    assert len(metrics._cache_requests_by_model) == 2
+    assert sum(metrics.requests_by_model.values()) == 5
+    assert 'headroom_requests_by_model{model="other"} 3' in await metrics.export()
+
+
+@pytest.mark.asyncio
+async def test_invalid_model_write_does_not_bust_valid_other_model() -> None:
+    """An invalid model's cache write must not warm the "other" entry used
+    for cache-bust attribution, or a genuine "other" model's first write
+    would be misread as a bust (issue #4942 review). Both requests still
+    count under "other" in requests_by_model."""
+    metrics = PrometheusMetrics(stateless=True)
+
+    async def record(model: str) -> None:
+        await metrics.record_request(
+            provider="anthropic",
+            model=model,
+            input_tokens=10,
+            output_tokens=1,
+            tokens_saved=0,
+            latency_ms=1.0,
+            cache_write_tokens=100,
+            cache_read_tokens=0,
+        )
+
+    await record("x" * 129)
+    await record("other")
+
+    assert metrics.requests_by_model["other"] == 2
+    assert metrics._cache_requests_by_model["other"] == 1
+    assert metrics.cache_by_provider["anthropic"]["bust_count"] == 0
+    assert 'headroom_provider_cache_bust_total{provider="anthropic"} 0' in (await metrics.export())
+
+
+@pytest.mark.asyncio
+async def test_mixed_type_model_keys_do_not_share_cache_history() -> None:
+    """A numeric model and its string form are distinct cache histories:
+    int 123 then str "123" are both first-time writes, so neither is a
+    bust (issue #4942 review). Both still count under the "123" display
+    bucket in requests_by_model, keeping numeric input exporter-compatible."""
+    metrics = PrometheusMetrics(stateless=True)
+
+    async def record(model: str | int) -> None:
+        await metrics.record_request(
+            provider="anthropic",
+            model=model,  # type: ignore[arg-type]
+            input_tokens=10,
+            output_tokens=1,
+            tokens_saved=0,
+            latency_ms=1.0,
+            cache_write_tokens=100,
+            cache_read_tokens=0,
+        )
+
+    await record(123)
+    await record("123")
+
+    assert metrics.requests_by_model["123"] == 2
+    assert metrics._cache_requests_by_model[123] == 1
+    assert metrics._cache_requests_by_model["123"] == 1
+    assert len(metrics._cache_requests_by_model) == 2
+    assert metrics.cache_by_provider["anthropic"]["bust_count"] == 0
+    assert 'headroom_provider_cache_bust_total{provider="anthropic"} 0' in (await metrics.export())
+
+
+@pytest.mark.asyncio
+async def test_mixed_type_model_keys_respect_cache_history_cap() -> None:
+    """Int/str pairs share one display bucket but are distinct cache
+    histories, so raw keys can outnumber display keys two-to-one. Cache
+    history is bounded independently: once it holds MAX_DISTINCT_MODELS
+    entries, further new raw keys attribute to "other" and the map never
+    exceeds the cap plus "other"."""
+    metrics = PrometheusMetrics(stateless=True)
+
+    async def record(model: str | int) -> None:
+        await metrics.record_request(
+            provider="anthropic",
+            model=model,  # type: ignore[arg-type]
+            input_tokens=10,
+            output_tokens=1,
+            tokens_saved=0,
+            latency_ms=1.0,
+            cache_read_tokens=1,
+        )
+
+    # Fill cache history to the cap with distinct ints; the display map
+    # holds their string forms.
+    for i in range(MAX_DISTINCT_MODELS):
+        await record(i)
+    assert len(metrics._cache_requests_by_model) == MAX_DISTINCT_MODELS
+    assert len(metrics.requests_by_model) == MAX_DISTINCT_MODELS
+
+    # The same values as strings are new raw keys, but the cache map is
+    # full: they collapse into "other" instead of growing it.
+    for i in range(MAX_DISTINCT_MODELS):
+        await record(str(i))
+    assert len(metrics.requests_by_model) == MAX_DISTINCT_MODELS
+    assert len(metrics._cache_requests_by_model) == MAX_DISTINCT_MODELS + 1
+    assert metrics._cache_requests_by_model["other"] == MAX_DISTINCT_MODELS
+
+
+@pytest.mark.asyncio
+async def test_distinct_nan_models_share_one_display_bucket() -> None:
+    """Distinct NaN values all display as "nan" but are unequal dict keys,
+    so each is its own cache history while sharing one display bucket.
+    Once cache history is full, further NaNs attribute to "other"."""
+    metrics = PrometheusMetrics(stateless=True)
+
+    async def record(model: float | int) -> None:
+        await metrics.record_request(
+            provider="anthropic",
+            model=model,  # type: ignore[arg-type]
+            input_tokens=10,
+            output_tokens=1,
+            tokens_saved=0,
+            latency_ms=1.0,
+            cache_read_tokens=1,
+        )
+
+    for _ in range(3):
+        await record(float("nan"))
+    assert metrics.requests_by_model["nan"] == 3
+    assert len(metrics._cache_requests_by_model) == 3
+
+    # Fill the remaining cache-history slots with distinct ints, then two
+    # more distinct NaNs must collapse into "other" instead of growing it.
+    for i in range(MAX_DISTINCT_MODELS - 3):
+        await record(i)
+    assert len(metrics._cache_requests_by_model) == MAX_DISTINCT_MODELS
+    for _ in range(2):
+        await record(float("nan"))
+    assert len(metrics._cache_requests_by_model) == MAX_DISTINCT_MODELS + 1
+    assert metrics._cache_requests_by_model["other"] == 2
+    assert metrics.requests_by_model["nan"] == 5
+    assert len(metrics.requests_by_model) == MAX_DISTINCT_MODELS - 2
+
+
+@pytest.mark.asyncio
 async def test_prometheus_metrics_model_cardinality_warns_once(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -505,6 +740,142 @@ async def test_prometheus_metrics_reset_rearms_cardinality_warning() -> None:
     assert metrics._model_cardinality_warned is False
     assert len(metrics.requests_by_model) == 0
     assert len(metrics._cache_requests_by_model) == 0
+
+
+def test_prometheus_metrics_caps_inbound_path_cardinality() -> None:
+    """A client hitting unbounded distinct paths (ID-bearing passthrough routes)
+    cannot grow inbound_requests_by_path past MAX_DISTINCT_PATHS + the "other"
+    sentinel, while the total request count stays exact."""
+    metrics = PrometheusMetrics(stateless=True)
+
+    # Fill exactly to the cap with distinct paths: no bucketing yet.
+    for i in range(MAX_DISTINCT_PATHS):
+        metrics.record_inbound_request(method="GET", path=f"/v1/files/file_{i}")
+    assert len(metrics.inbound_requests_by_path) == MAX_DISTINCT_PATHS
+    assert "other" not in metrics.inbound_requests_by_path
+
+    # New distinct paths past the cap bucket into "other", never their own key.
+    for i in range(5):
+        metrics.record_inbound_request(method="GET", path=f"/v1/responses/resp_{i}")
+    assert "/v1/responses/resp_0" not in metrics.inbound_requests_by_path
+    assert metrics.inbound_requests_by_path["other"] == 5
+    assert len(metrics.inbound_requests_by_path) == MAX_DISTINCT_PATHS + 1
+
+    # An already-tracked path keeps incrementing after the cap is reached.
+    metrics.record_inbound_request(method="GET", path="/v1/files/file_0")
+    assert metrics.inbound_requests_by_path["/v1/files/file_0"] == 2
+
+    # Accounting is preserved: every inbound request is counted somewhere.
+    total_calls = MAX_DISTINCT_PATHS + 5 + 1
+    assert metrics.inbound_requests_total == total_calls
+    assert sum(metrics.inbound_requests_by_path.values()) == total_calls
+
+
+def test_prometheus_metrics_path_cardinality_warns_once(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Bucketing inbound paths into "other" logs exactly one warning."""
+    metrics = PrometheusMetrics(stateless=True)
+    with caplog.at_level(logging.WARNING, logger="headroom.proxy"):
+        for i in range(MAX_DISTINCT_PATHS + 10):
+            metrics.record_inbound_request(method="GET", path=f"/v1/files/file_{i}")
+    cap_warnings = [r for r in caplog.records if "path cardinality cap" in r.getMessage()]
+    assert len(cap_warnings) == 1
+
+
+@pytest.mark.asyncio
+async def test_prometheus_metrics_reset_rearms_path_cardinality_warning() -> None:
+    """reset_runtime clears the path dict and re-arms the one-shot cap warning."""
+    metrics = PrometheusMetrics(stateless=True)
+    for i in range(MAX_DISTINCT_PATHS + 5):
+        metrics.record_inbound_request(method="GET", path=f"/v1/files/file_{i}")
+    assert metrics._path_cardinality_warned is True
+
+    await metrics.reset_runtime()
+
+    assert metrics._path_cardinality_warned is False
+    assert len(metrics.inbound_requests_by_path) == 0
+
+
+@pytest.mark.asyncio
+async def test_prometheus_metrics_caps_savings_source_cardinality() -> None:
+    """An extension that names a new savings source per request cannot grow
+    savings_by_source, or its exported series, past MAX_DISTINCT_SAVINGS_ROWS plus
+    one "other" row per realized flag, and every token and dollar is still booked."""
+    metrics = PrometheusMetrics(stateless=True)
+    sources = MAX_DISTINCT_SAVINGS_ROWS + 50
+    for i in range(sources):
+        await metrics.record_request(
+            provider="openai",
+            model="gpt-4o",
+            input_tokens=10,
+            output_tokens=1,
+            tokens_saved=0,
+            latency_ms=1.0,
+            savings_attribution=[
+                {"source": f"plugin_{i}", "realized": True, "tokens": 100, "usd": 0.01},
+                {"source": "tool_search", "realized": False, "tokens": 10},
+            ],
+        )
+
+    rows = metrics.savings_by_source
+    assert len(rows) == MAX_DISTINCT_SAVINGS_ROWS + 1
+    assert rows["tool_search:0"]["tokens"] == 10 * sources
+    assert sum(int(r["tokens"]) for r in rows.values()) == 110 * sources
+    assert sum(float(r["usd"]) for r in rows.values()) == pytest.approx(0.01 * sources)
+    assert sum(int(r["events"]) for r in rows.values()) == 2 * sources
+    exported = await metrics.export()
+    series = [
+        line
+        for line in exported.splitlines()
+        if line.startswith("headroom_savings_attributed_tokens_total{")
+    ]
+    assert len(series) == MAX_DISTINCT_SAVINGS_ROWS + 1
+    assert metrics._savings_source_cardinality_warned is True
+
+    await metrics.reset_runtime()
+
+    assert metrics._savings_source_cardinality_warned is False
+    assert metrics.savings_by_source == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("realized", [True, False])
+async def test_tool_search_first_seen_after_the_savings_cap_keeps_its_row(realized) -> None:
+    """The headline query selects source="tool_search", so a tool-search saving
+    that first arrives after the cap must keep its named row, not fold."""
+    metrics = PrometheusMetrics(stateless=True)
+    for i in range(MAX_DISTINCT_SAVINGS_ROWS):
+        await metrics.record_request(
+            provider="openai",
+            model="gpt-4o",
+            input_tokens=10,
+            output_tokens=1,
+            tokens_saved=0,
+            latency_ms=1.0,
+            savings_attribution=[{"source": f"plugin_{i}", "realized": realized, "tokens": 1}],
+        )
+    await metrics.record_request(
+        provider="openai",
+        model="gpt-4o",
+        input_tokens=10,
+        output_tokens=1,
+        tokens_saved=0,
+        latency_ms=1.0,
+        savings_attribution=[
+            {"source": "tool_search", "realized": realized, "tokens": 100},
+            {"source": "late_plugin", "realized": realized, "tokens": 7},
+        ],
+    )
+
+    rows = metrics.savings_by_source
+    assert rows[f"tool_search:{int(realized)}"]["tokens"] == 100
+    assert rows[f"other:{int(realized)}"]["tokens"] == 7
+    exported = await metrics.export()
+    assert (
+        f'headroom_savings_attributed_tokens_total{{realized="{str(realized).lower()}",'
+        f'source="tool_search"}} 100' in exported
+    )
 
 
 @pytest.mark.asyncio

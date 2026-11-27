@@ -406,7 +406,7 @@ def transport_proxy_config(
         cost_tracking_enabled=False,
         log_requests=False,
         log_full_messages=False,
-        fallback_enabled=False,
+        # Upstream removed provider fallback entirely; transport cannot opt in.
         memory_enabled=False,
         traffic_learning_enabled=False,
         subscription_tracking_enabled=False,

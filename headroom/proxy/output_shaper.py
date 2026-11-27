@@ -9,18 +9,7 @@ output tokens, so every lever here works by reshaping the request:
    provider prefix cache is preserved). Five levels, from "no ceremony" to
    full caveman.
 
-2. Effort routing — agentic loops are mostly mechanical continuations (the
-   last message is a clean tool_result: a file read, a passing test). Thinking
-   bills as output tokens, and harnesses like Claude Code pin
-   ``output_config.effort`` at ``xhigh`` for every turn. On turns classified
-   as mechanical we lower an explicitly-present effort; on errors or new user
-   asks we leave it alone. For legacy models still sending
-   ``thinking.budget_tokens`` we clamp the budget to the API floor instead.
-
 Safety rules (each prevents a concrete failure mode):
-- Never INJECT ``output_config.effort`` where the client didn't send it —
-  models without effort support 400 on it. Lowering an existing value is
-  always valid.
 - Never toggle ``thinking.type`` — disabling thinking while history carries
   thinking blocks 400s on some models, and the toggle busts the messages
   cache tier.
@@ -41,10 +30,10 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
-from headroom.proxy import runtime_env
+from headroom.proxy import output_savings, output_verbosity_policy, runtime_env
 from headroom.proxy.output_steering import (
     apply_openai_chat_verbosity_steering,
     apply_openai_responses_verbosity_steering,
@@ -62,6 +51,10 @@ from headroom.rollout import FeatureDecisionReason
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "DEFAULT_VERBOSITY_LEVEL",
+    "register_default_verbosity_level",
+    "restore_steering_registry",
+    "steering_registry_snapshot",
     "OutputShaperSettings",
     "ShapeResult",
     "TurnKind",
@@ -80,16 +73,76 @@ __all__ = [
 _replace_or_append_steering_block = replace_or_append_steering_block
 
 
+#: Level handed to an operator who turned the shaper on and said nothing else.
+#: Three. Paired SWE-bench Verified runs (Claude Code 2.1.325, Opus 5.5, 49
+#: tasks x 2 attempts against unsteered Claude Code) put L3 at -11.7% output
+#: tokens (95% CI 7.3-16.1%) and -9.5% cost, solving the same tasks. A blind
+#: judge playing the reviewer who must merge the change wanted a follow-up on
+#: 14% of L3's final replies against 11% unsteered. L4 saved more (-21%) but
+#: the judge wanted a follow-up on 20% of its replies against 3%, mostly for
+#: dropped caveats, which is why it is not the default.
+DEFAULT_VERBOSITY_LEVEL = 3
+
+
+def register_default_verbosity_level(level: int) -> None:
+    """Set the level used when ``HEADROOM_VERBOSITY_LEVEL`` is not set.
+
+    Extension seam, alongside ``register_verbosity_text``: an extension that
+    installs its own benchmarked text for a level can make that level the
+    default. An operator's explicit ``HEADROOM_VERBOSITY_LEVEL`` still wins, and
+    a proxy without the extension keeps core's default. Call it at startup:
+    the level is read per request, and moving it mid-conversation rewrites
+    the system-prompt tail, busting the prefix cache once. The setting is
+    process-wide: every app in the process steers at it.
+    """
+    global DEFAULT_VERBOSITY_LEVEL
+    if isinstance(level, bool) or not isinstance(level, int) or not 0 <= level <= 4:
+        raise ValueError(f"default verbosity level must be an int in 0-4; got {level!r}")
+    DEFAULT_VERBOSITY_LEVEL = level
+
+
+#: What the three extension seams have registered: the default level
+#: (:func:`register_default_verbosity_level`), each level's steering text
+#: (``output_verbosity_policy.register_verbosity_text``) and the modelled savings
+#: factors (``output_savings.register_modelled_factors``). A new seam belongs here.
+SteeringRegistry = tuple[int, dict[int, str], dict[int, tuple[float, float]]]
+
+
+def steering_registry_snapshot() -> SteeringRegistry:
+    """Copy of everything the steering and savings seams can change."""
+    return (
+        DEFAULT_VERBOSITY_LEVEL,
+        dict(output_verbosity_policy.VERBOSITY_LEVELS),
+        dict(output_savings.MODELLED_REDUCTION),
+    )
+
+
+def restore_steering_registry(snapshot: SteeringRegistry) -> None:
+    """Put the seams back as :func:`steering_registry_snapshot` found them.
+
+    ``install_all`` uses this so an extension that raises after registering
+    leaves nothing behind when it is skipped.
+    """
+    global DEFAULT_VERBOSITY_LEVEL
+    level, texts, factors = snapshot
+    DEFAULT_VERBOSITY_LEVEL = level
+    output_verbosity_policy.VERBOSITY_LEVELS.clear()
+    output_verbosity_policy.VERBOSITY_LEVELS.update(texts)
+    output_savings.MODELLED_REDUCTION.clear()
+    output_savings.MODELLED_REDUCTION.update(factors)
+
+
 @dataclass(frozen=True)
 class OutputShaperSettings:
     """Output-shaping settings with rollout enablement injected by the proxy."""
 
     enabled: bool = False
-    verbosity_level: int = 3
+    # Read at construction, not import, so a level registered by an extension
+    # applies to direct construction exactly as it does to from_env().
+    verbosity_level: int = field(default_factory=lambda: DEFAULT_VERBOSITY_LEVEL)
     # False in ``mode="cache"``. Steering is the one lever that writes into the
     # provider prefix-cache key (it appends to the system-prompt tail, and on a
-    # body with no system field it creates one); effort routing and the
-    # thinking budget sit outside the key and stay on. See
+    # body with no system field it creates one). See
     # :func:`steering_allowed_for`.
     steering_enabled: bool = True
 
@@ -110,15 +163,29 @@ class OutputShaperSettings:
                 "yes",
             )
         try:
-            level = int(runtime_env.getenv("HEADROOM_VERBOSITY_LEVEL", "3"))
+            level = int(
+                runtime_env.getenv("HEADROOM_VERBOSITY_LEVEL", str(DEFAULT_VERBOSITY_LEVEL))
+            )
         except ValueError:
-            level = 2
+            level = DEFAULT_VERBOSITY_LEVEL
         level = max(0, min(4, level))
         return cls(
             enabled=enabled,
             verbosity_level=level,
             steering_enabled=steering_enabled,
         )
+
+
+def output_holdout_fraction() -> float:
+    """Fraction of conversations held out of shaping (``HEADROOM_OUTPUT_HOLDOUT``).
+
+    Read live, like the other shaper knobs. Unset or unparseable means 0.0 (no
+    holdout); :func:`~headroom.proxy.output_savings.assign_arm` clamps the range.
+    """
+    try:
+        return float(runtime_env.getenv("HEADROOM_OUTPUT_HOLDOUT", "0") or "0")
+    except ValueError:
+        return 0.0
 
 
 def shaper_enabled_for(config: Any) -> bool | None:
@@ -165,37 +232,39 @@ def steering_allowed_for(config: Any) -> bool:
 
     ``mode="cache"`` freezes prior turns specifically to keep the provider's
     prefix-cache key byte-stable (see ``ProxyConfig.mode``). Verbosity steering
-    writes into that key, so running it there trades a large, certain cache
-    cost for a small, uncertain output saving — the wrong side of a roughly
-    60x margin on a long context. Effort routing and the thinking budget are
-    unaffected: they ride request parameters outside the cache key, so they
-    keep saving in cache mode.
+    writes into that key, so a block that CHANGES there trades a large, certain
+    cache cost for a small, uncertain output saving — the wrong side of a
+    roughly 60x margin on a long context.
+
+    This is the gate for the sources that can change mid-conversation. It is
+    NOT the last word: :func:`resolve_verbosity_level` lets an explicitly
+    pinned ``HEADROOM_VERBOSITY_LEVEL`` through even here, because a level
+    fixed before startup is written into turn 1's prefix and never moves. See
+    that function for the reasoning.
     """
     return getattr(config, "mode", None) != "cache"
 
 
-def resolve_verbosity_level(settings: OutputShaperSettings) -> tuple[int, str]:
-    """Resolve the live verbosity level and its source.
+#: Keys already warned about. Resolution runs on every request of every
+#: conversation, so an unguarded warning would be one log line per turn.
+_REPORTED: set[str] = set()
 
-    Precedence:
-      1. ``HEADROOM_VERBOSITY_LEVEL`` set explicitly → manual override.
-      2. AIMD controller state (when ``HEADROOM_VERBOSITY_AUTOTUNE`` is on).
-      3. Learned ``verbosity.json`` from ``learn --verbosity``.
-      4. The settings default.
 
-    Returns ``(level, source)``. Kept separate from :func:`shape_request` so the
-    body-mutating core stays a pure function of an explicit level.
+def _report_once(key: str, message: str, *args: Any) -> None:
+    """Warn the first time only. Cleared by tests via ``_REPORTED.clear()``."""
+    if key in _REPORTED:
+        return
+    _REPORTED.add(key)
+    logger.warning(message, *args)
+
+
+def _resolve_unpinned_level(settings: OutputShaperSettings) -> tuple[int, str]:
+    """Resolve the level from the sources that can move under our feet.
+
+    The controller rewrites its state file as it hunts, and ``verbosity.json``
+    appears the moment someone runs ``learn --verbosity``. Both can therefore
+    change mid-conversation, which is what makes them unsafe in cache mode.
     """
-    if not settings.steering_enabled:
-        # Level 0 is the documented "no steering" value, so this disables the
-        # only cache-key-mutating lever while leaving effort routing on. It
-        # deliberately outranks the manual override below: a level set in the
-        # environment must not reintroduce a prefix mutation the mode exists
-        # to prevent.
-        return 0, "cache_mode"
-    if runtime_env.getenv("HEADROOM_VERBOSITY_LEVEL"):
-        return settings.verbosity_level, "env"
-
     try:
         from ..paths import workspace_dir
 
@@ -229,6 +298,83 @@ def resolve_verbosity_level(settings: OutputShaperSettings) -> tuple[int, str]:
             pass
 
     return settings.verbosity_level, "default"
+
+
+def resolve_verbosity_level(settings: OutputShaperSettings) -> tuple[int, str]:
+    """Resolve the live verbosity level and its source.
+
+    Precedence:
+      1. ``HEADROOM_VERBOSITY_LEVEL`` set explicitly → manual override.
+      2. AIMD controller state (when ``HEADROOM_VERBOSITY_AUTOTUNE`` is on).
+      3. Learned ``verbosity.json`` from ``learn --verbosity``.
+      4. The settings default.
+
+    Returns ``(level, source)``. Kept separate from :func:`shape_request` so the
+    body-mutating core stays a pure function of an explicit level.
+
+    Cache mode and the pinned level
+    -------------------------------
+    ``mode="cache"`` used to force this to ``0`` unconditionally, outranking
+    even an explicit ``HEADROOM_VERBOSITY_LEVEL``. That guarded the right
+    hazard with the wrong instrument.
+
+    What costs a prefix cache is the steering block *changing* — appearing on a
+    conversation already in flight, or moving between levels — because the
+    block sits in the ``system`` array, which is inside the cached prefix of
+    every message-level ``cache_control`` breakpoint the client sets. What does
+    NOT cost anything is the block simply *being there*: :func:`shape_request`
+    applies it on every request with no turn-kind gating, and the text is
+    byte-stable per level and idempotent via the sentinel. So a level pinned in
+    the environment before the proxy starts is written into turn 1's prefix and
+    is byte-identical on every turn after it. The cache is established
+    including the block and hits normally from then on; the only cost is the
+    block's own tokens riding along in the cached prefix (~80 at L2, about
+    $0.000024 per turn at Sonnet cache-read rates, against a measured ~700
+    output tokens saved per turn — roughly 450x the other way).
+
+    What matters is therefore not WHICH level, but whether it can move. Both
+    sources that cannot move are allowed through in cache mode:
+
+    * an explicit ``HEADROOM_VERBOSITY_LEVEL`` → ``env_pinned``
+    * otherwise the settings level, fixed at startup → ``cache_mode_default``
+
+    The second is what makes ``HEADROOM_OUTPUT_SHAPER=1`` sufficient on its
+    own. The shaper is opt-in (see the ``proxy_output_shaper`` rollout spec, which
+    deliberately does not default-enable it), so an enabled shaper is already an
+    explicit request and there is nothing further to ask the operator for.
+
+    The controller and the learned profile stay out of cache mode entirely —
+    those are exactly the sources that rewrite themselves while conversations
+    are open. Skipping them also spares the default mode two filesystem stats
+    per request.
+    """
+    if runtime_env.getenv("HEADROOM_VERBOSITY_LEVEL"):
+        return settings.verbosity_level, ("env" if settings.steering_enabled else "env_pinned")
+
+    if not settings.steering_enabled:
+        # Cache mode. The shaper is opt-in (see the ``proxy_output_shaper``
+        # rollout spec), so an enabled shaper is already an explicit operator
+        # act -- there is nothing further to ask for. Steer at the settings
+        # level, which was fixed at startup and cannot move.
+        #
+        # The controller and the learned profile are deliberately NOT consulted
+        # here. Both rewrite their files while conversations are open, and a
+        # level that moves mid-conversation rewrites the system array, which
+        # sits inside the cached prefix of every message-level cache_control
+        # breakpoint. That is the bust this mode exists to prevent -- and
+        # skipping the lookup also spares the default mode two filesystem stats
+        # per request.
+        if runtime_env.getenv("HEADROOM_VERBOSITY_AUTOTUNE", "").lower() in ("1", "true", "yes"):
+            _report_once(
+                "autotune_in_cache_mode",
+                "OutputShaper: HEADROOM_VERBOSITY_AUTOTUNE is set but the AIMD controller is "
+                "not consulted in cache mode — a level that moves mid-conversation busts the "
+                "prefix cache. Steering at L%d. Set HEADROOM_MODE=token to autotune.",
+                settings.verbosity_level,
+            )
+        return settings.verbosity_level, "cache_mode_default"
+
+    return _resolve_unpinned_level(settings)
 
 
 @dataclass

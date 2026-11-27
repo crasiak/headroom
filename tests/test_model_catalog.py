@@ -19,8 +19,8 @@ from headroom.pricing import model_catalog
 
 ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = ROOT / "headroom" / "pricing" / "data"
-PINNED_SOURCE_SHA256 = "f68d88c12610ea31ab355a1293fde55aeed6fa78a1f4b182c67be47d80b1d202"
-PINNED_WHEEL_SHA256 = "d4064024151ff2877e542b56c6bb6a39e0c3e6651abf4639af9346a678586e52"
+PINNED_SOURCE_SHA256 = "60e814a40446bb997f95f8c601ea63fddabfb1eff67caba97026e4322df295ca"
+PINNED_WHEEL_SHA256 = "e5143a62f8a3250b9ead1b7e344d179d4d20631143cd4a94a5753c30fa5423c7"
 
 
 def _load_generator() -> Any:
@@ -239,13 +239,13 @@ def test_packaged_catalog_matches_manifest_and_pinned_source() -> None:
 
     assert manifest["catalog"]["sha256"] == hashlib.sha256(catalog_bytes).hexdigest()
     assert manifest["catalog"]["bytes"] == len(catalog_bytes)
-    assert manifest["catalog"]["model_count"] == 3816
+    assert manifest["catalog"]["model_count"] == 3820
     assert manifest["source"]["package"] == "litellm"
-    assert manifest["source"]["version"] == "1.101.0"
+    assert manifest["source"]["version"] == "1.101.3"
     assert manifest["source"]["wheel_sha256"] == PINNED_WHEEL_SHA256
     assert manifest["source"]["member"] == "litellm/model_prices_and_context_window_backup.json"
     assert manifest["source"]["member_sha256"] == PINNED_SOURCE_SHA256
-    assert manifest["source"]["member_bytes"] == 2_311_609
+    assert manifest["source"]["member_bytes"] == 2_312_677
     assert manifest["source"]["excluded_keys"] == ["fallback_generalizations", "sample_spec"]
     assert manifest["source"]["license"] == "MIT"
     assert manifest["source"]["license_sha256"] == hashlib.sha256(license_bytes).hexdigest()
@@ -257,7 +257,7 @@ def test_packaged_catalog_matches_manifest_and_pinned_source() -> None:
     catalog = model_catalog.parse_catalog(
         catalog_bytes, (DATA_DIR / model_catalog.MANIFEST_FILE).read_bytes()
     )
-    assert len(catalog.models) == 3816
+    assert len(catalog.models) == 3820
     assert "sample_spec" not in catalog.models
     assert "fallback_generalizations" not in catalog.models
     # Headroom's runtime registrations are not upstream model ids.
@@ -279,6 +279,7 @@ def test_packaged_catalog_matches_manifest_and_pinned_source() -> None:
         "mode": "chat",
         "output_cost_per_token": 1.5e-05,
         "output_cost_per_token_above_200k_tokens": 2.25e-05,
+        "prompt_cache_min_tokens": 1024,
     }
     # Absent rates stay absent: gpt-4o publishes no cache-write price.
     assert "cache_creation_input_token_cost" not in catalog.models["gpt-4o"]
@@ -313,7 +314,7 @@ def test_packaged_catalog_loads_in_a_fresh_process_without_litellm() -> None:
     )
     observed = json.loads(result.stdout)
     assert observed["file"].startswith(str(ROOT))
-    assert observed == {**observed, "models": 3816, "litellm": False, "pricing": False}
+    assert observed == {**observed, "models": 3820, "litellm": False, "pricing": False}
 
 
 # --- generator ---------------------------------------------------------------

@@ -100,6 +100,17 @@ def test_each_lease_gets_its_own_http_client(pool) -> None:
         assert first is not second
         assert first._transport is not second._transport
         assert first is not pool.engine.http_client
+        from headroom.proxy.tcp_keepalive import KeepaliveNetworkBackend, keepalive_socket_options
+        from headroom.proxy.upstream_pinning import PinnedAddressBackend
+
+        for client in (first, second):
+            backend = client._transport._pool._network_backend
+            assert isinstance(backend, PinnedAddressBackend)
+            assert isinstance(backend._inner, KeepaliveNetworkBackend)
+            assert backend._inner._options == keepalive_socket_options(
+                pool.engine.config.upstream_tcp_keepalive_seconds
+            )
+            assert client._transport._pool._http2 is False
     finally:
         asyncio.run(first.aclose())
         asyncio.run(second.aclose())
@@ -296,10 +307,19 @@ def test_replay_state_is_bounded_owned_and_cleared() -> None:
     assert first.stats() == {"sessions": 2, "trackers": 2}
     assert turn.session_id not in first.compression_caches
     assert all(not key.startswith(turn.session_id) for key in first.trackers._trackers)
+    # Upstream's branch history holds canonical messages too, so every index
+    # must follow the lease's session bound, not only the visible trackers.
+    for index in range(20):
+        _replay_turn(first, f"churn-{index}", messages)
+        assert set(first.trackers._lineage_history) <= set(first.trackers._trackers)
+    other_history = dict(second.trackers._lineage_history)
+    assert other_history
 
     assert first.clear() == {"sessions": 2, "trackers": 2}
     assert first.stats() == {"sessions": 0, "trackers": 0}
     assert first.trackers._lineages == {}
+    assert first.trackers._lineage_history == {}
+    assert second.trackers._lineage_history == other_history
     assert second.stats() == {"sessions": 1, "trackers": 1}
 
 
@@ -359,7 +379,7 @@ async def test_one_leases_stuck_compression_quarantines_only_that_lease(pool) ->
         await _until(lambda: stuck_lease.compression_snapshot()["jobs"] == 0)
         assert await stuck_lease._run_compression_in_executor(lambda: "back", timeout=5) == "back"
         assert stuck_lease.compression_snapshot() == {"jobs": 0, "leaked": 0}
-        await _until(lambda: pool.engine._compression_leaked_threads == 1)
+        await _until(lambda: pool.engine._compression_timed_out_workers_total == 1)
     finally:
         blocker.gate.set()
 

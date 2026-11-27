@@ -3,12 +3,16 @@
   "version": "1.0.0",
   "private": true,
   "description": "Locked CLI dependencies for the Docker wrap E2E harness",
+  "scripts": {
+    "test": "node --test --test-concurrency=1 --test-reporter=tap dependency-regression.test.cjs"
+  },
   "dependencies": {
     "@openai/codex": "0.153.4",
     "openclaw": "2026.10.7",
     "npm": "https://github.com/crasiak/headroom/releases/download/npm-security-cra-1534-1/npm-12.2.1-crasiak.1.tgz"
   },
   "overrides": {
+    "@modelcontextprotocol/sdk": "1.32.2",
     "npm": {
       ".": "$npm",
       "glob": "14.0.3",
@@ -19,5 +23,12 @@
     "minimatch": "11.0.4",
     "undici": "8.12.3",
     "zod": "4.6.7"
+  },
+  "allowScripts": {
+    "@google/genai@2.27.0": true,
+    "esbuild@0.28.2": true,
+    "koffi@3.3.2": false,
+    "protobufjs@7.6.6": true,
+    "openclaw@2026.10.7": true
   }
 }

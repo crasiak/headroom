@@ -14,6 +14,7 @@ import json
 import math
 import os
 import subprocess
+import sys
 import time
 import uuid
 from collections.abc import Callable, Mapping
@@ -322,6 +323,12 @@ def _proc_process_identity(pid: int) -> ProcessIdentity | None:
 
 def _ps_process_identity(pid: int) -> ProcessIdentity | None:
     try:
+        if sys.platform == "darwin":
+            from headroom.transport._process_darwin import process_start_seconds
+
+            return ProcessIdentity(
+                pid=pid, start_source="ps", start_time=float(process_start_seconds(pid))
+            )
         completed = subprocess_run(
             ["ps", "-o", "lstart=", "-p", str(pid)],
             check=True,

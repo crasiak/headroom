@@ -340,6 +340,52 @@ async def test_send_message_converts_anthropic_tools_and_tool_choice(
     assert sent["tool_choice"] == "required"
 
 
+@pytest.mark.parametrize(
+    ("anthropic_choice", "openai_choice"),
+    [
+        ({"type": "auto"}, "auto"),
+        ({"type": "any"}, "required"),
+        ({"type": "none"}, "none"),
+        ({"type": "tool", "name": "t"}, {"type": "function", "function": {"name": "t"}}),
+    ],
+)
+def test_convert_tool_choice_covers_every_anthropic_type(
+    anthropic_choice: dict[str, object], openai_choice: object
+) -> None:
+    """Every Anthropic tool_choice type maps to its OpenAI equivalent.
+
+    ``{"type": "none"}`` ("do not use any tool this turn") previously fell
+    through to the ``"auto"`` default, inverting the instruction into "you may
+    use tools" so the model could call a tool the client explicitly forbade.
+    """
+    assert anyllm._convert_tool_choice(anthropic_choice) == openai_choice
+
+
+@pytest.mark.asyncio
+async def test_send_message_forwards_tool_choice_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A request forbidding tools must reach any-llm as OpenAI ``"none"``.
+
+    Regression: ``{"type": "none"}`` was converted to ``"auto"``, letting the
+    model call a tool the client disabled for the turn.
+    """
+    backend, instance = make_backend(monkeypatch)
+    instance.response = make_response(make_choice("ok", "stop"))
+
+    await backend.send_message(
+        {
+            "model": "claude",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"name": "t", "input_schema": {"type": "object"}}],
+            "tool_choice": {"type": "none"},
+        },
+        {},
+    )
+
+    assert instance.calls[0]["tool_choice"] == "none"
+
+
 @pytest.mark.asyncio
 async def test_stream_message_converts_anthropic_tools_and_tool_choice(
     monkeypatch: pytest.MonkeyPatch,
@@ -377,7 +423,8 @@ async def test_send_message_returns_error_response(monkeypatch: pytest.MonkeyPat
 
     assert result.status_code == 401
     assert result.body["error"]["type"] == "authentication_error"
-    assert result.error == "authentication api_key missing"
+    # Unclassified exception text stays in the server log, never the client.
+    assert result.error == "The proxy could not complete the request."
 
 
 @pytest.mark.asyncio
@@ -416,7 +463,7 @@ async def test_stream_message_yields_events_and_error(monkeypatch: pytest.Monkey
     instance_error.raise_error = RuntimeError("stream broke")
     error_events = [event async for event in backend_error.stream_message({"messages": []}, {})]
     assert error_events[-1].event_type == "error"
-    assert error_events[-1].data["error"]["message"] == "stream broke"
+    assert error_events[-1].data["error"]["message"] == "The proxy could not complete the request."
 
 
 def _tool_call_delta(*, index, tc_id=None, name=None, arguments=None):  # noqa: ANN001, ANN202
@@ -709,8 +756,177 @@ def test_error_response_classifies_common_failures(monkeypatch: pytest.MonkeyPat
     assert generic.body["error"]["type"] == "api_error"
 
 
+@pytest.mark.parametrize(
+    "message",
+    ["Failed to generate response", "This model's maximum context length is 8192 tokens"],
+)
+def test_error_response_ignores_substrings_inside_other_words(
+    monkeypatch: pytest.MonkeyPatch, message: str
+) -> None:
+    backend, _instance = make_backend(monkeypatch)
+
+    response = backend._error_response(RuntimeError(message))
+
+    assert response.status_code == 500
+    assert response.body["error"]["type"] == "api_error"
+
+
+@pytest.mark.parametrize(
+    ("message", "status"),
+    [("Rate limit reached", 429), ("HTTP 429 Too Many Requests", 429), ("Model not found", 404)],
+)
+def test_error_response_phrase_matches_keep_status(
+    monkeypatch: pytest.MonkeyPatch, message: str, status: int
+) -> None:
+    backend, _instance = make_backend(monkeypatch)
+
+    assert backend._error_response(RuntimeError(message)).status_code == status
+
+
+class _StatusError(Exception):
+    def __init__(self, message: str, status_code: object) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
+def test_error_response_prefers_status_carried_by_exception(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend, _instance = make_backend(monkeypatch)
+
+    # Text says rate limit, the exception says 400: the exception wins.
+    bad = backend._error_response(_StatusError("rate limit in the text", 400))
+    assert bad.status_code == 400
+    assert bad.body["error"]["type"] == "invalid_request_error"
+
+    rate = backend._error_response(_StatusError("slow down", 429), openai_format=True)
+    assert rate.status_code == 429
+    assert rate.body["error"]["type"] == "rate_limit_exceeded"
+
+    missing = backend._error_response(_StatusError("gone", 404))
+    assert missing.status_code == 404
+    assert missing.body["error"]["type"] == "not_found_error"
+
+    # A non-4xx or non-int status is ignored and the text path decides.
+    assert backend._error_response(_StatusError("boom", 503)).status_code == 500
+    assert backend._error_response(_StatusError("rate limit", "429")).status_code == 429
+
+
+def _unified_openai_400() -> Exception:
+    """The exception the locked any-llm SDK raises with ANY_LLM_UNIFIED_EXCEPTIONS=1."""
+    httpx = pytest.importorskip("httpx")
+    openai = pytest.importorskip("openai")
+    handler = pytest.importorskip("any_llm.utils.exception_handler")
+    response = httpx.Response(400, request=httpx.Request("POST", "https://api.openai.com/v1"))
+    original = openai.BadRequestError(
+        "This model maximum context length is 8192 tokens",
+        response=response,
+        body={"code": "context_length_exceeded"},
+    )
+    converted = handler.convert_exception(original, "openai")
+    converted.__cause__ = original
+    return converted
+
+
+@pytest.mark.parametrize("openai_format", [True, False])
+def test_error_response_keeps_status_of_wrapped_provider_exception(
+    monkeypatch: pytest.MonkeyPatch, openai_format: bool
+) -> None:
+    backend, _instance = make_backend(monkeypatch)
+
+    response = backend._error_response(_unified_openai_400(), openai_format=openai_format)
+
+    assert response.status_code == 400
+    assert response.body["error"]["type"] == "invalid_request_error"
+
+
+@pytest.mark.asyncio
+async def test_send_openai_message_unified_400_stays_400(monkeypatch: pytest.MonkeyPatch) -> None:
+    backend, instance = make_backend(monkeypatch)
+    instance.raise_error = _unified_openai_400()
+
+    result = await backend.send_openai_message(
+        {"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]}, {}
+    )
+
+    assert result.status_code == 400
+    assert result.body["error"]["type"] == "invalid_request_error"
+
+
+def test_error_response_maps_sdk_rate_limit_error_without_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    handler = pytest.importorskip("any_llm.utils.exception_handler")
+    backend, _instance = make_backend(monkeypatch)
+
+    converted = handler.convert_exception(
+        RuntimeError("Quota exceeded: token limit reached"), "test-provider"
+    )
+    assert type(converted).__name__ == "RateLimitError"
+
+    response = backend._error_response(converted)
+
+    assert response.status_code == 429
+    assert response.body["error"]["type"] == "rate_limit_error"
+
+
+@pytest.mark.parametrize(
+    ("openai_format", "error_type"),
+    [(True, "model_not_found"), (False, "not_found_error")],
+)
+def test_error_response_maps_sdk_model_not_found_error_without_status(
+    monkeypatch: pytest.MonkeyPatch, openai_format: bool, error_type: str
+) -> None:
+    handler = pytest.importorskip("any_llm.utils.exception_handler")
+    backend, _instance = make_backend(monkeypatch)
+
+    converted = handler.convert_exception(
+        RuntimeError("The model requested does not exist"), "test-provider"
+    )
+    assert type(converted).__name__ == "ModelNotFoundError"
+
+    response = backend._error_response(converted, openai_format=openai_format)
+
+    assert response.status_code == 404
+    assert response.body["error"]["type"] == error_type
+
+
 @pytest.mark.asyncio
 async def test_close_is_noop(monkeypatch: pytest.MonkeyPatch) -> None:
     backend, _instance = make_backend(monkeypatch)
     assert await backend.close() is None
     assert isinstance(StreamEvent(event_type="message_start", data={}), StreamEvent)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("wire_format", ["anthropic", "openai"])
+@pytest.mark.parametrize("streaming", [False, True])
+async def test_send_message_forwards_service_tier(
+    monkeypatch: pytest.MonkeyPatch, wire_format: str, streaming: bool
+) -> None:
+    """service_tier is a standard provider param — forward it, don't drop it."""
+    backend, instance = make_backend(monkeypatch)
+    instance.response = (
+        FakeAsyncStream([])
+        if streaming
+        else make_response(
+            make_choice("done", "stop"),
+            usage=SimpleNamespace(prompt_tokens=1, completion_tokens=1, total_tokens=2),
+        )
+    )
+    body = {
+        "model": "claude-3-7-sonnet",
+        "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}],
+        "max_tokens": 16,
+        "service_tier": "standard_only",
+    }
+    if streaming:
+        method = (
+            backend.stream_message if wire_format == "anthropic" else backend.stream_openai_message
+        )
+        events = [event async for event in method(body, {})]
+        assert events
+    else:
+        method = backend.send_message if wire_format == "anthropic" else backend.send_openai_message
+        assert (await method(body, {})).status_code == 200
+    assert instance.calls[0]["service_tier"] == "standard_only"

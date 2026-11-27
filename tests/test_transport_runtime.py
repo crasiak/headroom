@@ -55,7 +55,9 @@ def test_transport_app_is_stateless_and_has_no_fallback(tmp_path, monkeypatch) -
     assert config.lossless is True
     assert config.compression_required is True
     assert config.cache_enabled is False
-    assert config.fallback_enabled is False
+    # The merged upstream config has no provider-fallback capability at all.
+    assert not hasattr(config, "fallback_enabled")
+    assert not hasattr(config, "fallback_provider")
     assert config.log_full_messages is False
     assert not (tmp_path / "workspace").exists()
 
