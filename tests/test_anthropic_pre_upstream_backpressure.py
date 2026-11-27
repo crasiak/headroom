@@ -1036,6 +1036,37 @@ class _SecurityBlock:
         raise self._Err("blocked by security policy")
 
 
+@pytest.mark.parametrize("blocked", [True, False])
+def test_security_scan_does_not_disclose_exception_details(blocked, caplog):
+    private = "private-path=/secret/scanner token=secret-fixture-value"
+
+    class Scanner:
+        def scan_request(self, _messages, _ctx):
+            raise _SecurityBlock._Err(private) if blocked else RuntimeError(private)
+
+    sem = asyncio.Semaphore(1)
+    handler = _DummyAnthropicHandler(anthropic_pre_upstream_sem=sem, security=Scanner())
+    request = _build_request(
+        {
+            "model": "claude-3-5-sonnet-latest",
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+        {"authorization": "Bearer sk-ant-api-test"},
+    )
+    with _tokenizer_patch(), caplog.at_level(logging.WARNING):
+        response = anyio.run(handler.handle_anthropic_messages, request)
+    assert response.status_code == (403 if blocked else 200)
+    if blocked:
+        assert json.loads(response.body)["error"] == {
+            "type": "security_block",
+            "message": "Request blocked by security policy.",
+        }
+        assert handler.upstream_enter_times == []
+    assert private not in response.body.decode()
+    assert private not in caplog.text
+    assert sem._value == 1
+
+
 class _CacheHit:
     def __init__(self) -> None:
         # A real ``CacheEntry`` rather than a hand-rolled stand-in: the
