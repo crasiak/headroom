@@ -1,0 +1,4 @@
+{
+  "reason": "No accepted advisories. The integrity-pinned npm 12.2.1-crasiak.1 artifact retains the complete reviewed bundled security profile; CI audits every severity without exceptions.",
+  "advisories": {}
+}

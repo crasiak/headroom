@@ -66,6 +66,66 @@ def test_no_rewrite_loop(tmp_path):
     assert r.tick() is False
 
 
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://127.0.0.1:8787",
+        "http://127.0.0.1:8787/",
+        "http://127.0.0.1:8787/v1",
+        "http://localhost:8787",
+        "http://LOCALHOST:8787/v1/",
+    ],
+)
+def test_proxy_own_url_spellings_are_not_captured(tmp_path, url):
+    r, sf, captured = _make(tmp_path)
+    _write(sf, {"env": {"ANTHROPIC_BASE_URL": url}})
+    assert r.tick() is False
+    assert captured == []
+    assert r.current_upstream is None
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://127.0.0.1:8788",
+        "http://localhost:9999/v1",
+        "https://127.0.0.1:8787",
+        "http://[::1]:8787",
+        "https://api.deepseek.com/anthropic",
+    ],
+)
+def test_other_ports_and_hosts_are_still_captured(tmp_path, url):
+    r, sf, captured = _make(tmp_path)
+    _write(sf, {"env": {"ANTHROPIC_BASE_URL": url}})
+    assert r.tick() is True
+    assert captured == [url]
+
+
+@pytest.mark.parametrize("url", ["http://127.0.0.1:99999", "http://[::1"])
+def test_unparseable_base_url_is_not_treated_as_the_proxy(tmp_path, url):
+    # urlsplit raises ValueError for these; such a URL is not this proxy.
+    r, sf, captured = _make(tmp_path)
+    _write(sf, {"env": {"ANTHROPIC_BASE_URL": url}})
+    assert r.tick() is True
+    assert captured == [url]
+
+
+def test_ipv6_proxy_address_is_self_only_for_ipv6_bind(tmp_path):
+    sf = tmp_path / "settings.json"
+    captured: list[str] = []
+    r = CCSwitchReconciler(
+        proxy_url="http://[::1]:8787",
+        default_upstream=DEFAULT,
+        set_upstream=captured.append,
+        path=sf,
+    )
+    _write(sf, {"env": {"ANTHROPIC_BASE_URL": "http://[::1]:8787"}})
+    assert r.tick() is False
+    _write(sf, {"env": {"ANTHROPIC_BASE_URL": "http://127.0.0.1:8787"}})
+    assert r.tick() is True
+    assert captured == ["http://127.0.0.1:8787"]
+
+
 def test_switching_provider_recaptures(tmp_path):
     r, sf, captured = _make(tmp_path)
     _write(
@@ -115,6 +175,33 @@ def test_official_left_direct_by_default(tmp_path, monkeypatch):
     assert json.loads(sf.read_text())["env"] == {}
 
 
+def test_official_resets_a_captured_third_party_upstream(tmp_path, monkeypatch):
+    monkeypatch.delenv("HEADROOM_CC_SWITCH_ROUTE_OFFICIAL", raising=False)
+    r, sf, captured = _make(tmp_path)
+    _write(sf, {"env": {"ANTHROPIC_BASE_URL": "https://api.kimi.com/anthropic"}})
+    assert r.tick() is True
+    assert captured[-1] == "https://api.kimi.com/anthropic"
+
+    # Switching back to Claude Official leaves settings.json direct, but the
+    # process-wide upstream must not stay on Kimi -- otherwise Anthropic OAuth
+    # traffic from any client still routed through this proxy is sent there.
+    _write(sf, {"env": {}})
+    assert r.tick() is False
+    assert json.loads(sf.read_text())["env"] == {}
+    assert captured[-1] == DEFAULT
+    assert r.current_upstream == DEFAULT
+
+
+def test_official_does_not_reset_upstream_when_never_captured(tmp_path, monkeypatch):
+    monkeypatch.delenv("HEADROOM_CC_SWITCH_ROUTE_OFFICIAL", raising=False)
+    r, sf, captured = _make(tmp_path)
+    _write(sf, {"env": {}})
+    assert r.tick() is False
+    # Nothing was captured, so nothing to reset: an operator-configured
+    # upstream must not be clobbered by a passing official tick.
+    assert captured == []
+
+
 def test_official_routed_when_opted_in(tmp_path, monkeypatch):
     monkeypatch.setenv("HEADROOM_CC_SWITCH_ROUTE_OFFICIAL", "1")
     r, sf, captured = _make(tmp_path)
@@ -122,6 +209,40 @@ def test_official_routed_when_opted_in(tmp_path, monkeypatch):
     assert r.tick() is True
     assert json.loads(sf.read_text())["env"]["ANTHROPIC_BASE_URL"] == PROXY
     assert captured[-1] == DEFAULT
+
+
+_THIRD_PARTY = {
+    "env": {
+        "ANTHROPIC_BASE_URL": "https://api.deepseek.com/anthropic",
+        "ANTHROPIC_AUTH_TOKEN": "sk-x",
+    }
+}
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX mode bits")
+def test_rewrite_keeps_owner_only_mode(tmp_path):
+    old_umask = os.umask(0o022)
+    try:
+        r, sf, _ = _make(tmp_path)
+        _write(sf, _THIRD_PARTY)
+        sf.chmod(0o600)
+        assert r.tick() is True
+        assert json.loads(sf.read_text())["env"]["ANTHROPIC_BASE_URL"] == PROXY
+        assert (sf.stat().st_mode & 0o777) == 0o600
+    finally:
+        os.umask(old_umask)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlinks need privileges on Windows")
+def test_rewrite_writes_through_a_symlinked_settings_file(tmp_path):
+    r, sf, _ = _make(tmp_path)
+    real = tmp_path / "dotfiles" / "settings.json"
+    real.parent.mkdir()
+    _write(real, _THIRD_PARTY)
+    sf.symlink_to(real)
+    assert r.tick() is True
+    assert sf.is_symlink()
+    assert json.loads(real.read_text())["env"]["ANTHROPIC_BASE_URL"] == PROXY
 
 
 def test_missing_file_is_noop(tmp_path):
@@ -162,3 +283,24 @@ def test_enabled_flag(monkeypatch, val, expected):
 
     monkeypatch.setenv("HEADROOM_CC_SWITCH_RECONCILE", val)
     assert reconciler_enabled() is expected
+
+
+@pytest.mark.windows_newline
+def test_rewrite_pins_lf_newlines(tmp_path, monkeypatch):
+    import headroom.fsutil as fsutil
+
+    calls: list[dict] = []
+    real_fdopen = fsutil.os.fdopen
+
+    def fdopen(fd, *args, **kwargs):
+        calls.append(kwargs)
+        return real_fdopen(fd, *args, **kwargs)
+
+    monkeypatch.setattr(fsutil.os, "fdopen", fdopen)
+    r, sf, _ = _make(tmp_path)
+    _write(sf, _THIRD_PARTY)
+    assert r.tick() is True
+    assert [call.get("newline") for call in calls] == [""]
+    raw = sf.read_bytes()
+    assert b"\r" not in raw
+    assert raw.endswith(b"\n")

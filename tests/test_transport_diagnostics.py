@@ -21,6 +21,8 @@ from headroom.transport.protocol import ProcessIdentity
     ],
 )
 def test_typed_reader_failure_is_unavailable(monkeypatch, failure, reason):
+    monkeypatch.setattr("headroom.transport.protocol.sys", SimpleNamespace(platform="linux"))
+
     def fail(*args, **kwargs):
         raise failure
 
@@ -34,6 +36,8 @@ def test_typed_reader_failure_is_unavailable(monkeypatch, failure, reason):
 
 
 def test_missing_pid_retains_reader_error(monkeypatch):
+    monkeypatch.setattr("headroom.transport.protocol.sys", SimpleNamespace(platform="linux"))
+
     def fail(*args, **kwargs):
         raise subprocess.TimeoutExpired("ps", 2)
 

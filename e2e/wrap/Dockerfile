@@ -25,12 +25,12 @@ FROM quay.io/pypa/manylinux_2_28_x86_64 AS builder
 ENV CARGO_HOME=/usr/local/cargo \
     RUSTUP_HOME=/usr/local/rustup \
     PATH=/usr/local/cargo/bin:/opt/python/cp311-cp311/bin:${PATH}
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-      | sh -s -- -y --no-modify-path --profile minimal -c rustfmt -c clippy --default-toolchain 1.95.0
+COPY scripts/install-rustup.sh /tmp/install-rustup.sh
+RUN sh /tmp/install-rustup.sh -y --no-modify-path --profile minimal -c rustfmt -c clippy --default-toolchain 1.95.0
 
 WORKDIR /build
 
-COPY pyproject.toml uv.lock README.md ./
+COPY pyproject.toml uv.lock README.md README-pypi.md ./
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates/ crates/
 COPY headroom/ headroom/
@@ -55,6 +55,9 @@ RUN /opt/python/cp311-cp311/bin/pip install 'maturin>=1.5,<2.0' && \
 # headers). Bookworm's libc.so.6 doesn't export these wrappers, so
 # `import headroom._core` fails at runtime. Trixie's glibc 2.41 does.
 #
+# Node 24.22.2 from the official multi-platform image; no NodeSource setup script.
+FROM node:24-bookworm-slim@sha256:01d566e8d94d8c619591d78652babfccd3c6992a3dffa9ed5ab39e11cf6c70e9 AS wrap-node
+
 # We need Python 3.11 here (aider-chat==0.86.2 requires Python <3.12).
 # Trixie's default `python3` is 3.13 — too new for aider. python:3.11-slim
 # gives us Python 3.11 + trixie glibc + apt access for installing Node.
@@ -70,17 +73,23 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONDONTWRITEBYTECODE=1
 
 # Pinned OpenClaw 2026.10.7 requires Node >=24.22.1 <25 (or >=26.12.1).
-# Install the Node 24 LTS line alongside Python 3.11. Also install git for packages
+# Use the digest-pinned Node stage above; also install git for packages
 # that clone at install time.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
       ca-certificates \
       curl \
       git \
-      gnupg && \
-    curl -fsSL https://deb.nodesource.com/setup_24.x | bash - && \
-    apt-get install -y --no-install-recommends nodejs && \
+        gnupg \
+        libstdc++6 \
+        libatomic1 && \
     rm -rf /var/lib/apt/lists/*
+
+COPY --from=wrap-node /usr/local/bin/node /usr/local/bin/node
+COPY --from=wrap-node /usr/local/lib/node_modules/ /usr/local/lib/node_modules/
+RUN ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm && \
+    ln -s ../lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx && \
+    ln -s ../lib/node_modules/corepack/dist/corepack.js /usr/local/bin/corepack
 
 # CRA-1534: use the same qualified distribution globally and inside wrap-tools.
 # Verify public artifact bytes before installing; no user runtime is changed.
@@ -111,17 +120,20 @@ RUN npm install -g --ignore-scripts --no-fund --no-audit /tmp/cra1534-npm.tgz &&
     SECURITY_NPM_LOCK=/tmp/cra1534-npm-lock.json \
     node --test /tmp/cra1534-test-security-npm.mjs
 
+
 # Freeze transitive CLI dependencies as well as the top-level versions.
 # Global npm install re-resolves ranges and can select partially published
 # dependency releases; npm ci consumes the reviewed lockfile instead.
-COPY e2e/wrap/tools/package.json e2e/wrap/tools/package-lock.json /opt/wrap-tools/
-# npm12 permits only the explicitly declared root artifact URL, never all remote
-# transitive URLs. Keep normal reviewed image lifecycle behavior; do not bypass
-# npm's script policy. Verify both actual npm copies rather than only the lock.
-RUN npm ci --prefix /opt/wrap-tools --allow-remote=root --no-fund --no-audit && \
+COPY e2e/wrap/tools/package.json e2e/wrap/tools/package-lock.json e2e/wrap/tools/.npmrc /opt/wrap-tools/
+# Permit only the integrity-bound root artifact URL; retain strict, versioned
+# lifecycle review and verify both actual npm inventories, not just lock rows.
+RUN npm ci --prefix /opt/wrap-tools --allow-remote=root --no-fund --no-audit --strict-allow-scripts && \
     SECURITY_NPM_PACKAGE=/opt/wrap-tools/node_modules/npm \
     SECURITY_NPM_LOCK=/tmp/cra1534-npm-lock.json \
     node --test /tmp/cra1534-test-security-npm.mjs
+
+COPY e2e/wrap/tools/dependency-regression.test.cjs e2e/wrap/tools/npm-audit-exceptions.json /opt/wrap-tools/
+RUN npm test --prefix /opt/wrap-tools
 
 WORKDIR /workspace
 
@@ -136,6 +148,7 @@ COPY --from=builder /dist/*.whl /tmp/wheels/
 # triggering the same `ModuleNotFoundError` the wheel install fixes.
 COPY sdk/typescript ./sdk/typescript
 COPY plugins/openclaw ./plugins/openclaw
+COPY scripts/install-opencode.sh /tmp/install-opencode.sh
 
 # Install the prebuilt manylinux wheel with [proxy] extras. Pip resolves
 # extras from the wheel's metadata and pulls deps from public PyPI. The
@@ -148,11 +161,10 @@ RUN python -m venv /opt/headroom-venv && \
     python -m venv /opt/aider-venv && \
     /opt/aider-venv/bin/python -m pip install --upgrade pip && \
     /opt/aider-venv/bin/python -m pip install "aider-chat==${AIDER_CHAT_VERSION}" && \
-    curl -fsSL https://opencode.ai/install | VERSION="${OPENCODE_VERSION}" bash
+    sh /tmp/install-opencode.sh "${OPENCODE_VERSION}"
 
-# The opencode installer adds its bin dir to .bashrc. Non-login shells
-# (including CMD, docker run, and e2e shims spawned by subprocess) won't
-# source .bashrc, so add the dir to PATH explicitly. The e2e shim shadows
+# Expose the installed binary to non-login shells (including CMD, docker run,
+# and e2e shims spawned by subprocess). The e2e shim shadows
 # opencode anyway, but this guarantees `which opencode` works for
 # diagnostics.
 ENV PATH="/root/.opencode/bin:${PATH}"

@@ -75,8 +75,11 @@ def test_loopback_origins_allowed_on_any_port(monkeypatch: pytest.MonkeyPatch, o
 def test_cross_origin_pages_rejected(monkeypatch: pytest.MonkeyPatch, origin: str) -> None:
     monkeypatch.delenv("HEADROOM_CORS_ORIGINS", raising=False)
     resp = _preflight(_make_client(), origin)
-    # A disallowed origin is never echoed back, so the browser blocks the read.
-    assert resp.headers.get("access-control-allow-origin") != origin
+    # No allow-origin header at all, so the browser blocks the read. Checking
+    # only that the origin is not echoed would accept a "*" answer. Today the
+    # security gate refuses these origins before CORS runs; this assertion
+    # still holds if the gate ever lets one through to a "*" CORS layer.
+    assert resp.headers.get("access-control-allow-origin") is None
 
 
 def test_explicit_allowlist_override(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -89,13 +92,25 @@ def test_explicit_allowlist_override(monkeypatch: pytest.MonkeyPatch) -> None:
 
     # Once an explicit list is set, loopback is no longer implicitly trusted.
     blocked = _preflight(client, "http://localhost:8787")
-    assert blocked.headers.get("access-control-allow-origin") != "http://localhost:8787"
+    assert blocked.headers.get("access-control-allow-origin") is None
 
 
 def test_wildcard_optback(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("HEADROOM_CORS_ORIGINS", "*")
-    resp = _preflight(_make_client(), "http://evil.com")
-    assert resp.status_code == 200
-    assert resp.headers.get("access-control-allow-origin") == "*"
+    monkeypatch.delenv("HEADROOM_WS_ORIGINS", raising=False)
+    client = _make_client()
+
+    # "*" widens which pages may read a response; it does not let a foreign
+    # page drive the proxy, so the security gate refuses it before CORS runs.
+    foreign = _preflight(client, "http://evil.com")
+    assert foreign.status_code == 403
+    assert foreign.headers.get("access-control-allow-origin") is None
+    refused_post = client.post("/v1/messages", content="{}", headers={"Origin": "http://evil.com"})
+    assert refused_post.status_code == 403
+
+    # A page the proxy trusts still gets the wildcard answer.
+    local = _preflight(client, "http://127.0.0.1:8787")
+    assert local.status_code == 200
+    assert local.headers.get("access-control-allow-origin") == "*"
     # Wildcard opt-back must not silently re-enable credentialed reads.
-    assert resp.headers.get("access-control-allow-credentials") != "true"
+    assert local.headers.get("access-control-allow-credentials") != "true"

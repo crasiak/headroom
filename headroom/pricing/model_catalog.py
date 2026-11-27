@@ -28,6 +28,8 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 
+from headroom.pricing.deepseek_tiers import FLAT_PRICING_IDS, flat_pricing_row
+
 logger = logging.getLogger(__name__)
 
 SCHEMA_VERSION = 1
@@ -52,7 +54,9 @@ _RATE_FIELD = re.compile(
     r"|cache_creation_input_token_cost_above_1hr)(_above_\d+k_tokens)?"
 )
 TEXT_FIELDS = frozenset({"litellm_provider", "mode"})
-LIMIT_FIELDS = frozenset({"max_tokens", "max_input_tokens", "max_output_tokens"})
+LIMIT_FIELDS = frozenset(
+    {"max_tokens", "max_input_tokens", "max_output_tokens", "prompt_cache_min_tokens"}
+)
 
 
 class CatalogError(ValueError):
@@ -72,12 +76,31 @@ class ModelCatalog:
     litellm_version: str
     # Lower-cased key -> first key with that spelling, for case-insensitive lookups.
     _folded: Mapping[str, str] = field(init=False, repr=False, compare=False)
+    # Separate immutable flat-price view. Trusted upstream vendor corrections
+    # cannot widen telemetry membership or mutate the raw pinned evidence.
+    pricing_models: Mapping[str, Mapping[str, Any]] = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         folded: dict[str, str] = {}
         for name in self.models:
             folded.setdefault(name.lower(), name)
         object.__setattr__(self, "_folded", MappingProxyType(folded))
+        priced = {name: MappingProxyType(dict(row)) for name, row in self.models.items()}
+        for model, canonical in FLAT_PRICING_IDS.items():
+            for name in (model, f"deepseek/{model}"):
+                priced[name] = MappingProxyType(
+                    {**priced.get(name, {}), **flat_pricing_row(canonical)}
+                )
+        object.__setattr__(self, "pricing_models", MappingProxyType(priced))
+
+    def is_pricing_resolvable(self, name: str) -> bool:
+        # Only the exact SDK registration keys are added, never vendor-like
+        # arbitrary prefixes or free/other tags from client-controlled names.
+        return name in self.pricing_models and (
+            self.is_resolvable(name)
+            or name in FLAT_PRICING_IDS
+            or name.removeprefix("deepseek/") in FLAT_PRICING_IDS
+        )
 
     def is_resolvable(self, name: str) -> bool:
         return name in self.models and name not in self.unresolvable

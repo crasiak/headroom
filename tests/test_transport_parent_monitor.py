@@ -23,7 +23,8 @@ from headroom.transport.runtime import (
 
 
 @pytest.fixture
-def parent() -> ProcessIdentity:
+def parent(monkeypatch: pytest.MonkeyPatch) -> ProcessIdentity:
+    monkeypatch.setattr("headroom.transport.protocol.sys", SimpleNamespace(platform="linux"))
     identity = _ps_process_identity(os.getpid())
     assert identity is not None
     return identity

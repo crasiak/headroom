@@ -12,11 +12,12 @@
 //! - [`HfTokenizer::from_bytes`] — for tokenizers embedded via `include_bytes!`.
 //! - [`HfTokenizer::from_file`] — for a local `tokenizer.json`.
 //! - [`HfTokenizer::from_pretrained`] — pulls `tokenizer.json` from the
-//!   HuggingFace Hub via `hf-hub`. First call downloads to
-//!   `~/.cache/huggingface/hub`, subsequent calls hit the cache. Blocking;
+//!   HuggingFace Hub via `hf-hub`. First call downloads into the hub cache
+//!   Python's `huggingface_hub` uses (`HF_HUB_CACHE`, `HF_HOME/hub`,
+//!   `~/.cache/huggingface/hub`, …), subsequent calls hit it. Blocking;
 //!   call from `main()` or `tokio::task::spawn_blocking`. Gated repos
-//!   (Llama, Mistral) require an `HF_TOKEN` env var or a token in
-//!   `~/.cache/huggingface/token`.
+//!   (Llama, Mistral) need a token: `HF_TOKEN`, or the file
+//!   `hf auth login` writes (`HF_HOME/token`, or `HF_TOKEN_PATH`).
 //!
 //! # What's NOT here
 //! - **No tokenizer.json bundled in the binary.** Bundling Llama / Cohere
@@ -49,6 +50,13 @@ pub enum HfTokenizerError {
         #[source]
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+    /// `HEADROOM_OFFLINE` is set, so the Hub fetch was refused before any
+    /// socket was opened. Deliberately a separate variant from [`Self::Hub`]:
+    /// a caller that retries or falls back on a transient download failure
+    /// must not do either here — the operator asked for no egress, and
+    /// retrying an air-gap refusal is just a slower refusal.
+    #[error(transparent)]
+    Offline(#[from] crate::offline::OfflineEgressBlocked),
 }
 
 /// Token counter backed by a HuggingFace `tokenizer.json`.
@@ -104,23 +112,85 @@ impl HfTokenizer {
     /// HuggingFace Hub and load it. `repo` is the canonical Hub identifier,
     /// e.g. `"CohereForAI/c4ai-command-r-v01"` or `"meta-llama/Meta-Llama-3-8B"`.
     ///
-    /// Uses the `main` revision. Blocking — calls into `ureq` synchronously.
-    /// First successful call writes the file to `~/.cache/huggingface/hub`
-    /// (or `$HF_HOME` if set); subsequent calls in the same or later
-    /// processes hit the on-disk cache.
+    /// Fetches at the repo's pinned commit ([`crate::hf_pins`]), not `main`:
+    /// tokenizer bytes decide every token count the proxy reports, so a floating
+    /// revision means the same model can be counted differently after an
+    /// upstream push with no change here (GH #4939). Use
+    /// [`Self::from_pretrained_at`] to name a revision explicitly, and
+    /// `HEADROOM_HF_PIN=off` to float deliberately.
+    ///
+    /// Blocking — calls into `ureq` synchronously.
+    /// The file lands in the hub cache directory Python's `huggingface_hub`
+    /// would use ([`crate::hf_cache::hub_cache_dir`]: `HF_HUB_CACHE`, then
+    /// `HUGGINGFACE_HUB_CACHE`, `HF_HOME/hub`, `XDG_CACHE_HOME/huggingface/hub`,
+    /// `~/.cache/huggingface/hub`), so later calls, and the Python side, hit
+    /// the same copy. The token and `HF_ENDPOINT` are read as Python reads
+    /// them too ([`crate::hf_cache::hf_token`]); `hf-hub`'s own defaults
+    /// ignore every variable but `HF_HOME`, and with `Api::new` even that.
     ///
     /// Errors:
+    /// - [`HfTokenizerError::Offline`] when `HEADROOM_OFFLINE` is set. Refused
+    ///   before any socket is opened; see below.
     /// - [`HfTokenizerError::Hub`] for download failures (no network, 404,
     ///   401 on a gated model without `HF_TOKEN`).
     /// - [`HfTokenizerError::Load`] if the downloaded bytes don't parse as
     ///   a valid `tokenizer.json`. Should not happen for healthy HF repos.
     pub fn from_pretrained(repo: &str) -> Result<Self, HfTokenizerError> {
-        let api = hf_hub::api::sync::Api::new().map_err(|e| HfTokenizerError::Hub {
-            repo: repo.to_string(),
-            source: Box::new(e),
-        })?;
-        let path = api
-            .model(repo.to_string())
+        Self::from_pretrained_at(repo, None)
+    }
+
+    /// [`Self::from_pretrained`] with an explicit revision.
+    ///
+    /// `revision: None` means "the pin for `repo`, or the default branch for a
+    /// repo we do not ship". Anything else is used verbatim — a commit SHA, a
+    /// tag, or a branch — so a caller with its own vendored snapshot (or a
+    /// mirror) can point at it without editing the shared table.
+    pub fn from_pretrained_at(
+        repo: &str,
+        revision: Option<&str>,
+    ) -> Result<Self, HfTokenizerError> {
+        // Pinned commits (GH #4939): `Api::model` hard-codes `main`, so the
+        // revision is resolved first and every fetch below names it.
+        let pinned = crate::hf_pins::resolve(repo, revision);
+        // Warm-cache path, network-free. `hf-hub` resolves every revision
+        // through `refs/<revision>`, but Python's `huggingface_hub` writes
+        // `snapshots/<sha>/` with NO `refs/<sha>` (refs point at branches), so
+        // a cache Python seeded at a pin was a miss here and re-downloaded.
+        // Reading the snapshot directly first makes a Python-style warm cache a
+        // hit, which also lets an air-gapped host serve a pre-seeded pin without
+        // a socket — see the air-gap note below, which this now relaxes.
+        if let Some(path) = cached_tokenizer(repo, pinned) {
+            return Self::from_file(repo, path);
+        }
+        // Air-gap chokepoint, matching `headroom/offline.py`'s `guard_egress`.
+        // This is the Rust half of the same switch, so an operator who sets
+        // HEADROOM_OFFLINE=1 gets the same refusal whichever runtime reaches
+        // for the Hub.
+        //
+        // `crate::hf_cache::hub_api` runs the guard before it builds the
+        // client, rather than around the `get` below: building it creates the
+        // `ureq` agent and resolves the endpoint, and hf-hub's own
+        // HF_HUB_OFFLINE handling only covers the cache lookup — a cache miss
+        // still dials out. So the air-gapped case never constructs a client.
+        //
+        // The refusal is hard on purpose. Silently returning an estimating
+        // tokenizer would leave token counts subtly wrong with no signal; the
+        // caller (`tokenizer::registry::try_register_hf`) already propagates
+        // the error so the operator sees which repo was wanted.
+        //
+        // It only refuses on a genuine cache miss: `cached_tokenizer` above
+        // already served a pre-seeded pin, which is the case an air-gapped
+        // deployment cares about. A miss still refuses rather than downloading.
+        let api = hub_api(repo)?;
+        let handle = match pinned {
+            Some(rev) => api.repo(hf_hub::Repo::with_revision(
+                repo.to_string(),
+                hf_hub::RepoType::Model,
+                rev.to_string(),
+            )),
+            None => api.model(repo.to_string()),
+        };
+        let path = handle
             .get("tokenizer.json")
             .map_err(|e| HfTokenizerError::Hub {
                 repo: repo.to_string(),
@@ -136,6 +206,46 @@ impl HfTokenizer {
     pub fn name(&self) -> &str {
         &self.name
     }
+}
+
+/// The cached `tokenizer.json` for `repo` at `revision` (`None` = let the cache
+/// resolve the default branch), or `None` when it is not on disk.
+///
+/// `crate::hf_cache::snapshot_path` already resolves a commit SHA as the
+/// snapshot directory directly and a branch through `refs/<branch>`, which is
+/// exactly Python's layout. Read before the `hf-hub` client is built so a warm
+/// cache never opens a socket — and so a Python-seeded pin (which has no
+/// `refs/<sha>`) is a hit rather than a re-download.
+fn cached_tokenizer(repo: &str, revision: Option<&str>) -> Option<std::path::PathBuf> {
+    let cache = crate::hf_cache::hub_cache_dir()?;
+    let revision = revision?;
+    let path = crate::hf_cache::snapshot_path(&cache, repo, revision).join("tokenizer.json");
+    path.is_file().then_some(path)
+}
+
+/// The Hub client for [`HfTokenizer::from_pretrained`] fetching `repo`:
+/// caching in Python's hub cache directory, with Python's token and endpoint.
+/// Refuses with [`HfTokenizerError::Offline`] under `HEADROOM_OFFLINE`.
+fn hub_api(repo: &str) -> Result<hf_hub::api::sync::Api, HfTokenizerError> {
+    use crate::hf_cache::HubApiError;
+    const PURPOSE: &str = "HuggingFace tokenizer download";
+
+    let hub_error = |source: Box<dyn std::error::Error + Send + Sync>| HfTokenizerError::Hub {
+        repo: repo.to_string(),
+        source,
+    };
+    let Some(cache) = crate::hf_cache::hub_cache_dir() else {
+        // Offline still wins: the caller treats `Offline` as final, and a
+        // missing cache directory is no reason to report a Hub failure.
+        crate::offline::guard_egress(PURPOSE, repo)?;
+        return Err(hub_error(
+            "no HuggingFace cache directory (set HF_HUB_CACHE or HF_HOME)".into(),
+        ));
+    };
+    crate::hf_cache::hub_api(&cache, PURPOSE, repo).map_err(|e| match e {
+        HubApiError::Offline(blocked) => HfTokenizerError::Offline(blocked),
+        HubApiError::Build(source) => hub_error(Box::new(source)),
+    })
 }
 
 impl Tokenizer for HfTokenizer {
@@ -260,6 +370,41 @@ mod tests {
         assert!(Arc::ptr_eq(&a.inner, &b.inner));
     }
 
+    /// A-2: `HEADROOM_OFFLINE=1` must stop the Hub fetch before a socket exists.
+    ///
+    /// The repo name is deliberately one that cannot exist, which is what makes
+    /// this a real assertion rather than a tautology: without the guard the call
+    /// reaches `hf-hub`, dials `huggingface.co`, gets a 401/404 and returns
+    /// `HfTokenizerError::Hub`. Only the guard can produce `Offline`, and only
+    /// by returning before `hf_cache::hub_api` builds the client — so `Offline` *is* the "no socket was
+    /// opened" assertion for this path. (A packet-level assertion is not
+    /// available to a `cargo test` unit test the way `socket.socket` patching is
+    /// in Python; this typed-error distinction is the equivalent signal.)
+    #[test]
+    fn from_pretrained_refuses_while_offline() {
+        let _guard = crate::test_support::env_lock();
+        std::env::set_var(crate::offline::OFFLINE_ENV, "1");
+        let result = HfTokenizer::from_pretrained("headroomlabs-ai/this-repo-does-not-exist-a2");
+        std::env::remove_var(crate::offline::OFFLINE_ENV);
+
+        match result {
+            Err(HfTokenizerError::Offline(blocked)) => {
+                assert_eq!(blocked.purpose, "HuggingFace tokenizer download");
+                assert_eq!(
+                    blocked.destination,
+                    "headroomlabs-ai/this-repo-does-not-exist-a2"
+                );
+            }
+            Err(other) => panic!("expected an offline refusal, got a network error: {other}"),
+            Ok(_) => panic!("expected an offline refusal, got a tokenizer"),
+        }
+    }
+
+    // The "switch off ⇒ guard is a no-op" half is covered in `crate::offline`'s
+    // own tests rather than here: asserting it through `from_pretrained` would
+    // mean actually dialling huggingface.co, which is exactly the thing a unit
+    // test must not do.
+
     #[test]
     fn from_file_loads_a_real_file() {
         // Round-trip via a temp file to cover the on-disk constructor.
@@ -281,6 +426,155 @@ mod tests {
         assert_eq!(t.count_text("hello world"), 2);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Lay out `tokenizer.json` for `repo` in hub cache `cache`, the way
+    /// Python's `huggingface_hub` leaves a `main` download: a snapshot plus
+    /// `refs/main` naming it.
+    fn cache_main_tokenizer(cache: &std::path::Path, repo: &str) {
+        let repo_dir = cache.join(format!("models--{}", repo.replace('/', "--")));
+        let snapshot = repo_dir.join("snapshots").join("abc123");
+        std::fs::create_dir_all(&snapshot).unwrap();
+        std::fs::write(snapshot.join("tokenizer.json"), TINY_TOKENIZER_JSON).unwrap();
+        std::fs::create_dir_all(repo_dir.join("refs")).unwrap();
+        std::fs::write(repo_dir.join("refs").join("main"), "abc123").unwrap();
+    }
+
+    /// Variables `from_pretrained` reads, saved and restored around a test.
+    fn hub_env() -> crate::hf_cache::tests::CacheEnv {
+        crate::hf_cache::tests::CacheEnv::cleared_with(
+            [
+                "HF_TOKEN",
+                "HUGGING_FACE_HUB_TOKEN",
+                "HF_TOKEN_PATH",
+                "HF_ENDPOINT",
+                "HF_TEST_ROOT",
+            ]
+            .map(String::from),
+        )
+    }
+
+    /// The tokenizer is read from (and would be downloaded into) the hub cache
+    /// Python uses, here an `HF_HUB_CACHE` given through `${VAR}`. Before, it
+    /// was always `~/.cache/huggingface/hub`, so this was a cache miss and a
+    /// download. `HF_ENDPOINT` points at a closed loopback port, so a miss
+    /// fails fast instead of reaching the internet.
+    #[test]
+    fn from_pretrained_reads_the_hub_cache_python_uses() {
+        let _guard = crate::test_support::env_lock();
+        let _env = hub_env();
+        let t = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", t.path().join("home"));
+        std::env::set_var("USERPROFILE", t.path().join("home"));
+        std::env::set_var("HF_TEST_ROOT", t.path());
+        std::env::set_var("HF_HUB_CACHE", "${HF_TEST_ROOT}/hub");
+        std::env::set_var("HF_ENDPOINT", "http://127.0.0.1:9");
+        cache_main_tokenizer(&t.path().join("hub"), "acme/tiny");
+
+        let tokenizer = HfTokenizer::from_pretrained("acme/tiny").expect("served from the cache");
+        assert_eq!(tokenizer.count_text("hello world"), 2);
+    }
+
+    /// A cache seeded at a **commit SHA** with no `refs/<sha>` entry is a hit.
+    ///
+    /// Python's `huggingface_hub` writes `snapshots/<sha>/` and, for a branch,
+    /// a `refs/<branch>` pointer — it never writes `refs/<sha>`. `hf-hub`
+    /// resolves every revision through `refs/<revision>`, so a pinned download
+    /// would look up `refs/<the-pin>`, find nothing, and re-download a snapshot
+    /// that is already on disk. (#4939 review)
+    #[test]
+    fn from_pretrained_reads_a_python_style_sha_snapshot_without_a_ref() {
+        let _guard = crate::test_support::env_lock();
+        let _env = hub_env();
+        let t = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", t.path().join("home"));
+        std::env::set_var("USERPROFILE", t.path().join("home"));
+        std::env::set_var("HF_HUB_CACHE", t.path().join("hub"));
+        // A closed loopback port: if this is a cache miss the test fails with a
+        // connection error instead of silently reaching the real Hub.
+        std::env::set_var("HF_ENDPOINT", "http://127.0.0.1:9");
+
+        let repo = "acme/tiny";
+        let sha = crate::hf_pins::revision(repo).unwrap_or("abc123");
+        let repo_dir = t
+            .path()
+            .join("hub")
+            .join(format!("models--{}", repo.replace('/', "--")));
+        let snapshot = repo_dir.join("snapshots").join(sha);
+        std::fs::create_dir_all(&snapshot).unwrap();
+        std::fs::write(snapshot.join("tokenizer.json"), TINY_TOKENIZER_JSON).unwrap();
+        // Deliberately NO refs/<sha>: that is what Python's cache looks like.
+        assert!(!repo_dir.join("refs").join(sha).exists());
+
+        let tokenizer =
+            HfTokenizer::from_pretrained_at(repo, Some(sha)).expect("served from the cache");
+        assert_eq!(tokenizer.count_text("hello world"), 2);
+    }
+
+    /// A cache miss asks the Hub at `HF_ENDPOINT` with the token from
+    /// `HF_TOKEN`. `hf-hub`'s `Api::new` read neither, so a gated repo
+    /// (Llama, Mistral) failed with 401 even with `HF_TOKEN` set. A loopback
+    /// stand-in for the Hub records the request and answers 404.
+    #[test]
+    fn from_pretrained_sends_hf_token_to_hf_endpoint() {
+        use std::io::{Read, Write};
+        let _guard = crate::test_support::env_lock();
+        let _env = hub_env();
+        let t = tempfile::tempdir().unwrap();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // Waits at most 10 s for the request, so a regression that never
+        // reaches the endpoint fails instead of hanging the suite.
+        listener.set_nonblocking(true).unwrap();
+        let hub = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let mut conn = loop {
+                match listener.accept() {
+                    Ok((conn, _)) => break conn,
+                    Err(_) if std::time::Instant::now() < deadline => {
+                        std::thread::sleep(std::time::Duration::from_millis(20))
+                    }
+                    Err(_) => return String::new(),
+                }
+            };
+            conn.set_nonblocking(false).unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0u8; 1024];
+            while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = conn.read(&mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buf[..n]);
+            }
+            conn.write_all(
+                b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )
+            .unwrap();
+            String::from_utf8_lossy(&request).to_ascii_lowercase()
+        });
+        std::env::set_var("HOME", t.path().join("home"));
+        std::env::set_var("USERPROFILE", t.path().join("home"));
+        std::env::set_var("HF_HUB_CACHE", t.path().join("hub"));
+        // Trailing slash on purpose: Python strips it, and a kept one
+        // would request `//acme/...`.
+        std::env::set_var("HF_ENDPOINT", format!("http://127.0.0.1:{port}/"));
+        std::env::set_var("HF_TOKEN", "hf_test_token");
+
+        let result = HfTokenizer::from_pretrained("acme/gated");
+        let request = hub.join().unwrap();
+        assert!(
+            matches!(result, Err(HfTokenizerError::Hub { .. })),
+            "{result:?}"
+        );
+        assert!(
+            request.contains(" /acme/gated/resolve/main/tokenizer.json "),
+            "{request}"
+        );
+        assert!(
+            request.contains("authorization: bearer hf_test_token"),
+            "{request}"
+        );
     }
 
     /// Network-dependent: hits HuggingFace Hub. Run with
@@ -305,10 +599,86 @@ mod tests {
         // request. Locks in that we propagate Hub errors as `Hub`, not
         // `Load`, so callers can distinguish "couldn't fetch" from
         // "fetched but malformed".
+        //
+        // Runs online: hold the env lock so a parallel test's
+        // `HEADROOM_OFFLINE=1` can't turn this into `Offline`, and clear an
+        // inherited value for the same reason.
+        let _guard = crate::test_support::env_lock();
+        let inherited = std::env::var_os(crate::offline::OFFLINE_ENV);
+        std::env::remove_var(crate::offline::OFFLINE_ENV);
         let r = HfTokenizer::from_pretrained("");
+        if let Some(value) = inherited {
+            std::env::set_var(crate::offline::OFFLINE_ENV, value);
+        }
         assert!(
             matches!(r, Err(HfTokenizerError::Hub { .. })),
             "expected HfTokenizerError::Hub, got {r:?}"
         );
+    }
+
+    /// GH #4939: the download must name an immutable revision for a shipped
+    /// repo, and an explicit override must reach the handle unchanged.
+    ///
+    /// What is asserted is the *resolution*, not the fetch: `from_pretrained`
+    /// opens a socket, and a unit test must not. The `Repo` built from each
+    /// resolution is checked for the revision it would put in the URL.
+    #[test]
+    fn shipped_tokenizer_repos_resolve_to_their_pin() {
+        let _guard = crate::test_support::env_lock();
+        std::env::remove_var(crate::hf_pins::PIN_ENV);
+        for repo in [
+            "meta-llama/Meta-Llama-3-8B",
+            "Qwen/Qwen2.5-7B",
+            "mistralai/Mistral-7B-v0.1",
+        ] {
+            let rev = crate::hf_pins::resolve(repo, None)
+                .unwrap_or_else(|| panic!("{repo} is shipped but unpinned"));
+            let handle = hf_hub::Repo::with_revision(
+                repo.to_string(),
+                hf_hub::RepoType::Model,
+                rev.to_string(),
+            );
+            assert_eq!(handle.revision(), rev);
+            // `url_revision` is what hf-hub splices into the fetch URL, so this
+            // is the closest a unit test gets to "the GET carries the commit".
+            assert_eq!(handle.url_revision(), rev);
+            assert_ne!(handle.url_revision(), "main");
+            assert_eq!(
+                handle.folder_name(),
+                format!("models--{}", repo.replace('/', "--"))
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_revision_beats_the_pin_at_the_entry_point() {
+        let _guard = crate::test_support::env_lock();
+        std::env::remove_var(crate::hf_pins::PIN_ENV);
+        assert_eq!(
+            crate::hf_pins::resolve("meta-llama/Meta-Llama-3-8B", Some("abc123")),
+            Some("abc123")
+        );
+    }
+
+    #[test]
+    fn unpinned_repo_keeps_the_default_branch() {
+        let _guard = crate::test_support::env_lock();
+        std::env::remove_var(crate::hf_pins::PIN_ENV);
+        assert_eq!(crate::hf_pins::resolve("gpt2", None), None);
+    }
+
+    /// The pin must not change which cache directory is used, or every warm
+    /// deployment would re-download the tokenizer once. `hf-hub` keys the
+    /// snapshot dir on the commit and `refs/main` on the branch, so resolving a
+    /// pin adds a `refs/<sha>` entry; it does not relocate the repo dir.
+    #[test]
+    fn pinning_does_not_relocate_the_cache_repo_dir() {
+        let main = hf_hub::Repo::new("gpt2".to_string(), hf_hub::RepoType::Model);
+        let pinned = hf_hub::Repo::with_revision(
+            "gpt2".to_string(),
+            hf_hub::RepoType::Model,
+            "abc123".to_string(),
+        );
+        assert_eq!(main.folder_name(), pinned.folder_name());
     }
 }

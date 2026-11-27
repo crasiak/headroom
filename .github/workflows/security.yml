@@ -33,15 +33,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Python
-        uses: actions/setup-python@v7
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.12"
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v10.1.0
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
 
       - name: Export production dependency set from uv.lock
         run: |
@@ -51,9 +51,109 @@ jobs:
           wc -l requirements-prod.txt
 
       - name: Audit dependencies (pip-audit)
-        uses: pypa/gh-action-pip-audit@v1.1.0
+        # Audit the complete frozen production closure without re-resolution.
+        # Published metadata is independently resolved and audited below.
+        run: uvx pip-audit==2.10.1 -r requirements-prod.txt --no-deps --disable-pip
+
+  # ---- SCA: what `pip install headroom-ai[all]` gets ---------------------
+  # pip ignores [tool.uv], so resolve and audit published metadata separately.
+  # fastembed>=0.9.1 permits Pillow>=13; decoder_guard remains defense in depth,
+  # never an advisory waiver. Python>=3.11 retains the fixed filelock floor.
+  # `uv pip compile` approximates pip on Linux/Python 3.12, not every platform.
+  # It resolves live from PyPI, so a new upstream advisory would fail PRs that
+  # did not cause it: on pull requests it runs only when pyproject.toml changes;
+  # pushes to main and the weekly schedule always run it.
+  published-install-audit:
+    name: Dependency audit (pip install from package metadata)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          inputs: requirements-prod.txt
+          fetch-depth: 0
+
+      - name: Run on this event?
+        id: gate
+        run: |
+          if [ "${{ github.event_name }}" != "pull_request" ] || \
+             git diff --name-only "${{ github.event.pull_request.base.sha }}" HEAD | grep -qx pyproject.toml; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "pyproject.toml unchanged in this PR; main and the weekly run cover it."
+          fi
+
+      - name: Set up Python
+        if: steps.gate.outputs.run == 'true'
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        if: steps.gate.outputs.run == 'true'
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+
+      - name: Resolve what pip installs from the package metadata
+        if: steps.gate.outputs.run == 'true'
+        run: |
+          uv --no-config pip compile pyproject.toml --extra all --python-version 3.12 \
+            --no-header --no-annotate -o published.txt
+          uv --no-config pip compile pyproject.toml --python-version 3.12 \
+            --no-header --no-annotate -o core.txt
+          grep -iE '^(pillow|fastembed)==' published.txt
+
+      - name: The decoder guard holds on that Pillow
+        if: steps.gate.outputs.run == 'true'
+        run: |
+          uv venv -p 3.12 .published
+          uv --no-config pip install -p .published -r core.txt \
+            "$(grep -i '^pillow==' published.txt)" pytest pytest-asyncio
+          .published/bin/python -m pytest -p no:cacheprovider tests/test_image_decoder_guard.py
+          PINNED="$(grep -i '^pillow==' published.txt | cut -d= -f3)" .published/bin/python - <<'PY'
+          import os
+
+          import PIL
+          from headroom.image.decoder_guard import FIXED_PILLOW_MAJOR, pillow_is_safe
+
+          # The guard reads the Pillow that is imported; it must be pip's pick.
+          assert PIL.__version__ == os.environ["PINNED"], (PIL.__version__, os.environ["PINNED"])
+          fixed = int(PIL.__version__.split(".")[0]) >= FIXED_PILLOW_MAJOR
+          assert pillow_is_safe() is fixed, (PIL.__version__, pillow_is_safe())
+          print("Pillow", PIL.__version__, "decodes images:", fixed)
+          PY
+
+      - name: Audit it (pip-audit)
+        if: steps.gate.outputs.run == 'true'
+        run: |
+          uvx pip-audit==2.10.1 -r published.txt --no-deps --disable-pip
+
+  # ---- SCA: Rust dependency advisories -----------------------------------
+  # `cargo audit` reads Cargo.lock only (no build, about a minute), so it runs
+  # unconditionally: every PR, every push to main, and the weekly schedule
+  # above. It used to live in rust.yml behind the `rust-changes` path filter;
+  # pushes that touched no Rust path reported it `skipped`, and rust.yml's own
+  # schedule stopped firing after 2026-09-08, so no advisory scan ran for three
+  # weeks. Blocking: an accepted advisory goes in .cargo/audit.toml with a
+  # written reason.
+  cargo-audit:
+    name: Rust advisories (cargo audit)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install cargo-audit + cargo-deny
+        uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: cargo-audit,cargo-deny
+
+      - name: cargo audit (blocking; exceptions in .cargo/audit.toml)
+        run: cargo audit
+
+      # Licence allow-list from deny.toml. Advisory decisions stay with
+      # cargo-audit above, so there is one place that decides what is accepted.
+      - name: cargo deny check licenses
+        continue-on-error: true
+        run: cargo deny check licenses
 
   # Audit every maintained npm lock, including development dependencies.
   # Lockfile audits do not install packages or execute their lifecycle scripts.
@@ -72,10 +172,12 @@ jobs:
           - e2e/wrap/tools
           - e2e/wrap/tools/npm-security
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: ">=24.16.0 <25"
+      # Every maintained closure, including dev and npm's packed inventory.
+      # No waiver file, severity reduction, or omitted dependency classes.
       - name: Audit locked dependencies at every severity
         working-directory: ${{ matrix.directory }}
         run: npm audit --package-lock-only --audit-level=low
@@ -171,18 +273,24 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        language: [python, javascript-typescript]
+        language: [python, javascript-typescript, actions]
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@v3
+        uses: github/codeql-action/init@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
         with:
           languages: ${{ matrix.language }}
           queries: security-extended
+          # Test code never ships. Its alerts were all test idioms (asserting a
+          # URL appears in output, a fake server binding 0.0.0.0), so scanning
+          # it only buried the real findings.
+          config: |
+            paths-ignore:
+              - tests
 
       - name: Perform CodeQL analysis
-        uses: github/codeql-action/analyze@v3
+        uses: github/codeql-action/analyze@33d7b85da1a04171e211befe2c739303b9a4c066 # v4.39.3
         with:
           category: "/language:${{ matrix.language }}"
 
@@ -197,16 +305,20 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
       - name: Install gitleaks
         run: |
           version=8.18.4
+          # SHA-256 of gitleaks_8.18.4_linux_x64.tar.gz from the release's
+          # gitleaks_8.18.4_checksums.txt. Update both lines together.
+          sha256=ba6dbb656933921c775ee5a2d1c13a91046e7952e9d919f9bac4cec61d628e7d
           curl -sSfL \
             "https://github.com/gitleaks/gitleaks/releases/download/v${version}/gitleaks_${version}_linux_x64.tar.gz" \
             -o /tmp/gitleaks.tar.gz
+          echo "${sha256}  /tmp/gitleaks.tar.gz" | sha256sum --check --strict
           tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
           sudo install /tmp/gitleaks /usr/local/bin/gitleaks
           gitleaks version

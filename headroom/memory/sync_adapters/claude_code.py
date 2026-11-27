@@ -21,11 +21,14 @@ Each .md file has:
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from pathlib import Path
 from typing import Any
 
 from headroom.memory.sync import AgentMemory, AgentMemoryAdapter
+
+_JSON_FRONTMATTER_MARKER = "# headroom-frontmatter: json-v1"
 
 
 def _sanitize_for_filename(text: str) -> str:
@@ -55,30 +58,73 @@ def _parse_frontmatter(content: str) -> tuple[dict[str, str], str]:
 
     Returns (frontmatter_dict, body).
     """
-    if not content.startswith("---"):
+    # Delimiters occupy their own lines. A name/description can legitimately
+    # contain "---"; treating that substring as the end corrupts the body and
+    # its content hash on the next import.
+    match = re.match(
+        r"\A---[ \t]*\r?\n(.*?)^---[ \t]*(?:\r?\n|\Z)", content, re.DOTALL | re.MULTILINE
+    )
+    if match is None:
         return {}, content
 
-    end = content.find("---", 3)
-    if end == -1:
-        return {}, content
-
-    fm_text = content[3:end].strip()
-    body = content[end + 3 :].strip()
+    fm_text = match.group(1).strip()
+    body = content[match.end() :].strip()
+    encoded_strings = _JSON_FRONTMATTER_MARKER in (line.strip() for line in fm_text.split("\n"))
 
     fm: dict[str, str] = {}
     for line in fm_text.split("\n"):
+        if line.strip() == _JSON_FRONTMATTER_MARKER:
+            continue
         if ":" in line:
             key, _, value = line.partition(":")
+            value = value.strip()
+            # Only marked exports encode escapes. Older files may contain
+            # literal quoted paths such as "C:\temp\notes".
+            if encoded_strings and value.startswith('"'):
+                try:
+                    decoded = json.loads(value)
+                except json.JSONDecodeError:
+                    pass
+                else:
+                    if isinstance(decoded, str):
+                        fm[key.strip()] = decoded
+                        continue
             fm[key.strip()] = value.strip().strip('"').strip("'")
 
     return fm, body
 
 
-def _build_frontmatter(fields: dict[str, str]) -> str:
+def _build_frontmatter(fields: dict[str, Any]) -> str:
     """Build YAML frontmatter block."""
-    lines = ["---"]
+    lines = ["---", _JSON_FRONTMATTER_MARKER]
     for key, value in fields.items():
         if value:
+            value = str(value)
+            # Keep ordinary identifiers byte-stable. Everything else is a JSON
+            # string literal (also valid YAML), so ': ', comments, dates and
+            # booleans cannot change a native agent's interpretation.
+            plain_identifier = re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]*", value)
+            if not plain_identifier or value.lower() in {
+                "null",
+                "true",
+                "false",
+                "yes",
+                "no",
+                "on",
+                "off",
+                "y",
+                "n",
+            }:
+                value = json.dumps(value, ensure_ascii=False)
+                # Escape characters forbidden or normalized by YAML readers.
+                value = "".join(
+                    f"\\u{ord(char):04x}"
+                    if 0x7F <= ord(char) <= 0x9F
+                    or 0xD800 <= ord(char) <= 0xDFFF
+                    or char in "\u2028\u2029\ufffe\uffff"
+                    else char
+                    for char in value
+                )
             lines.append(f"{key}: {value}")
     lines.append("---")
     return "\n".join(lines)
@@ -193,7 +239,7 @@ class ClaudeCodeAdapter(AgentMemoryAdapter):
                     "source_agent": source_agent,
                 }
             )
-            target.write_text(f"{fm}\n\n{content}\n", encoding="utf-8")
+            target.write_text(f"{fm}\n\n{content}\n", encoding="utf-8", newline="\n")
             written += 1
 
             # Track for MEMORY.md index
@@ -236,7 +282,7 @@ class ClaudeCodeAdapter(AgentMemoryAdapter):
         else:
             content = "# Memory\n" + new_section
 
-        memory_md.write_text(content, encoding="utf-8")
+        memory_md.write_text(content, encoding="utf-8", newline="\n")
 
     def fingerprint(self) -> str:
         """Hash of all .md filenames + contents for change detection."""

@@ -9,10 +9,14 @@ way a user would from the shell.
 
 from __future__ import annotations
 
+import ipaddress
+import os
 import shutil
 import sqlite3
+import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 import pytest
@@ -263,9 +267,200 @@ class TestCodexMemoryMcpConfig:
         assert "--db" not in content
         assert 'model = "gpt-4o"' in content
 
+    def test_inject_replaces_unmarked_memory_block(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A `[mcp_servers.headroom_memory]` table without the injection
+        markers (e.g. hand-copied from the `mcp_server.py` docstring, or left
+        over from before this table was marker-guarded) must be replaced in
+        place, not duplicated alongside a second, marked table.
+        """
+        _set_test_home(monkeypatch, tmp_path)
+        config_file = tmp_path / ".codex" / "config.toml"
+        config_file.parent.mkdir(parents=True)
+        config_file.write_text(
+            '[profiles.default]\nmodel = "gpt-4o"\n\n'
+            "[mcp_servers.headroom_memory]\n"
+            'command = "python"\n'
+            'args = ["-m", "headroom.memory.mcp_server", "--user", "old-user"]\n'
+            "startup_timeout_sec = 30\n"
+            "tool_timeout_sec = 30\n\n"
+            "[mcp_servers.other]\n"
+            'command = "other-tool"\n'
+        )
+
+        wrap_mod._inject_memory_mcp_config("codex-user")
+
+        content = config_file.read_text()
+        assert content.count("[mcp_servers.headroom_memory]") == 1
+        assert content.count(wrap_mod._MEMORY_MCP_MARKER) == 1
+        assert '"--user", "codex-user"' in content
+        assert "old-user" not in content
+        assert 'model = "gpt-4o"' in content
+        assert "[mcp_servers.other]" in content
+        assert 'command = "other-tool"' in content
+
+        # The result must also be valid, parseable TOML — the original bug
+        # produced two `[mcp_servers.headroom_memory]` tables, which is
+        # invalid TOML (duplicate key) and breaks Codex startup.
+        parsed = tomllib.loads(content)
+        assert parsed["mcp_servers"]["headroom_memory"]["args"][-1] == "codex-user"
+
+    def test_inject_preserves_table_looking_text_in_multiline_string(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A `[mcp_servers.headroom_memory]`-looking line embedded inside an
+        unrelated multiline string value must not be mistaken for a real
+        table and stripped -- doing so previously deleted the string's
+        closing delimiter and any settings after it, corrupting the file.
+        """
+        _set_test_home(monkeypatch, tmp_path)
+        config_file = tmp_path / ".codex" / "config.toml"
+        config_file.parent.mkdir(parents=True)
+        original = (
+            'instructions = """\n'
+            "[mcp_servers.headroom_memory]\n"
+            "keep this instruction\n"
+            '"""\n'
+            'model="gpt-4o"\n'
+        )
+        config_file.write_text(original)
+
+        wrap_mod._inject_memory_mcp_config("codex-user")
+
+        content = config_file.read_text()
+        # The unrelated multiline string and the setting after it must
+        # survive untouched.
+        assert "keep this instruction" in content
+        assert 'model="gpt-4o"' in content
+        # The real, marker-wrapped memory MCP block must still be injected.
+        assert content.count(wrap_mod._MEMORY_MCP_MARKER) == 1
+
+        parsed = tomllib.loads(content)
+        assert parsed["model"] == "gpt-4o"
+        assert parsed["instructions"] == "[mcp_servers.headroom_memory]\nkeep this instruction\n"
+        assert parsed["mcp_servers"]["headroom_memory"]["args"][-1] == "codex-user"
+
+    def test_inject_replaces_quoted_key_memory_table(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """TOML allows `[mcp_servers."headroom_memory"]` as an equivalent
+        spelling of `[mcp_servers.headroom_memory]`; an unmarked table using
+        this spelling must still be replaced in place, not left behind
+        alongside a second, semantically-duplicate table.
+        """
+        _set_test_home(monkeypatch, tmp_path)
+        config_file = tmp_path / ".codex" / "config.toml"
+        config_file.parent.mkdir(parents=True)
+        config_file.write_text(
+            '[profiles.default]\nmodel = "gpt-4o"\n\n'
+            '[mcp_servers."headroom_memory"]\n'
+            'command = "python"\n'
+            'args = ["-m", "headroom.memory.mcp_server", "--user", "old-user"]\n\n'
+            "[mcp_servers.other]\n"
+            'command = "other-tool"\n'
+        )
+
+        wrap_mod._inject_memory_mcp_config("codex-user")
+
+        content = config_file.read_text()
+        assert content.count(wrap_mod._MEMORY_MCP_MARKER) == 1
+        assert '"--user", "codex-user"' in content
+        assert "old-user" not in content
+        assert 'model = "gpt-4o"' in content
+        assert "[mcp_servers.other]" in content
+        assert 'command = "other-tool"' in content
+
+        # Must parse as valid TOML with exactly one `mcp_servers.headroom_memory`
+        # table -- the original bug left the quoted-key table behind, and
+        # `tomllib.loads` raises `Cannot declare (\'mcp_servers\', \'headroom_memory\')
+        # twice` once the marker-wrapped table is appended alongside it.
+        parsed = tomllib.loads(content)
+        assert parsed["mcp_servers"]["headroom_memory"]["args"][-1] == "codex-user"
+        assert parsed["mcp_servers"]["other"]["command"] == "other-tool"
+
+    def test_inject_preserves_array_table_after_unmarked_memory_table(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Removing an old memory table must stop before an unrelated array table."""
+        _set_test_home(monkeypatch, tmp_path)
+        config_file = tmp_path / ".codex" / "config.toml"
+        config_file.parent.mkdir(parents=True)
+        config_file.write_text(
+            "[mcp_servers.headroom_memory]\n"
+            'command = "old"\n\n'
+            "[[profiles.custom.entries]]\n"
+            'name = "preserve"\n'
+        )
+
+        wrap_mod._inject_memory_mcp_config("codex-user")
+
+        parsed = tomllib.loads(config_file.read_text())
+        assert parsed["profiles"]["custom"]["entries"] == [{"name": "preserve"}]
+        assert parsed["mcp_servers"]["headroom_memory"]["args"][-1] == "codex-user"
+
+    def test_inject_ignores_triple_quote_in_comment_before_memory_table(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A comment delimiter cannot hide the real old memory table from cleanup."""
+        _set_test_home(monkeypatch, tmp_path)
+        config_file = tmp_path / ".codex" / "config.toml"
+        config_file.parent.mkdir(parents=True)
+        config_file.write_text(
+            '# Example triple quote: """\n[mcp_servers.headroom_memory]\ncommand = "old"\n'
+        )
+
+        wrap_mod._inject_memory_mcp_config("codex-user")
+
+        content = config_file.read_text()
+        parsed = tomllib.loads(content)
+        assert content.count("[mcp_servers.headroom_memory]") == 1
+        assert parsed["mcp_servers"]["headroom_memory"]["args"][-1] == "codex-user"
+
+    def test_inject_leaves_file_unchanged_when_candidate_is_invalid(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """An invalid candidate must never overwrite the user's configuration."""
+        _set_test_home(monkeypatch, tmp_path)
+        config_file = tmp_path / ".codex" / "config.toml"
+        config_file.parent.mkdir(parents=True)
+        original = (
+            "broken = [\n"
+            f"{wrap_mod._MEMORY_MCP_MARKER}\n"
+            "[mcp_servers.headroom_memory]\n"
+            'command = "old"\n'
+            f"{wrap_mod._MEMORY_MCP_END}\n"
+        )
+        config_file.write_text(original)
+
+        wrap_mod._inject_memory_mcp_config("codex-user")
+
+        assert config_file.read_text() == original
+
 
 class TestInjectAndRestoreRoundTrip:
     """End-to-end wrap → unwrap cycle operating directly on a temp $HOME."""
+
+    def test_invalid_user_config_is_named_and_left_untouched(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """A broken config.toml is reported by path, with the user's own line.
+
+        The merged candidate used to be the first thing parsed, so the warning
+        named a line in Headroom's generated text and no file at all.
+        """
+        _set_test_home(monkeypatch, tmp_path)
+        config_file = tmp_path / ".codex" / "config.toml"
+        config_file.parent.mkdir(parents=True)
+        config_file.write_text("model = [unterminated\n", encoding="utf-8")
+
+        assert wrap_mod._inject_codex_provider_config(8787) is None
+
+        out = capsys.readouterr().out
+        assert f"could not update Codex config {config_file}: it is not valid TOML" in out
+        assert "line 1" in out
+        assert "Fix or remove the file, then re-run." in out
+        assert config_file.read_text(encoding="utf-8") == "model = [unterminated\n"
 
     def test_wrap_unwrap_restores_empty_state(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -283,6 +478,47 @@ class TestInjectAndRestoreRoundTrip:
         assert not config_file.exists()
         assert not (tmp_path / ".codex" / "config.toml.headroom-backup").exists()
 
+    def test_wrap_unwrap_removes_generated_auth_helper(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        _set_test_home(monkeypatch, tmp_path)
+        config_dir = tmp_path / ".codex"
+        config_dir.mkdir()
+        (config_dir / "auth.json").write_text(
+            '{"OPENAI_API_KEY": "sk-test-only"}', encoding="utf-8"
+        )
+
+        wrap_mod._inject_codex_provider_config(8787)
+        helper = wrap_mod.codex_auth_helper_path(config_dir / "auth.json")
+        assert helper.exists()
+        config = tomllib.loads((config_dir / "config.toml").read_text(encoding="utf-8"))
+        assert config["model_providers"]["headroom"]["auth"]["args"] == [str(helper.resolve())]
+
+        status, _ = wrap_mod._restore_codex_provider_config()
+
+        assert status == "removed"
+        assert not helper.exists()
+
+    def test_wrap_unwrap_preserves_preexisting_unrelated_auth_helper(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        _set_test_home(monkeypatch, tmp_path)
+        config_dir = tmp_path / ".codex"
+        config_dir.mkdir()
+        config_file = config_dir / "config.toml"
+        config_file.write_text('model = "gpt-5"\n', encoding="utf-8")
+        (config_dir / "auth.json").write_text(
+            '{"OPENAI_API_KEY": "sk-test-only"}', encoding="utf-8"
+        )
+        helper = config_dir / ".headroom-codex-auth.py"
+        helper.write_text("user content", encoding="utf-8")
+
+        wrap_mod._inject_codex_provider_config(8787)
+        status, _ = wrap_mod._restore_codex_provider_config()
+
+        assert status == "restored"
+        assert helper.read_text(encoding="utf-8") == "user content"
+
     def test_wrap_unwrap_respects_codex_home(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
@@ -298,7 +534,48 @@ class TestInjectAndRestoreRoundTrip:
 
         status, _ = wrap_mod._restore_codex_provider_config()
         assert status == "removed"
+
         assert not config_file.exists()
+
+    def test_wrap_helper_collision_aborts_before_backup(self, monkeypatch, tmp_path: Path) -> None:
+        _set_test_home(monkeypatch, tmp_path)
+        config_dir = tmp_path / ".codex"
+        config_dir.mkdir()
+        auth = config_dir / "auth.json"
+        auth.write_text('{"OPENAI_API_KEY": "sk-test-only"}', encoding="utf-8")
+        config_file = config_dir / "config.toml"
+        original = 'model_provider = "openai"\n'
+        config_file.write_text(original, encoding="utf-8")
+        helper = wrap_mod.codex_auth_helper_path(auth, config_path=config_file)
+        helper.write_text("user content", encoding="utf-8")
+
+        with pytest.raises(
+            wrap_mod.click.ClickException, match="Codex provider configuration was not updated"
+        ):
+            wrap_mod._inject_codex_provider_config(8787)
+
+        assert config_file.read_text(encoding="utf-8") == original
+        assert not (config_dir / "config.toml.headroom-backup").exists()
+        assert helper.read_text(encoding="utf-8") == "user content"
+
+    def test_unwrap_keeps_helper_used_by_restored_custom_provider(
+        self, monkeypatch, tmp_path: Path
+    ) -> None:
+        _set_test_home(monkeypatch, tmp_path)
+        config_dir = tmp_path / ".codex"
+        config_dir.mkdir()
+        auth = config_dir / "auth.json"
+        auth.write_text('{"OPENAI_API_KEY": "sk-test-only"}', encoding="utf-8")
+        original = "[model_providers.custom]\n" + wrap_mod.build_codex_auth_config(auth)
+        config_file = config_dir / "config.toml"
+        config_file.write_text(original, encoding="utf-8")
+
+        wrap_mod._inject_codex_provider_config(8787)
+        status, _ = wrap_mod._restore_codex_provider_config()
+
+        assert status == "restored"
+        assert config_file.read_text(encoding="utf-8") == original
+        assert wrap_mod.codex_auth_helper_path(auth).exists()
 
     def test_wrap_unwrap_restores_prior_model_provider(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -573,6 +850,27 @@ class TestSubscriptionRouting:
         content = (tmp_path / ".codex" / "config.toml").read_text(encoding="utf-8")
         assert 'openai_base_url = "http://127.0.0.1:8787/v1"' in content
 
+    def test_inject_preserves_multiline_inline_profile_overrides(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Keys nested in a multi-line inline profiles table are not root keys."""
+        from headroom.providers.codex.config_toml import loads_codex_config
+
+        _set_test_home(monkeypatch, tmp_path)
+        config_file = tmp_path / ".codex" / "config.toml"
+        config_file.parent.mkdir(parents=True)
+        config_file.write_text(
+            'profiles = {\n  work = {\n    model_provider = "company",\n  },\n}\n',
+            encoding="utf-8",
+        )
+
+        wrap_mod._inject_codex_provider_config(8787)
+
+        parsed = loads_codex_config(config_file.read_text(encoding="utf-8"))
+        assert parsed["model_provider"] == "headroom"
+        assert parsed["openai_base_url"] == "http://127.0.0.1:8787/v1"
+        assert parsed["profiles"]["work"] == {"model_provider": "company"}
+
     def test_inject_emits_requires_openai_auth_for_chatgpt(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
@@ -632,12 +930,18 @@ class TestSubscriptionRouting:
         assert config_file.read_text(encoding="utf-8") == original
 
     def test_strip_cleans_orphaned_openai_base_url(self) -> None:
-        """Safety net: orphaned openai_base_url lines are cleaned up."""
+        """Safety net: orphaned root openai_base_url lines are cleaned up.
+
+        Wrap only ever writes these keys at the document root; the same key
+        inside a [profiles.*] table is a user override and stays.
+        """
         content = (
-            '[profiles.default]\nmodel = "gpt-4o"\nopenai_base_url = "http://127.0.0.1:8787/v1"\n'
+            'openai_base_url = "http://127.0.0.1:8787/v1"\n\n'
+            '[profiles.default]\nmodel = "gpt-4o"\nopenai_base_url = "http://127.0.0.1:9999/v1"\n'
         )
         cleaned = wrap_mod._strip_codex_headroom_blocks(content)
-        assert "openai_base_url" not in cleaned
+        assert "127.0.0.1:8787" not in cleaned
+        assert 'openai_base_url = "http://127.0.0.1:9999/v1"' in cleaned
         assert 'model = "gpt-4o"' in cleaned
 
     def test_no_env_key_in_injected_provider(
@@ -859,6 +1163,14 @@ class TestInjectAvoidsDuplicateTopLevelKeys:
         # the marker-delimited top-level block.
         assert wrap_mod._redirect_existing_top_level_keys(blank, 8787) == blank
 
+    @pytest.mark.parametrize("sep", [" ", "\x85"])
+    def test_redirect_leaves_provider_text_inside_single_line_string(self, sep: str) -> None:
+        # TOML allows U+2028 and U+0085 inside a single-line string, so the
+        # text after them is still part of the value, not a root assignment.
+        content = f"notes = 'hello{sep}model_provider = \"company\"{sep}world'\n"
+        assert wrap_mod._redirect_existing_top_level_keys(content, 8787) == content
+        assert not wrap_mod._has_redirectable_top_level_key(content, "model_provider")
+
     def test_inject_preserves_user_value_in_trailing_comment(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
@@ -943,6 +1255,86 @@ class TestInjectAvoidsDuplicateTopLevelKeys:
         assert 'env_http_headers = { "X-Headroom-Project" = "HEADROOM_PROJECT" }' in content
         assert "[profiles.default]" in content
         assert 'model = "gpt-5"' in content
+
+    def test_inject_replaces_legacy_nested_subtable_format(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Legacy ``wrap`` output used a nested
+        ``[model_providers.headroom.env_http_headers]`` sub-table instead of
+        today's inline table. The strip must consume the sub-table as well:
+        leaving it behind makes the re-injected inline ``env_http_headers``
+        key a duplicate TOML key and invalidates the whole config (seen in
+        the wild as ``TOMLDecodeError: Cannot declare ('model_providers',
+        'headroom') twice``).
+        """
+        _set_test_home(monkeypatch, tmp_path)
+        config_dir = tmp_path / ".codex"
+        config_dir.mkdir()
+        config_file = config_dir / "config.toml"
+        config_file.write_text(
+            "[profiles.default]\n"
+            'model = "gpt-5"\n'
+            "\n"
+            "[model_providers.headroom]\n"
+            'base_url = "http://127.0.0.1:8787/v1"\n'
+            'name = "OpenAI via Headroom proxy"\n'
+            "requires_openai_auth = true\n"
+            "supports_websockets = true\n"
+            "\n"
+            "[model_providers.headroom.env_http_headers]\n"
+            'X-Headroom-Project = "HEADROOM_PROJECT"\n'
+            "\n"
+            "[notice]\n"
+            "hide_rate_limit_model_nudge = true\n"
+        )
+
+        wrap_mod._inject_codex_provider_config(8787)
+        content = config_file.read_text()
+
+        parsed = tomllib.loads(content)  # must not raise: the original bug did
+        assert content.count("[model_providers.headroom]") == 1
+        assert "[model_providers.headroom.env_http_headers]" not in content
+        assert content.count("env_http_headers") == 1  # inline form from the injection
+        assert parsed["model_providers"]["headroom"]["base_url"] == "http://127.0.0.1:8787/v1"
+        assert parsed["model_providers"]["headroom"]["env_http_headers"] == {
+            "X-Headroom-Project": "HEADROOM_PROJECT"
+        }
+        assert parsed["profiles"]["default"]["model"] == "gpt-5"
+        assert parsed["notice"] == {"hide_rate_limit_model_nudge": True}
+
+    def test_inject_preserves_array_table_after_legacy_provider_table(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Provider cleanup must stop before an unrelated TOML array table."""
+        _set_test_home(monkeypatch, tmp_path)
+        config_file = tmp_path / ".codex" / "config.toml"
+        config_file.parent.mkdir()
+        config_file.write_text(
+            "[model_providers.headroom]\n"
+            'base_url = "http://127.0.0.1:8787/v1"\n\n'
+            "[[profiles.custom.entries]]\n"
+            'name = "preserve"\n'
+        )
+
+        wrap_mod._inject_codex_provider_config(8787)
+
+        parsed = tomllib.loads(config_file.read_text())
+        assert parsed["profiles"]["custom"]["entries"] == [{"name": "preserve"}]
+        assert parsed["model_providers"]["headroom"]["base_url"] == "http://127.0.0.1:8787/v1"
+
+    def test_inject_leaves_invalid_provider_config_unchanged(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Provider injection must not overwrite a config that cannot validate."""
+        _set_test_home(monkeypatch, tmp_path)
+        config_file = tmp_path / ".codex" / "config.toml"
+        config_file.parent.mkdir()
+        original = 'broken = [\n[model_providers.headroom]\nbase_url = "http://127.0.0.1:8787/v1"\n'
+        config_file.write_text(original)
+
+        wrap_mod._inject_codex_provider_config(8787)
+
+        assert config_file.read_text() == original
 
     def test_unwrap_restores_prior_headroom_provider_table(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -1198,7 +1590,42 @@ def test_codex_session_launch_settings_keep_routing_process_local(
     )
     assert env["CODEX_HOME"] == str(codex_home)
     assert env["OPENAI_BASE_URL"] == "http://127.0.0.1:9898/v1"
-    assert display == ["OPENAI_BASE_URL=http://127.0.0.1:9898/v1"]
+    assert display == [
+        "OPENAI_BASE_URL=http://127.0.0.1:9898/v1",
+        wrap_mod._CODEX_EMBEDDED_MODE_NOTE,
+    ]
+    assert config_file.read_text(encoding="utf-8") == original_config
+
+
+def test_codex_session_launch_settings_accept_multiline_inline_table(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # #4378: Codex accepts an inline table split across lines.
+    _set_test_home(monkeypatch, tmp_path)
+    codex_home = tmp_path / "custom-codex-home"
+    codex_home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    monkeypatch.setattr(wrap_mod, "_project_name_from_cwd", lambda: None)
+    config_file = codex_home / "config.toml"
+    original_config = (
+        'model = "gpt-5"\n\n'
+        "[mcp_servers.dingtalk]\n"
+        'command = "npx"\n'
+        "env = {\n"
+        '  DINGTALK_Client_ID = "**********",\n'
+        "  \n"
+        "    }\n"
+    )
+    config_file.write_text(original_config, encoding="utf-8")
+
+    args, env, _ = wrap_mod._codex_session_launch_settings(
+        port=9898,
+        codex_args=("exec", "hello"),
+        environ={"CODEX_HOME": str(codex_home)},
+    )
+
+    assert args[:2] == ("--config", 'openai_base_url="http://127.0.0.1:9898/v1"')
+    assert env["OPENAI_BASE_URL"] == "http://127.0.0.1:9898/v1"
     assert config_file.read_text(encoding="utf-8") == original_config
 
 
@@ -1217,7 +1644,7 @@ def test_codex_session_launch_settings_preserve_custom_provider_identity(
     )
     config_file.write_text(original_config, encoding="utf-8")
 
-    args, env, _ = wrap_mod._codex_session_launch_settings(
+    args, env, display = wrap_mod._codex_session_launch_settings(
         port=9898,
         codex_args=("--profile", "work"),
         environ={"CODEX_HOME": str(codex_home)},
@@ -1232,6 +1659,8 @@ def test_codex_session_launch_settings_preserve_custom_provider_identity(
         '="HEADROOM_CODEX_UPSTREAM_BASE_URL"'
     ) in args
     assert env[wrap_mod._UPSTREAM_BASE_URL_ENV_VAR] == "https://api.example.test/v1"
+    # Custom-provider routing also goes through --config, so the note applies (#3888).
+    assert display[-1] == wrap_mod._CODEX_EMBEDDED_MODE_NOTE
     assert config_file.read_text(encoding="utf-8") == original_config
 
 
@@ -1615,6 +2044,7 @@ def test_wrap_codex_prepare_only_registers_serena_when_uvx_exists(
     runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     _set_test_home(monkeypatch, tmp_path)
+    monkeypatch.setenv("HEADROOM_CODE_MEMORY", "serena")
     config_file = tmp_path / ".codex" / "config.toml"
     config_file.parent.mkdir(parents=True)
 
@@ -1624,7 +2054,7 @@ def test_wrap_codex_prepare_only_registers_serena_when_uvx_exists(
         return None
 
     with patch("headroom.cli.wrap.shutil.which", side_effect=fake_which):
-        # Serena is the code-memory MCP; assert it lands in the codex config.
+        # Serena is opted in; assert it lands in the codex config.
         result = runner.invoke(main, ["wrap", "codex", "--prepare-only"])
 
     assert result.exit_code == 0, result.output
@@ -1835,6 +2265,313 @@ def test_stop_local_proxy_for_unwrap_refuses_unidentified_listener(
     kill_proxy.assert_not_called()
 
 
+def _record_signals(monkeypatch: pytest.MonkeyPatch) -> list[object]:
+    calls: list[object] = []
+    real_run = subprocess.run
+
+    def run(args: list[str], **kwargs: Any) -> Any:
+        if args[0] == "taskkill":
+            calls.append(("run", args))
+            return None
+        return real_run(args, **kwargs)  # process lookups (ps, powershell) stay real
+
+    monkeypatch.setattr(wrap_mod.os, "kill", lambda pid, sig: calls.append(("kill", pid)))
+    monkeypatch.setattr(wrap_mod.subprocess, "run", run)
+    monkeypatch.setattr(wrap_mod.time, "sleep", lambda s: None)
+    monkeypatch.setattr(wrap_mod, "_check_proxy", lambda port: False)
+    return calls
+
+
+@pytest.mark.parametrize("bad_pid", [-1, 0, 1, True])
+def test_kill_proxy_by_pid_never_signals_unsafe_pid(
+    monkeypatch: pytest.MonkeyPatch, bad_pid: int
+) -> None:
+    """A listener-supplied PID of -1/0/1 must never reach os.kill or taskkill."""
+    calls = _record_signals(monkeypatch)
+    for plat in ("win32", "linux"):
+        monkeypatch.setattr(wrap_mod.sys, "platform", plat)
+        assert wrap_mod._kill_proxy_by_pid(bad_pid, 8787) is False
+    assert calls == []
+
+
+def test_kill_proxy_by_pid_never_signals_own_process(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = _record_signals(monkeypatch)
+    assert wrap_mod._kill_proxy_by_pid(wrap_mod.os.getpid(), 8787) is False
+    assert calls == []
+
+
+def test_kill_proxy_by_pid_never_signals_a_live_process_that_is_not_the_proxy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A /health body naming another real process of the user must not get it killed.
+
+    The victim's command line even mentions ``headroom proxy --port 8787`` (an
+    ssh session to a dev box, say); only the listener on the port may be signalled.
+    """
+    calls = _record_signals(monkeypatch)
+    real_platform = sys.platform
+    victim = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import time; time.sleep(30)",
+            "ssh",
+            "devbox",
+            "headroom proxy --port 8787",
+        ]
+    )
+    try:
+        for plat in ("win32", "linux", real_platform):
+            monkeypatch.setattr(wrap_mod.sys, "platform", plat)
+            assert wrap_mod._kill_proxy_by_pid(victim.pid, 8787) is False
+        assert calls == []
+        assert victim.poll() is None
+    finally:
+        monkeypatch.undo()  # os.kill is recorded above; really stop the child
+        victim.kill()
+        victim.wait()
+
+
+def test_pids_from_netstat_reads_probed_listeners_whatever_the_locale() -> None:
+    output = """
+  Proto  Lokale Adresse         Remoteadresse          Status           PID
+  TCP    0.0.0.0:8787           0.0.0.0:0              ABHOEREN         4242
+  TCP    127.0.0.1:8787         0.0.0.0:0              ABHOEREN         4244
+  TCP    192.168.1.5:8787       0.0.0.0:0              ABHOEREN         555
+  TCP    127.0.0.1:8787         127.0.0.1:50000        HERGESTELLT      777
+  TCP    0.0.0.0:18787          0.0.0.0:0              ABHOEREN         999
+"""
+    assert wrap_mod._pids_from_netstat(output, 8787) == {4242, 4244}
+
+
+def _proc_hex(ip: str) -> str:
+    """``ip`` as /proc/net/tcp writes it: the raw bytes, in host byte order, as hex."""
+    raw = ipaddress.IPv4Address(ip).packed
+    return (raw[::-1] if sys.byteorder == "little" else raw).hex().upper()
+
+
+def test_pids_from_proc_reads_probed_listeners_from_kernel_tables(tmp_path: Path) -> None:
+    """Linux fallback: socket inodes from /proc/net/tcp, owners from /proc/<pid>/fd.
+
+    Only 127.0.0.1 and 0.0.0.0 count; 1.0.0.127 (127.0.0.1 with its bytes
+    swapped) and a LAN address do not.
+    """
+    lo, anyaddr = _proc_hex("127.0.0.1"), _proc_hex("0.0.0.0")
+    swapped, lan = _proc_hex("1.0.0.127"), _proc_hex("192.168.0.5")
+    rest = "00000000:00000000 00:00000000 00000000  501 0"
+    (tmp_path / "net").mkdir()
+    (tmp_path / "net" / "tcp").write_text(
+        "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n"
+        f"   0: {lo}:2253 00000000:0000 0A {rest} 1111\n"
+        f"   1: {lan}:2253 00000000:0000 0A {rest} 2222\n"
+        f"   2: {lo}:2253 {lo}:C350 01 {rest} 3333\n"
+        f"   3: {swapped}:2253 00000000:0000 0A {rest} 4444\n"
+        f"   4: {anyaddr}:2253 00000000:0000 0A {rest} 5555\n",
+        encoding="ascii",
+    )
+    owners = (("4242", "1111"), ("555", "2222"), ("777", "3333"), ("888", "4444"), ("999", "5555"))
+    for pid, inode in owners:
+        (tmp_path / pid / "fd").mkdir(parents=True)
+        os.symlink(f"socket:[{inode}]", tmp_path / pid / "fd" / "3")
+    (tmp_path / "self").mkdir()  # non-numeric entries are skipped
+
+    assert wrap_mod._pids_from_proc(8787, tmp_path) == {4242, 999}
+
+
+def test_pids_from_proc_skips_a_descriptor_that_closes_during_the_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A vanished fd must not hide the proxy's listening socket on a later fd."""
+    (tmp_path / "net").mkdir()
+    (tmp_path / "net" / "tcp").write_text(
+        "  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode\n"
+        f"   0: {_proc_hex('127.0.0.1')}:2253 00000000:0000 0A "
+        "00000000:00000000 00:00000000 00000000  501 0 1111\n",
+        encoding="ascii",
+    )
+    fds = tmp_path / "4242" / "fd"
+    fds.mkdir(parents=True)
+    os.symlink("pipe:[9]", fds / "3")
+    os.symlink("socket:[1111]", fds / "4")
+    real_iterdir, real_readlink = Path.iterdir, os.readlink
+
+    def readlink(path: Any) -> str:
+        if Path(path) == fds / "3":
+            raise FileNotFoundError(path)  # closed between listing and readlink
+        return real_readlink(path)
+
+    # List fd 3 before fd 4, whatever order the filesystem returns.
+    monkeypatch.setattr(Path, "iterdir", lambda self: iter(sorted(real_iterdir(self))))
+    monkeypatch.setattr(wrap_mod.os, "readlink", readlink)
+
+    assert wrap_mod._pids_from_proc(8787, tmp_path) == {4242}
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("12345", 12345),
+        (" 42 ", 42),
+        ("\u0661\u0662", None),
+        ("1" * 5000, None),
+        ("-1", None),
+        ("", None),
+    ],
+    ids=["plain", "padded", "non-ascii-digits", "huge", "negative", "empty"],
+)
+def test_parse_pid_fails_closed(text: str, expected: int | None) -> None:
+    assert wrap_mod._parse_pid(text) == expected
+    assert wrap_mod._health_pid(text) == expected
+
+
+def test_listening_pids_runs_netstat_from_the_windows_system_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A netstat.exe in the project directory must never be the one that runs."""
+    commands: list[list[str]] = []
+
+    def run(command: list[str], **kwargs: Any) -> Any:
+        commands.append(command)
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setitem(sys.modules, "psutil", None)  # force the netstat branch
+    monkeypatch.setattr(wrap_mod, "run", run)
+    monkeypatch.setattr(wrap_mod.sys, "platform", "win32")
+    monkeypatch.setenv("SystemRoot", str(tmp_path / "Windows"))
+
+    assert wrap_mod._listening_pids(8787) == set()
+    assert commands[0][0] == str(tmp_path / "Windows" / "System32" / "netstat.exe")
+
+
+def test_pids_from_lsof_reads_probed_ipv4_listeners() -> None:
+    output = (
+        "p4242\nf7\ntIPv4\nn127.0.0.1:8787\np555\nf3\ntIPv6\nn[::1]:8787\n"
+        "p999\nf4\ntIPv4\nn*:8787\np" + "1" * 5000 + "\nf5\ntIPv4\nn*:8787\n"
+    )
+    assert wrap_mod._pids_from_lsof(output, 8787) == {4242, 999}
+
+
+def _listen(host: str, port: int = 0) -> tuple[subprocess.Popen[str], int]:
+    """A child process listening on ``host``:``port``; returns it and the port."""
+    family = "socket.AF_INET6" if ":" in host else "socket.AF_INET"
+    child = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import socket, sys, time\n"
+            f"s = socket.socket({family})\n"
+            f"try:\n    s.bind(({host!r}, {port})); s.listen()\n"
+            "except OSError:\n    print(-1, flush=True); sys.exit()\n"
+            "print(s.getsockname()[1], flush=True); time.sleep(30)",
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    assert child.stdout is not None
+    return child, int(child.stdout.readline())
+
+
+def test_only_the_listener_the_probe_reaches_is_confirmed() -> None:
+    """An IPv6-only server sharing the port with a 127.0.0.1 listener is not the proxy."""
+    children: list[subprocess.Popen[str]] = []
+    try:
+        for _ in range(5):
+            ipv6, port = _listen("::1")
+            children.append(ipv6)
+            if port == -1:
+                pytest.skip("no IPv6 loopback")
+            ipv4, ipv4_port = _listen("127.0.0.1", port)
+            children.append(ipv4)
+            if ipv4_port == port:
+                break
+        else:
+            pytest.skip("could not bind one port on both loopbacks")
+        listeners = wrap_mod._listening_pids(port)
+        if listeners is None:
+            pytest.skip("no psutil, lsof, ss or netstat to list listeners")
+        assert ipv4.pid in listeners
+        assert ipv6.pid not in listeners
+        assert wrap_mod._is_headroom_proxy_pid(ipv6.pid, port) is False
+        assert wrap_mod._is_headroom_proxy_pid(ipv4.pid, port) is True
+    finally:
+        for child in children:
+            child.kill()
+            child.wait()
+
+
+def test_kill_proxy_by_pid_rechecks_the_pid_before_sigkill(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If the PID stops being the listener after SIGTERM, it is not SIGKILLed."""
+    calls = _record_signals(monkeypatch)
+    monkeypatch.setattr(wrap_mod.sys, "platform", "linux")
+    monkeypatch.setattr(wrap_mod, "_check_proxy", lambda port: True)
+    answers = iter([True, False])
+    monkeypatch.setattr(wrap_mod, "_is_headroom_proxy_pid", lambda pid, port: next(answers))
+
+    assert wrap_mod._kill_proxy_by_pid(4242, 8787) is False
+    assert calls == [("kill", 4242)]
+
+
+def test_stop_local_proxy_for_unwrap_ignores_unconfirmed_pid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = _record_signals(monkeypatch)
+    monkeypatch.setattr(wrap_mod, "_check_proxy", lambda port: True)
+    monkeypatch.setattr(wrap_mod, "_query_proxy_config", lambda port: {"pid": -1})
+
+    assert wrap_mod._stop_local_proxy_for_unwrap(8787) == "failed"
+    assert calls == []
+
+
+@pytest.mark.parametrize("body", [b"[]", b'"ok"', b"1", b"null"])
+def test_query_proxy_config_non_dict_health_is_unidentified(
+    monkeypatch: pytest.MonkeyPatch, body: bytes
+) -> None:
+    import io
+
+    from headroom.providers.copilot import wrap as copilot_wrap
+
+    monkeypatch.setattr(
+        copilot_wrap.urllib.request,
+        "urlopen",
+        lambda url, timeout=2: io.BytesIO(body),
+    )
+    assert wrap_mod._query_proxy_config(8787) is None
+
+
+def test_kill_proxy_by_pid_positive_control_signals_the_listener(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The process really listening on the port is the one that gets stopped."""
+    listener = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import socket, time\n"
+            "s = socket.socket(); s.bind(('127.0.0.1', 0)); s.listen()\n"
+            "print(s.getsockname()[1], flush=True); time.sleep(30)",
+        ],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert listener.stdout is not None
+        port = int(listener.stdout.readline())
+        if wrap_mod._listening_pids(port) is None:
+            pytest.skip("no psutil, lsof, ss or netstat to list listeners")
+        calls = _record_signals(monkeypatch)
+        assert wrap_mod._kill_proxy_by_pid(listener.pid, port) is True
+        assert calls[0] in (
+            ("kill", listener.pid),
+            ("run", ["taskkill", "/F", "/T", "/PID", str(listener.pid)]),
+        )
+    finally:
+        monkeypatch.undo()
+        listener.kill()
+        listener.wait()
+
+
 def test_unwrap_codex_is_safe_noop_with_explicit_codex_home(
     runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -1880,6 +2617,138 @@ def test_unwrap_codex_preserves_unrelated_sections(
     assert result.exit_code == 0, result.output
     restored = config_file.read_text(encoding="utf-8")
     assert restored == original
+
+
+def test_unwrap_codex_removes_init_provider_routing(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`headroom init -g codex` routing must be removable with `unwrap codex` (#3749).
+
+    Without this, unwrap reported "no longer routed" while Codex stayed pinned
+    to a local proxy that nothing restarts on Windows.
+    """
+    from headroom.cli import init as init_cli
+
+    _set_test_home(monkeypatch, tmp_path)
+    config_file = tmp_path / ".codex" / "config.toml"
+    config_file.parent.mkdir(parents=True)
+    original = 'model = "gpt-5"\n\n[mcp_servers.local_thing]\ncommand = "thing"\n'
+    config_file.write_text(original, encoding="utf-8")
+    init_cli._ensure_codex_provider(config_file, 8787)
+    assert 'openai_base_url = "http://127.0.0.1:8787/v1"' in config_file.read_text(encoding="utf-8")
+
+    result = runner.invoke(main, ["unwrap", "codex", "--no-stop-proxy"])
+
+    assert result.exit_code == 0, result.output
+    assert "Nothing to undo" not in result.output
+    cleaned = config_file.read_text(encoding="utf-8")
+    assert "Headroom init provider" not in cleaned
+    assert "openai_base_url" not in cleaned
+    assert "model_providers.headroom" not in cleaned
+    assert tomllib.loads(cleaned) == tomllib.loads(original)
+
+
+def test_unwrap_codex_removes_init_only_config_file(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from headroom.cli import init as init_cli
+
+    _set_test_home(monkeypatch, tmp_path)
+    config_file = tmp_path / ".codex" / "config.toml"
+    init_cli._ensure_codex_provider(config_file, 8787)
+
+    result = runner.invoke(main, ["unwrap", "codex", "--no-stop-proxy"])
+
+    assert result.exit_code == 0, result.output
+    assert not config_file.exists()
+
+
+def test_unwrap_codex_after_init_then_wrap_removes_init_routing(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """init -> persistent wrap -> unwrap: the pre-wrap snapshot holds init's
+    routing, so restoring it verbatim left Codex pinned to the proxy."""
+    from headroom.cli import init as init_cli
+
+    _set_test_home(monkeypatch, tmp_path)
+    config_file = tmp_path / ".codex" / "config.toml"
+    config_file.parent.mkdir(parents=True)
+    original = 'model = "gpt-5"\n\n[mcp_servers.local_thing]\ncommand = "thing"\n'
+    config_file.write_text(original, encoding="utf-8")
+    init_cli._ensure_codex_provider(config_file, 8787)
+    runner.invoke(main, ["wrap", "codex", "--prepare-only", "--port", "8787"])
+    assert wrap_mod._codex_config_paths()[1].exists()
+
+    result = runner.invoke(main, ["unwrap", "codex", "--no-stop-proxy"])
+
+    assert result.exit_code == 0, result.output
+    assert "Restored prior" in result.output
+    restored = config_file.read_text(encoding="utf-8")
+    assert "Headroom init provider" not in restored
+    assert "127.0.0.1:8787" not in restored
+    assert tomllib.loads(restored) == tomllib.loads(original)
+
+
+def test_unwrap_codex_keeps_snapshot_when_init_cleanup_write_fails(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A failed write of the init-cleaned snapshot must not consume the
+    snapshot, or a retry has nothing left to restore."""
+    from headroom.cli import init as init_cli
+
+    _set_test_home(monkeypatch, tmp_path)
+    config_file = tmp_path / ".codex" / "config.toml"
+    config_file.parent.mkdir(parents=True)
+    original = 'model = "gpt-5"\n\n[mcp_servers.local_thing]\ncommand = "thing"\n'
+    config_file.write_text(original, encoding="utf-8")
+    init_cli._ensure_codex_provider(config_file, 8787)
+    runner.invoke(main, ["wrap", "codex", "--prepare-only", "--port", "8787"])
+    backup_file = wrap_mod._codex_config_paths()[1]
+    assert backup_file.exists()
+
+    def failing_write(path: Path, content: str) -> None:
+        raise OSError("disk full")
+
+    with monkeypatch.context() as m:
+        m.setattr(wrap_mod, "_write_text", failing_write)
+        failed = runner.invoke(main, ["unwrap", "codex", "--no-stop-proxy"])
+
+    assert failed.exit_code != 0
+    assert backup_file.exists()
+
+    result = runner.invoke(main, ["unwrap", "codex", "--no-stop-proxy"])
+
+    assert result.exit_code == 0, result.output
+    assert "Restored prior" in result.output
+    restored = config_file.read_text(encoding="utf-8")
+    assert "127.0.0.1:8787" not in restored
+    assert tomllib.loads(restored) == tomllib.loads(original)
+
+
+def test_unwrap_codex_init_cleanup_keeps_profile_overrides(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Orphan cleanup is root-only: [profiles.*] routing keys are user-owned,
+    even when they point at a Headroom proxy."""
+    from headroom.cli import init as init_cli
+
+    _set_test_home(monkeypatch, tmp_path)
+    config_file = tmp_path / ".codex" / "config.toml"
+    config_file.parent.mkdir(parents=True)
+    original = (
+        'model = "gpt-5"\n\n'
+        "[profiles.work]\n"
+        'model_provider = "headroom"\n'
+        'openai_base_url = "http://127.0.0.1:9999/v1"\n'
+    )
+    config_file.write_text(original, encoding="utf-8")
+    init_cli._ensure_codex_provider(config_file, 8787)
+
+    result = runner.invoke(main, ["unwrap", "codex", "--no-stop-proxy"])
+
+    assert result.exit_code == 0, result.output
+    assert tomllib.loads(config_file.read_text(encoding="utf-8")) == tomllib.loads(original)
+    assert tomllib.loads(wrap_mod._strip_codex_headroom_blocks(original)) == tomllib.loads(original)
 
 
 # ---------------------------------------------------------------------------
@@ -2043,3 +2912,46 @@ class TestCodexLaunchExportsCustomUpstream:
     ) -> None:
         env = self._launch_env(monkeypatch, tmp_path, custom_upstream=None)
         assert wrap_mod._UPSTREAM_BASE_URL_ENV_VAR not in env
+
+
+@pytest.mark.parametrize("original", ["", 'model = "gpt-5"\n'])
+def test_unwrap_init_snapshot_removes_unreferenced_auth_helper(monkeypatch, tmp_path, original):
+    from headroom.cli import init as init_cli
+    from headroom.providers.codex.install import codex_auth_helper_path
+
+    _set_test_home(monkeypatch, tmp_path)
+    config = tmp_path / ".codex/config.toml"
+    config.parent.mkdir()
+    config.write_text(original, encoding="utf-8")
+    auth = config.with_name("auth.json")
+    auth.write_text('{"OPENAI_API_KEY":"test-key"}', encoding="utf-8")
+    init_cli._ensure_codex_provider(config, 8787)
+    helper = codex_auth_helper_path(auth, config_path=config)
+    assert helper.exists()
+    backup = wrap_mod._codex_config_paths()[1]
+    backup.write_text(config.read_text(encoding="utf-8"), encoding="utf-8")
+    wrap_mod._restore_codex_provider_config()
+    assert not helper.exists()
+    assert not backup.exists()
+    if original:
+        assert tomllib.loads(config.read_text(encoding="utf-8")) == tomllib.loads(original)
+    else:
+        assert not config.exists()
+
+
+@pytest.mark.parametrize("with_backup", [False, True])
+def test_unwrap_preserves_adopted_provider_options(monkeypatch, tmp_path, with_backup):
+    from headroom.cli import init as init_cli
+
+    _set_test_home(monkeypatch, tmp_path)
+    config = tmp_path / ".codex/config.toml"
+    config.parent.mkdir()
+    original = '[model_providers.headroom]\nbase_url = "http://127.0.0.1:9200/v1"\nrequest_max_retries = 7\n'
+    config.write_text(original, encoding="utf-8")
+    init_cli._ensure_codex_provider(config, 8787)
+    init_cli._ensure_codex_provider(config, 9500)
+    if with_backup:
+        backup = wrap_mod._codex_config_paths()[1]
+        backup.write_text(config.read_text(encoding="utf-8"), encoding="utf-8")
+    wrap_mod._restore_codex_provider_config()
+    assert tomllib.loads(config.read_text(encoding="utf-8")) == tomllib.loads(original)

@@ -95,7 +95,15 @@ def test_reexec_sets_vars_and_execs_once(monkeypatch):
     assert proxy_cli.os.environ["_HEADROOM_MALLOC_TUNED"] == "1"
     # Re-exec normalizes to `python -m headroom.cli <args>`, preserving the PID.
     assert rec["path"] == "/usr/bin/python3"
-    assert rec["argv"] == ["/usr/bin/python3", "-m", "headroom.cli", "proxy", "--port", "8787"]
+    assert rec["argv"] == [
+        "/usr/bin/python3",
+        "-P",
+        "-m",
+        "headroom.cli",
+        "proxy",
+        "--port",
+        "8787",
+    ]
 
 
 # --------------------------------------------------------------------------- #
@@ -276,17 +284,71 @@ async def test_slow_trim_does_not_stop_unrelated_async_work(monkeypatch):
 # --------------------------------------------------------------------------- #
 # ProxyConfig wiring
 # --------------------------------------------------------------------------- #
-def test_proxy_config_malloc_trim_default_is_darwin_scoped(monkeypatch):
-    # Default-on only on macOS (the platform with the documented RSS ratchet);
-    # elsewhere it is opt-in, so glibc deployments do not silently take on a
-    # once-a-minute allocator purge.
+def test_proxy_config_malloc_trim_default_is_scoped_to_platforms_with_a_trim_call(monkeypatch):
+    # Default-on on macOS and glibc Linux, the two platforms with a trim call
+    # and a documented RSS ratchet; elsewhere the periodic task is a no-op, so
+    # the default stays off rather than scheduling wakeups for nothing.
     from headroom.proxy import models
 
     monkeypatch.setattr(models.sys, "platform", "darwin")
     assert models.ProxyConfig().periodic_malloc_trim_enabled is True
 
     monkeypatch.setattr(models.sys, "platform", "linux")
+    assert models.ProxyConfig().periodic_malloc_trim_enabled is True
+
+    monkeypatch.setattr(models.sys, "platform", "win32")
     assert models.ProxyConfig().periodic_malloc_trim_enabled is False
 
     # The interval knob is platform-independent.
     assert models.ProxyConfig().malloc_trim_interval_seconds == 60
+
+
+@pytest.mark.parametrize(
+    ("platform", "expected"),
+    [("darwin", True), ("linux", True), ("win32", False)],
+)
+def test_cli_proxy_uses_the_same_trim_default_as_the_dataclass(monkeypatch, platform, expected):
+    # `headroom proxy` builds its ProxyConfig field by field, so it can only
+    # inherit the platform scope by calling the shared default: a literal here
+    # (as `sys.platform == "darwin"` was) silently overrides the dataclass for
+    # every CLI-launched proxy. Covers the third entry point; the server's
+    # env factory and ProxyConfig() itself are covered above.
+    pytest.importorskip("click")
+    pytest.importorskip("fastapi")
+    from click.testing import CliRunner
+
+    from headroom.cli.main import main
+
+    monkeypatch.setattr(proxy_cli.sys, "platform", platform)
+    monkeypatch.delenv("HEADROOM_MALLOC_TRIM", raising=False)
+    captured: dict = {}
+
+    def fake_run_server(config, **kwargs):  # noqa: ANN001
+        captured["config"] = config
+
+    monkeypatch.setattr("headroom.proxy.server.run_server", fake_run_server)
+    result = CliRunner().invoke(main, ["proxy"], catch_exceptions=False)
+
+    assert result.exit_code == 0, result.output
+    assert captured["config"].periodic_malloc_trim_enabled is expected
+
+
+def test_cli_proxy_trim_env_opt_out_still_wins(monkeypatch):
+    pytest.importorskip("click")
+    pytest.importorskip("fastapi")
+    from click.testing import CliRunner
+
+    from headroom.cli.main import main
+
+    monkeypatch.setattr(proxy_cli.sys, "platform", "linux")
+    monkeypatch.setenv("HEADROOM_MALLOC_TRIM", "0")
+    captured: dict = {}
+
+    def fake_run_server(config, **kwargs):  # noqa: ANN001
+        captured["config"] = config
+
+    monkeypatch.setattr("headroom.proxy.server.run_server", fake_run_server)
+    result = CliRunner().invoke(main, ["proxy"], catch_exceptions=False)
+
+    assert result.exit_code == 0, result.output
+    assert captured["config"].periodic_malloc_trim_enabled is False
